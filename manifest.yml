@@ -1,0 +1,21 @@
+# nonk8s
+# 插件清单文件使用 YAML 格式存储。
+# 格式说明：https://docs.classisland.tech/zh-cn/latest/dev/plugins/create-project/
+
+id: ClassSlideSync.Plugin
+name: 课件续页
+description: 记录每份课件的讲授进度：下次打开同一份课件时，在屏幕边上显示"上次停在第几页"，点一下就从那一页接着放映。支持 PowerPoint 与 WPS 演示。
+entranceAssembly: "ClassSlideSync.Plugin.dll"
+url: https://github.com/KKT446/ClassSlideSync
+version: 1.0.1.0
+apiVersion: 2.0.0.0
+author: kkt446
+
+# 下面这几行是上架 ClassIsland 插件市场时索引文件要用的信息（插件加载时会忽略它们）。
+# 提 PR 到 https://github.com/ClassIsland/PluginIndex 时，把本文件整体复制成
+# index/plugins-v2/ClassSlideSync.Plugin.yml 即可。
+repoOwner: KKT446
+repoName: ClassSlideSync
+assetsRoot: main/
+supportedOSPlatforms:
+  - Windows

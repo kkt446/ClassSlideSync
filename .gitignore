@@ -1,0 +1,15 @@
+# 编译产物
+bin/
+obj/
+cipx/
+*.user
+*.pdb
+
+# 本机测试时抓的截图、临时脚本产物
+shots/
+*.latest.dll
+
+# 编辑器
+.vs/
+.idea/
+.vscode/

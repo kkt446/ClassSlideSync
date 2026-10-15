@@ -1,0 +1,56 @@
+name: build-and-release
+
+# 推一个形如 1.0.1.0 的 tag 就会自动编译、打包 .cipx 并建一个 Release
+# （ClassIsland 插件市场要求 tag 严格是 a.b.c.d，不能带 v 前缀或其它内容）
+on:
+  push:
+    tags:
+      - "*.*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: 编译并打包 .cipx
+        shell: pwsh
+        run: pwsh -ep bypass -NoLogo -File ./Pack-Cipx.ps1
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClassSlideSync.Plugin.cipx
+          path: |
+            cipx/ClassSlideSync.Plugin.cipx
+            cipx/checksums.md
+          if-no-files-found: error
+
+      - name: 建/更新 Release 并附上插件包
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $md5 = (Get-Content cipx/checksums.md -Raw).Trim()
+          # 网页上手动建过这个 tag 的 Release 时不要报错，改成把附件补上去
+          gh release view $tag --json tagName *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag "cipx/ClassSlideSync.Plugin.cipx" "cipx/checksums.md" --clobber
+          } else {
+            gh release create $tag `
+              "cipx/ClassSlideSync.Plugin.cipx" `
+              "cipx/checksums.md" `
+              --title "课件续页 $tag" `
+              --notes "ClassIsland 插件包（导入方式：ClassIsland → 插件 → 导入插件包）。`n`n$md5"
+          }

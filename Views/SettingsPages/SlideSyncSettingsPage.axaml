@@ -1,0 +1,322 @@
+<ci:SettingsPageBase x:Class="ClassSlideSync.Plugin.Views.SettingsPages.SlideSyncSettingsPage"
+      xmlns="https://github.com/avaloniaui"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+      xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+      xmlns:local="clr-namespace:ClassSlideSync.Plugin.Views.SettingsPages"
+      xmlns:ci="http://classisland.tech/schemas/xaml/core"
+      xmlns:controls="clr-namespace:FluentAvalonia.UI.Controls;assembly=FluentAvalonia"
+      xmlns:ciControls="clr-namespace:ClassIsland.Core.Controls;assembly=ClassIsland.Core"
+      mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
+      x:DataType="local:SlideSyncSettingsPage">
+
+    <!--
+      布局照抄本体自己的设置页：settings-container 负责宽度与间距（960 / 4），
+      SettingsExpander 负责卡片外观，图标用 Fluent 字形，颜色一律 DynamicResource，
+      于是老师换主题色或明暗主题时，这一页跟着变，不会变成界面上的异物。
+    -->
+    <ScrollViewer>
+        <StackPanel Classes="settings-container animated-intro">
+
+            <ciControls:IconText Glyph="&#xEF27;" Text="基本" Margin="0 0 0 4" />
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xEA2F;}"
+                                       Header="授课时显示悬浮卡片"
+                                       Description="检测到放映时，在屏幕边缘浮出一张卡片显示当前页码。">
+                <controls:SettingsExpander.Footer>
+                    <ToggleSwitch VerticalAlignment="Center"
+                                  IsChecked="{Binding Settings.AutoShowOverlay, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE5C3;}"
+                                       Header="无人操作时自动贴边"
+                                       Description="停手一段时间后卡片缩成屏幕边缘的一条标签，不挡课件。">
+                <controls:SettingsExpander.Footer>
+                    <StackPanel Orientation="Horizontal" Spacing="10">
+                        <Slider Width="170" Minimum="5" Maximum="120" TickFrequency="5" IsSnapToTickEnabled="True"
+                                Classes="auto-tooltip" ci:SliderDragTooltipAssist.StringFormat="F0"
+                                VerticalAlignment="Center"
+                                Value="{Binding Settings.AutoHideSeconds, Mode=TwoWay}"/>
+                        <ToggleSwitch VerticalAlignment="Center"
+                                      IsChecked="{Binding Settings.AutoHide, Mode=TwoWay}"/>
+                    </StackPanel>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE6EF;}"
+                                       Header="记录每节课的进度台账"
+                                       Description="每次放映写一条记录：从第几页看到第几页、看了多久。卡片就是靠它知道“上次停在哪一页”。">
+                <controls:SettingsExpander.Footer>
+                    <ToggleSwitch VerticalAlignment="Center"
+                                  IsChecked="{Binding Settings.RecordLedger, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xF031;}"
+                                       Header="最短记录时长"
+                                       Description="短于该时长的放映当作误触，不写进台账（秒）。">
+                <controls:SettingsExpander.Footer>
+                    <NumericUpDown Width="140" Minimum="0" Maximum="600" Increment="5"
+                                   VerticalAlignment="Center"
+                                   Value="{Binding Settings.MinSessionSeconds, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <Separator Margin="0 12 0 4" />
+            <ciControls:IconText Glyph="&#xE51E;" Text="运行时机" Margin="0 0 0 4" />
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE51E;}"
+                                       Header="上课前自动待命"
+                                       Description="{Binding RuntimeSummary}">
+                <controls:SettingsExpander.Footer>
+                    <ToggleSwitch VerticalAlignment="Center"
+                                  IsChecked="{Binding Settings.AutoStartBeforeClass, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xF031;}"
+                                       Header="提前多少秒待命"
+                                       Description="默认 120 秒，也就是上课前 2 分钟。"
+                                       IsVisible="{Binding Settings.AutoStartBeforeClass}">
+                <controls:SettingsExpander.Footer>
+                    <NumericUpDown Width="140" Minimum="0" Maximum="600" Increment="10"
+                                   VerticalAlignment="Center"
+                                   Value="{Binding Settings.PreClassLeadSeconds, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xF031;}"
+                                       Header="下课后保留多久"
+                                       Description="默认 120 秒。下课之后插件还会盯一会儿课件，把「最后停在第几页」记完，然后彻底退出（秒）。"
+                                       IsVisible="{Binding Settings.AutoStartBeforeClass}">
+                <controls:SettingsExpander.Footer>
+                    <NumericUpDown Width="140" Minimum="0" Maximum="1800" Increment="30"
+                                   VerticalAlignment="Center"
+                                   Value="{Binding Settings.PostClassGraceSeconds, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xEA2F;}"
+                                       Header="课表外打开课件也加载"
+                                       Description="自习课、临时加课、学校没排课表时的兜底：只要打开 PowerPoint/WPS 就待命，关掉就退出。">
+                <controls:SettingsExpander.Footer>
+                    <ToggleSwitch VerticalAlignment="Center"
+                                  IsChecked="{Binding Settings.ArmOnDeckOpenOutsideClass, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE7B3;}"
+                                       Header="检测到 PPT 就显示卡片"
+                                       Description="默认开：只要 PowerPoint/WPS 在跑、课件打开着，就显示卡片，不管是不是上课时间。关掉 = 课表时段外一律不显示、下课铃一响就隐藏（插件仍在后台记页码）。">
+                <controls:SettingsExpander.Footer>
+                    <ToggleSwitch VerticalAlignment="Center"
+                                  IsChecked="{Binding Settings.ShowCardOutsideClass, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE6EF;}"
+                                       Header="历史保留天数"
+                                       Description="默认 21 天（3 周）。更久没用过的课件记录会被自动清理，正在用的课件不受影响。">
+                <controls:SettingsExpander.Footer>
+                    <NumericUpDown Width="140" Minimum="1" Maximum="365" Increment="1"
+                                   VerticalAlignment="Center"
+                                   Value="{Binding Settings.HistoryRetentionDays, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE9B0;}"
+                                       Header="诊断日志"
+                                       Description="把每次 COM 轮询的结果写进 app.log。排查「没反应」时才需要打开，平时关着。">
+                <controls:SettingsExpander.Footer>
+                    <ToggleSwitch VerticalAlignment="Center"
+                                  IsChecked="{Binding Settings.DiagnosticLog, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <Separator Margin="0 12 0 4" />
+            <ciControls:IconText Glyph="&#xE523;" Text="卡片外观" Margin="0 0 0 4" />
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xF4D1;}"
+                                       Header="跟随 ClassIsland 主题"
+                                       Description="{Binding Appearance.ThemeSummary}">
+                <controls:SettingsExpander.Footer>
+                    <ToggleSwitch VerticalAlignment="Center"
+                                  IsChecked="{Binding Settings.FollowClassIslandTheme, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE523;}"
+                                       Header="强调色"
+                                       Description="页码和“点这里跳过去”用的颜色。"
+                                       IsVisible="{Binding !Settings.FollowClassIslandTheme}">
+                <controls:SettingsExpander.Footer>
+                    <ColorPicker VerticalAlignment="Center"
+                                 Color="{Binding Appearance.AccentColor, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE523;}"
+                                       Header="卡片底色"
+                                       Description="默认用 ClassIsland 主界面的底色。"
+                                       IsVisible="{Binding !Settings.FollowClassIslandTheme}">
+                <controls:SettingsExpander.Footer>
+                    <ColorPicker VerticalAlignment="Center"
+                                 Color="{Binding Appearance.BackgroundColor, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xF37D;}"
+                                       Header="不透明度"
+                                       Description="太高挡课件，太低看不清字。">
+                <controls:SettingsExpander.Footer>
+                    <Slider Width="180" Minimum="20" Maximum="100" TickFrequency="5" IsSnapToTickEnabled="True"
+                            Classes="auto-tooltip" ci:SliderDragTooltipAssist.StringFormat="F0"
+                            VerticalAlignment="Center"
+                            Value="{Binding Settings.CardOpacityPercent, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xF031;}"
+                                       Header="圆角"
+                                       Description="0 = 直角，24 = 很圆；跟随主题时用 ClassIsland 的圆角设置。">
+                <controls:SettingsExpander.Footer>
+                    <StackPanel Orientation="Horizontal" Spacing="10">
+                        <Slider Width="170" Minimum="0" Maximum="24" TickFrequency="1" IsSnapToTickEnabled="True"
+                                Classes="auto-tooltip" ci:SliderDragTooltipAssist.StringFormat="F0"
+                                VerticalAlignment="Center"
+                                Value="{Binding Appearance.CornerRadius, Mode=TwoWay}"/>
+                        <ToggleSwitch VerticalAlignment="Center" OnContent="自定义" OffContent="跟随"
+                                      IsChecked="{Binding Appearance.CustomRadius, Mode=TwoWay}"/>
+                    </StackPanel>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xEE83;}"
+                                       Header="大小"
+                                       Description="整张卡片的缩放倍数。">
+                <controls:SettingsExpander.Footer>
+                    <Slider Width="180" Minimum="0.6" Maximum="2" TickFrequency="0.05" IsSnapToTickEnabled="True"
+                            Classes="auto-tooltip" ci:SliderDragTooltipAssist.StringFormat="F2"
+                            VerticalAlignment="Center"
+                            Value="{Binding Settings.CardScale, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE6EF;}"
+                                       Header="字号微调"
+                                       Description="在 ClassIsland 的字号基础上加减。">
+                <controls:SettingsExpander.Footer>
+                    <Slider Width="180" Minimum="-4" Maximum="12" TickFrequency="1" IsSnapToTickEnabled="True"
+                            Classes="auto-tooltip" ci:SliderDragTooltipAssist.StringFormat="F0"
+                            VerticalAlignment="Center"
+                            Value="{Binding Settings.CardFontSizeDelta, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE7C3;}"
+                                       Header="贴哪一边"
+                                       Description="默认右边，和 ClassIsland 主界面同侧。">
+                <controls:SettingsExpander.Footer>
+                    <ComboBox SelectedIndex="{Binding Appearance.SideIndex, Mode=TwoWay}" HorizontalContentAlignment="Left">
+                        <ciControls:IconText Glyph="&#xE7C3;" Text="右边" />
+                        <ciControls:IconText Glyph="&#xE7C3;" Text="左边" />
+                    </ComboBox>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE5CB;}"
+                                       Header="垂直位置"
+                                       Description="0 = 贴屏幕顶部，50 = 居中，100 = 贴底部。">
+                <controls:SettingsExpander.Footer>
+                    <Slider Width="180" Minimum="0" Maximum="100" TickFrequency="5" IsSnapToTickEnabled="True"
+                            Classes="auto-tooltip" ci:SliderDragTooltipAssist.StringFormat="F0"
+                            VerticalAlignment="Center"
+                            Value="{Binding Settings.CardVerticalPercent, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE89D;}"
+                                       Header="收起标签宽度"
+                                       Description="缩起来之后露在屏幕边缘的那一条有多宽（像素）。">
+                <controls:SettingsExpander.Footer>
+                    <Slider Width="180" Minimum="16" Maximum="96" TickFrequency="2" IsSnapToTickEnabled="True"
+                            Classes="auto-tooltip" ci:SliderDragTooltipAssist.StringFormat="F0"
+                            VerticalAlignment="Center"
+                            Value="{Binding Settings.CollapsedTabWidth, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <Separator Margin="0 12 0 4" />
+            <ciControls:IconText Glyph="&#xE6EF;" Text="显示内容" Margin="0 0 0 4" />
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xEFBF;}"
+                                       Header="显示内容"
+                                       Description="卡片上出现哪几行。">
+                <!-- FluentAvalonia 2.4.1 的 SettingsExpanderItem 上没有 IsOn 属性，
+                     开关必须自己放进 Footer（本体 CountDownComponentSettingsControl 就是这么写的），
+                     用 Classes="switcher" 会去套一个依赖该属性的模板，所以不能那么写。 -->
+                <controls:SettingsExpanderItem Content="课件文件名">
+                    <controls:SettingsExpanderItem.Footer>
+                        <ToggleSwitch VerticalAlignment="Center" IsChecked="{Binding Settings.CardShowFileName, Mode=TwoWay}"/>
+                    </controls:SettingsExpanderItem.Footer>
+                </controls:SettingsExpanderItem>
+                <controls:SettingsExpanderItem Content="共几页">
+                    <controls:SettingsExpanderItem.Footer>
+                        <ToggleSwitch VerticalAlignment="Center" IsChecked="{Binding Settings.CardShowSlideCount, Mode=TwoWay}"/>
+                    </controls:SettingsExpanderItem.Footer>
+                </controls:SettingsExpanderItem>
+                <controls:SettingsExpanderItem Content="科目 · 上下课">
+                    <controls:SettingsExpanderItem.Footer>
+                        <ToggleSwitch VerticalAlignment="Center" IsChecked="{Binding Settings.CardShowContext, Mode=TwoWay}"/>
+                    </controls:SettingsExpanderItem.Footer>
+                </controls:SettingsExpanderItem>
+                <controls:SettingsExpanderItem Content="状态行（正在跳转…）">
+                    <controls:SettingsExpanderItem.Footer>
+                        <ToggleSwitch VerticalAlignment="Center" IsChecked="{Binding Settings.CardShowStatusLine, Mode=TwoWay}"/>
+                    </controls:SettingsExpanderItem.Footer>
+                </controls:SettingsExpanderItem>
+                <controls:SettingsExpanderItem Content="上次停在第几页">
+                    <controls:SettingsExpanderItem.Footer>
+                        <ToggleSwitch VerticalAlignment="Center" IsChecked="{Binding Settings.CardShowJumpLine, Mode=TwoWay}"/>
+                    </controls:SettingsExpanderItem.Footer>
+                </controls:SettingsExpanderItem>
+            </controls:SettingsExpander>
+
+            <Separator Margin="0 12 0 4" />
+            <ciControls:IconText Glyph="&#xF031;" Text="交互" Margin="0 0 0 4" />
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE6F9;}"
+                                       Header="点击卡片跳页"
+                                       Description="点“上次停在第 N 页”那一行直接跳过去。">
+                <controls:SettingsExpander.Footer>
+                    <ToggleSwitch VerticalAlignment="Center"
+                                  IsChecked="{Binding Settings.CardClickToJump, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE55F;}"
+                                       Header="跳转时重播该页动画"
+                                       Description="关掉＝从上次中断的地方接着播（默认）。">
+                <controls:SettingsExpander.Footer>
+                    <ToggleSwitch VerticalAlignment="Center"
+                                  IsChecked="{Binding Settings.JumpResetsAnimation, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE7C3;}"
+                                       Header="预览卡片"
+                                       Description="把卡片叫出来，看看现在的样子。">
+                <controls:SettingsExpander.Footer>
+                    <Button Content="显示卡片" Click="OnPreviewClick"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <TextBlock Text="{Binding Appearance.CardSummary}" TextWrapping="Wrap"
+                       FontSize="{DynamicResource MainWindowSecondaryFontSize}"
+                       Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                       Margin="0 10 0 0"/>
+
+        </StackPanel>
+    </ScrollViewer>
+</ci:SettingsPageBase>
