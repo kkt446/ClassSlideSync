@@ -1,4 +1,4 @@
-﻿# 一键打包成 ClassIsland 能直接导入的 .cipx
+# 一键打包成 ClassIsland 能直接导入的 .cipx
 #
 #   用法（在仓库根目录）：
 #       pwsh -ep bypass -File .\Pack-Cipx.ps1
@@ -37,8 +37,14 @@ if (-not $dotnet) {
     throw "找不到带 SDK 的 dotnet。请装 .NET 8 SDK（https://dotnet.microsoft.com/download/dotnet/8.0），或把 SDK 解压到 $env:LOCALAPPDATA\dotnet-sdk\"
 }
 
-$shell = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
-if (-not $shell) { $shell = (Get-Command powershell -ErrorAction SilentlyContinue).Source }
+# 这里只传「命令名」，不要传完整路径：
+# SDK 的 MSBuild 目标拼命令行时不给 $(PowershellBinaryName) 加引号，一旦路径里带空格
+# （例如 C:\Program Files\PowerShell\7\pwsh.exe）就会被 cmd 从空格处拆开，
+# 表现为 error MSB3073 ... exited with code 9009（GitHub Actions 上必踩）。传命令名则由 PATH 解析，稳。
+$shell = $null
+foreach ($name in @("pwsh", "powershell")) {
+    if (Get-Command $name -ErrorAction SilentlyContinue) { $shell = $name; break }
+}
 if (-not $shell) { throw "找不到 pwsh / PowerShell" }
 
 Write-Host "dotnet : $dotnet"

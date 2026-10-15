@@ -46,7 +46,13 @@ jobs:
           # 网页上手动建过这个 tag 的 Release 时不要报错，改成把附件补上去
           gh release view $tag --json tagName *> $null
           if ($LASTEXITCODE -eq 0) {
+            # 这个 Release 已经存在：覆盖附件之外，还**必须**把说明里的 MD5 一起更新。
+            # 市场会拿说明里的哈希去校验下载到的附件，说明不更新就会校验失败。
+            # 只换掉 MD5 那一行，作者手写的正文保留。
             gh release upload $tag "cipx/ClassSlideSync.Plugin.cipx" "cipx/checksums.md" --clobber
+            $old = gh release view $tag --json body --jq .body
+            $keep = (($old -split "`n" | Where-Object { $_ -notmatch 'CLASSISLAND_PKG_MD5' }) -join "`n").TrimEnd()
+            gh release edit $tag --notes "$keep`n`n$md5"
           } else {
             gh release create $tag `
               "cipx/ClassSlideSync.Plugin.cipx" `
