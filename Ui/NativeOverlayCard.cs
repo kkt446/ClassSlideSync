@@ -40,6 +40,7 @@ namespace ClassSlideSync.Plugin.Ui
         const int WM_CLOSE = 0x0010;
         const int WM_DESTROY = 0x0002;
         const int WM_ERASEBKGND = 0x0014;
+        const int WM_MOUSEMOVE = 0x0200;
         const int WM_LBUTTONDOWN = 0x0201;
         const int WM_LBUTTONUP = 0x0202;
         const int WM_LBUTTONDBLCLK = 0x0203;
@@ -68,6 +69,24 @@ namespace ClassSlideSync.Plugin.Ui
         IntPtr pumpHwnd;
         uint taskbarCreated;
         WndProcDelegate proc;
+
+        // 2026-10-17 崩溃根因（把 ClassIsland.Desktop 整个进程带崩的那个 FailFast）：
+        // RegisterClassEx 只是把函数指针交给系统，托管侧不留任何引用。委托一旦被 GC 回收，
+        // 下一条窗口消息就会踩到"在已回收的委托上回调"，运行时立刻 FailFast。事件日志原文：
+        //   A callback was made on a garbage collected delegate of type
+        //   'ClassSlideSync.Plugin!ClassSlideSync.Plugin.Ui.NativeOverlayCard+WndProcDelegate::Invoke'
+        //   栈：NativeOverlayCard.DispatchMessage → DispatchMessage → Run
+        // 所以每注册一个窗口类，就把它的委托放进这个静态表里钉住（类活到进程结束，委托也得活着）。
+        static readonly System.Collections.Generic.List<WndProcDelegate> classRoots =
+            new System.Collections.Generic.List<WndProcDelegate>();
+
+        // 窗口类名也改成"一个卡片实例一个"：以前固定叫 ClassSlideSyncCard，第二次注册必然 1410
+        // （已存在）而沿用**上一个实例**的 wndproc —— 于是卸下再待命之后，新窗口的消息全被
+        // 旧实例的代码处理，而旧实例的 hwnd 早就销毁了，绘制全落到空处：表现就是老师看到的
+        // "第一节课还有卡片，后面开 WPS 就不显示了"（2026-10-17 日志：00:25 那次有 paint，
+        // 00:31/00:37 两次 applies 涨、paint 一直是 0）。
+        static int classSeq;
+        readonly string className = "ClassSlideSyncCard" + System.Threading.Interlocked.Increment(ref classSeq);
         bool quit;
 
         // Layout is authored against 96 dpi and scaled to whatever the window's monitor runs at.
@@ -95,6 +114,15 @@ namespace ClassSlideSync.Plugin.Ui
         bool fontInstalled;
         string fontNote = "";
         bool expanded;
+
+        // 拖拽（2026-10-16 用户要求：悬浮窗可以鼠标拖着走，松手记住位置）。
+        // 按下时先只记"预备"，移动超过几个像素才算真拖 —— 否则每一次点击都会被当成抖动的拖拽，
+        // 跳页就再也点不动了。
+        bool dragArmed;
+        bool dragging;
+        POINT dragStartCursor;
+        RECT dragStartRect;
+
         // 这一份课件打开后是不是已经自动弹过一次小窗了。老师手动收回之后不能再弹回来，
         // 只有"关掉课件再打开一份"才算新的一轮（用户 2026-10-13 要求：打开课件先弹小窗，
         // 15 秒后自己贴边收回）。
@@ -115,6 +143,12 @@ namespace ClassSlideSync.Plugin.Ui
 
         /// <summary>Raised on the overlay thread when the teacher clicks the page number.</summary>
         public event Action JumpRequested;
+
+        /// <summary>
+        /// 老师把卡片拖到新位置并松手时触发（浮层线程）：参数是"贴不贴右边"和竖直百分比。
+        /// 宿主把这两个值写进设置，下次启动就从这个位置显示。
+        /// </summary>
+        public event Action<bool, int> PositionChanged;
 
         public void Start() { thread.Start(); }
 
@@ -174,6 +208,11 @@ namespace ClassSlideSync.Plugin.Ui
         volatile bool wakePending;
         // ApplyPending 跑过几次（诊断用）：卡片不显示时，用来区分"状态没送到"和"送到了但判成不显示"。
         int applyCount;
+        // 已经真正应用过的那份状态的哈希。唤醒消息（PostMessage）万一丢了，引擎按哈希去重不会再推，
+        // 卡片就永远停在旧状态（2026-10-17 老师报"开 WPS 卡片出不来"）——每秒的自检心跳拿它兜底。
+        int appliedHash = int.MinValue;
+        // 状态变化的日志出口（由插件服务接到台账 app.log）：卡片该出现却没出现时只看日志。
+        public Action<string> Log;
         // 浮层线程走到哪一步了（诊断用）：卡片线程一旦死在半路，窗口会留在屏幕上但什么都不画。
         volatile string stage = "new";
 
@@ -243,11 +282,12 @@ namespace ClassSlideSync.Plugin.Ui
                 wc.lpfnWndProc = proc;
                 wc.hInstance = hInst;
                 wc.hCursor = LoadCursor(IntPtr.Zero, IDC_HAND);
-                wc.lpszClassName = "ClassSlideSyncCard";
-                if (RegisterClassEx(ref wc) == 0 && Marshal.GetLastWin32Error() != 1410) { Fail("RegisterClassEx"); return; }
+                wc.lpszClassName = className;
+                if (RegisterClassEx(ref wc) == 0) { Fail("RegisterClassEx"); return; }
+                classRoots.Add(proc);   // 钉住委托：类活着，回调指针就必须一直有效
 
                 // A message-only window keeps the pump alive even while the card is collapsed.
-                pumpHwnd = CreateWindowEx(0, "ClassSlideSyncCard", "pump", WS_POPUP,
+                pumpHwnd = CreateWindowEx(0, className, "pump", WS_POPUP,
                     0, 0, 0, 0, new IntPtr(-3) /*HWND_MESSAGE*/, IntPtr.Zero, hInst, IntPtr.Zero);
                 if (pumpHwnd == IntPtr.Zero) { Fail("CreateWindowEx(pump)"); return; }
 
@@ -257,7 +297,7 @@ namespace ClassSlideSync.Plugin.Ui
                 // 从而与 ClassIsland 主界面（黑底 50%）观感一致的办法。
                 hwnd = CreateWindowEx(
                     WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
-                    "ClassSlideSyncCard", "课件续页", WS_POPUP,
+                    className, "课件续页", WS_POPUP,
                     screenRight - tabWidth, screenTop + (screenHeight - cardHeight) / 2,
                     cardWidth, cardHeight, IntPtr.Zero, IntPtr.Zero, hInst, IntPtr.Zero);
                 if (hwnd == IntPtr.Zero) { Fail("CreateWindowEx(card)"); return; }
@@ -495,6 +535,9 @@ namespace ClassSlideSync.Plugin.Ui
                 CardState st;
                 lock (gate) { st = pending; }
                 bool want = st.DeckOpen || DateTime.UtcNow < previewUntil;
+                // 2026-10-17：状态变了却没被应用（唤醒消息丢了、或者 ApplyPending 里出过异常），
+                // 这里补一条。引擎按哈希去重不会再推第二遍，没有这道兜底卡片就永远停在旧状态。
+                if (st.Hash() != appliedHash) { Wake(WM_APP_APPLY); return; }
                 if (want != shown) { Wake(WM_APP_APPLY); return; }
                 // 课件刚打开、本该弹小窗，却还缩在边上（同样是被丢消息的后果）。
                 if (want && !expanded && !expandedForDeck) Wake(WM_APP_APPLY);
@@ -540,9 +583,40 @@ namespace ClassSlideSync.Plugin.Ui
                     case WM_LBUTTONDOWN:
                         lastActivity = DateTime.UtcNow;
                         RestartHideTimer();
+                        BeginDrag(hWnd);
+                        return IntPtr.Zero;
+
+                    // 按住拖动。鼠标可能已经跑到窗口外面，所以按下时 SetCapture，
+                    // 后续的 MOUSEMOVE / BUTTONUP 才会继续送到这个窗口。
+                    case WM_MOUSEMOVE:
+                        if (dragArmed)
+                        {
+                            POINT p;
+                            if (GetCursorPos(out p))
+                            {
+                                int dx = p.X - dragStartCursor.X, dy = p.Y - dragStartCursor.Y;
+                                if (!dragging && (Math.Abs(dx) > Scaled(4) || Math.Abs(dy) > Scaled(4))) dragging = true;
+                                if (dragging)
+                                {
+                                    lastActivity = DateTime.UtcNow;
+                                    SetWindowPos(hWnd, HWND_TOPMOST, dragStartRect.Left + dx, dragStartRect.Top + dy,
+                                        cardWidth, cardHeight, SWP_NOACTIVATE);
+                                }
+                            }
+                        }
                         return IntPtr.Zero;
 
                     case WM_LBUTTONUP:
+                        ReleaseCapture();
+                        if (dragArmed && dragging)
+                        {
+                            dragArmed = false;
+                            dragging = false;
+                            DropCard();
+                            return IntPtr.Zero;   // 拖完这一下不当点击，免得顺手把放映跳走
+                        }
+                        dragArmed = false;
+                        dragging = false;
                         OnClick((short)(lParam.ToInt64() & 0xFFFF), (short)((lParam.ToInt64() >> 16) & 0xFFFF));
                         return IntPtr.Zero;
 
@@ -578,6 +652,7 @@ namespace ClassSlideSync.Plugin.Ui
             applyCount++;
             CardState st;
             lock (gate) { st = pending; }
+            appliedHash = st.Hash();
             ApplyLook();
             // 外观可能刚刚变过（换边、改垂直位置、改缩放），所以每次都要重新摆一遍。
             Place();
@@ -591,6 +666,12 @@ namespace ClassSlideSync.Plugin.Ui
             {
                 shown = shouldShow;
                 ShowWindow(hwnd, shouldShow ? SW_SHOWNOACTIVATE : SW_HIDE);
+                var log = Log;
+                if (log != null)
+                {
+                    try { log("show=" + shouldShow + " deck=" + hasDeck + " preview=" + preview + " file=" + st.FileName); }
+                    catch { }
+                }
             }
             if (!shouldShow)
             {
@@ -606,12 +687,10 @@ namespace ClassSlideSync.Plugin.Ui
             // 设置页的"预览"也算一轮：老师改完颜色/大小，得看到整张卡片，不是光一个把手。
             if (autoShow && (st.Showing || hasDeck || preview))
             {
-                if (st.Showing || preview)
-                {
-                    expandedForDeck = true;
-                    DoExpand();
-                }
-                else if (!expandedForDeck)
+                // 2026-10-16 用户报的 bug（第 4 条）：放映中每翻一页引擎都会重推状态（哈希变了），
+                // 原来这里在 st.Showing 时无条件 DoExpand()，老师刚点收起箭头，下一页又自己弹开。
+                // 现在一份课件只自动弹一次（expandedForDeck），之后翻页只改数字，不再动展开状态。
+                if (!expandedForDeck)
                 {
                     expandedForDeck = true;
                     DoExpand();
@@ -627,6 +706,56 @@ namespace ClassSlideSync.Plugin.Ui
             if (expanded)
                 SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             InvalidateRect(hwnd, IntPtr.Zero, false);
+        }
+
+        void BeginDrag(IntPtr hWnd)
+        {
+            try
+            {
+                dragArmed = true;
+                dragging = false;
+                if (!GetCursorPos(out dragStartCursor) || !GetWindowRect(hWnd, out dragStartRect))
+                {
+                    dragArmed = false;
+                    return;
+                }
+                SetCapture(hWnd);
+            }
+            catch { dragArmed = false; }
+        }
+
+        /// <summary>
+        /// 松手落地：按卡片中心落在屏幕哪半边决定贴左还是贴右，竖直位置换算成百分比。
+        /// 位置只保存这两个值（贴边 + 百分比），和设置页里那两个设置完全一致 ——
+        /// “拖动”和“改设置”不会各存一套互相打架，卡片也只认这两个值来摆位。
+        /// </summary>
+        void DropCard()
+        {
+            try
+            {
+                RECT r;
+                if (hwnd == IntPtr.Zero || !GetWindowRect(hwnd, out r)) return;
+                int cx = (r.Left + r.Right) / 2;
+                bool onRight = cx >= (screenLeft + screenRight) / 2;
+                int winH = r.Bottom - r.Top;
+                int span = screenHeight - winH;
+                int pct = span > 0 ? (int)Math.Round((r.Top - screenTop) * 100.0 / span) : 50;
+                if (pct < 0) pct = 0;
+                if (pct > 100) pct = 100;
+
+                // 先就地生效，别等宿主回推外观（那一趟要跨线程，卡片会先闪回旧位置）。
+                look.OnRight = onRight;
+                look.VerticalPercent = pct;
+                Place();
+                ApplyWindowRegion();
+                InvalidateRect(hwnd, IntPtr.Zero, false);
+                lastActivity = DateTime.UtcNow;
+                RestartHideTimer();
+
+                var handler = PositionChanged;
+                if (handler != null) handler(onRight, pct);
+            }
+            catch { }
         }
 
         void OnClick(int x, int y)
@@ -694,11 +823,13 @@ namespace ClassSlideSync.Plugin.Ui
                             collapseHit = new Rect32(0, 0, 0, 0);
                             showingCard = st.Showing;
                             bool rl = look.OnRight, rr = !look.OnRight;
-                            g.FillRounded(Color32.Mix(bg, text, 0.10), pill, radius, rl, rr);
+                            // 收起把手：白底 + 纯黑箭头（2026-10-17 用户要求“背景白色，箭头改为纯黑”）。
+                            // 白底上的黑箭头对比最强，不用再描边。
+                            g.FillRounded(bg, pill, radius, rl, rr);
                             g.StrokeRounded(hairline, pill, radius, rl, rr);
                             // 箭头永远指向"屏幕中间"：贴右边就是 ❮（往左拉出来），贴左边就是 ❯。
                             // 和展开态右上角那个"收回"箭头正好相反，一进一出不会看错。
-                            g.Text(look.OnRight ? "\u276E" : "\u276F", g.FontHuge, accent, pill, Align.Center, true);
+                            g.Text(look.OnRight ? "\u276E" : "\u276F", g.FontHuge, Color32.FromArgb(255, 0, 0, 0), pill, Align.Center, true);
                         }
                         else
                         {
@@ -890,6 +1021,18 @@ namespace ClassSlideSync.Plugin.Ui
         static extern IntPtr DispatchMessage(ref MSG lpmsg);
         [DllImport("user32.dll")]
         static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+        // 拖拽用（2026-10-16 用户第 3 条）：光标位置 + 鼠标捕获 + 窗口矩形。
+        [DllImport("user32.dll")]
+        static extern bool GetCursorPos(out POINT lpPoint);
+        [DllImport("user32.dll")]
+        static extern IntPtr SetCapture(IntPtr hWnd);
+        [DllImport("user32.dll")]
+        static extern bool ReleaseCapture();
+        [DllImport("user32.dll")]
+        static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+        struct POINT { public int X, Y; }
         [DllImport("user32.dll")]
         static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
         [DllImport("user32.dll")]
@@ -1009,6 +1152,7 @@ namespace ClassSlideSync.Plugin.Ui
             readonly IntPtr dc;
             readonly int width, height;
             readonly IntPtr fontSmall, fontBig, fontTiny, fontHuge;
+            readonly IntPtr nullPen;
 
             const int FW_NORMAL = 400, FW_SEMIBOLD = 600;
             const uint CLEARTYPE = 5, ANTIALIASED = 4, DEFAULT_CHARSET = 1, DEFAULT_PITCH = 0;
@@ -1041,6 +1185,12 @@ namespace ClassSlideSync.Plugin.Ui
                 savedBkMode = SetBkMode(dc, TRANSPARENT);
                 savedTextColor = SetTextColor(dc, 0xFFFFFF);
                 savedFont = SelectObject(dc, fontSmall);
+                // GDI 的 Rectangle / RoundRect 是"用画刷填、用画笔描边"：内存 DC 默认那支笔是 1px 黑笔，
+                // 于是每个填充都会在边上留一条黑线——收起把手右边那条竖线（r.R - radius 处）就是这么来的
+                // （2026-10-17 用户报的「有条线是bug」）。换成空笔，填充就只填不描边；
+                // 真正要描边的地方由 StrokeRounded 自己选笔、画完再还回来。
+                nullPen = CreatePen(5 /*PS_NULL*/, 0, 0);
+                SelectObject(dc, nullPen);
             }
 
             public IntPtr FontSmall { get { return fontSmall; } }
@@ -1144,6 +1294,7 @@ namespace ClassSlideSync.Plugin.Ui
                 SelectObject(dc, savedFont);
                 SetBkMode(dc, savedBkMode);
                 SetTextColor(dc, savedTextColor);
+                DeleteObject(nullPen);
                 DeleteObject(fontSmall);
                 DeleteObject(fontBig);
                 DeleteObject(fontTiny);

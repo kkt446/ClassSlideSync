@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.IO;
 using System.Runtime.CompilerServices;
@@ -48,6 +49,17 @@ namespace ClassSlideSync.Plugin.Core
         bool cardShowStatusLine = true;
         bool cardShowJumpLine = true;
         bool cardClickToJump = true;
+
+        // ---- 学科课件文件夹（2026-10-16 用户第 1 条）----
+        bool autoOpenSubjectFolder = true;
+        ObservableCollection<SubjectFolder> subjectFolders = new ObservableCollection<SubjectFolder>();
+
+        public SyncSettings()
+        {
+            // 集合内部的增删、以及每一行自己改路径，都要让宿主知道"设置有变化"，
+            // 否则 ConfigureFileHelper 不会保存：PropertyChanged 默认只在设置属性被赋值时触发。
+            subjectFolders.CollectionChanged += OnFoldersChanged;
+        }
 
         /// <summary>Show the floating card as soon as a show is detected.</summary>
         public bool AutoShowOverlay
@@ -296,6 +308,91 @@ namespace ClassSlideSync.Plugin.Core
             set { Set(ref cardClickToJump, value); }
         }
 
+        // ---- 学科课件文件夹（2026-10-16 用户第 1 条）----------------------------
+
+        /// <summary>
+        /// 上课时自动打开"当前科目对应的课件文件夹"（默认开）。科目名取自 ClassIsland 课表，
+        /// 文件夹在下面这个列表里配。
+        /// </summary>
+        public bool AutoOpenSubjectFolder
+        {
+            get { return autoOpenSubjectFolder; }
+            set { Set(ref autoOpenSubjectFolder, value); }
+        }
+
+        /// <summary>科目 → 课件文件夹。设置页里可以直接增删改。</summary>
+        public ObservableCollection<SubjectFolder> SubjectFolders
+        {
+            get { return subjectFolders; }
+            set
+            {
+                if (value == null || ReferenceEquals(value, subjectFolders)) return;
+                subjectFolders.CollectionChanged -= OnFoldersChanged;
+                subjectFolders = value;
+                subjectFolders.CollectionChanged += OnFoldersChanged;
+                foreach (SubjectFolder f in subjectFolders) Hook(f, true);
+                Raise(nameof(SubjectFolders));
+            }
+        }
+
+        /// <summary>
+        /// 按科目名找课件文件夹；找不到返回空串。ClassIsland 的科目名可以是复合的
+        /// （课表里写"劳动/英语"、简称"劳/英"），所以先整体匹配，再退回去试斜杠分开的每一段。
+        /// </summary>
+        public string FindSubjectFolder(string subjectName)
+        {
+            if (string.IsNullOrWhiteSpace(subjectName)) return "";
+            string want = subjectName.Trim();
+            string hit = MatchFolder(want);
+            if (hit.Length > 0) return hit;
+
+            char[] seps = new char[] { '/', '／', '\\', '、', '|', '+' };
+            if (want.IndexOfAny(seps) >= 0)
+            {
+                foreach (string part in want.Split(seps))
+                {
+                    hit = MatchFolder(part.Trim());
+                    if (hit.Length > 0) return hit;
+                }
+            }
+            return "";
+        }
+
+        string MatchFolder(string subject)
+        {
+            if (string.IsNullOrEmpty(subject)) return "";
+            foreach (SubjectFolder f in subjectFolders)
+            {
+                if (f == null) continue;
+                string name = f.Subject == null ? "" : f.Subject.Trim();
+                if (name.Length == 0) continue;
+                if (!string.Equals(name, subject, StringComparison.OrdinalIgnoreCase)) continue;
+                if (string.IsNullOrWhiteSpace(f.Folder)) continue;
+                return f.Folder.Trim();
+            }
+            return "";
+        }
+
+        void OnFoldersChanged(object sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
+        {
+            if (e.NewItems != null) foreach (SubjectFolder f in e.NewItems) Hook(f, true);
+            if (e.OldItems != null) foreach (SubjectFolder f in e.OldItems) Hook(f, false);
+            Raise(nameof(SubjectFolders));
+        }
+
+        void Hook(SubjectFolder f, bool on)
+        {
+            if (f == null) return;
+            if (on) f.PropertyChanged += OnFolderChanged;
+            else f.PropertyChanged -= OnFolderChanged;
+        }
+
+        void OnFolderChanged(object sender, PropertyChangedEventArgs e)
+        {
+            // 某一行改了科目名或路径：也算"设置变了"，让宿主把配置存下来。
+            Raise(nameof(SubjectFolders));
+        }
+
         /// <summary>#RRGGBB / #RRGGBBAA / 裸十六进制都接受，统一存成 #RRGGBB 形式的大写串。</summary>
         static string Normalize(string value)
         {
@@ -320,6 +417,11 @@ namespace ClassSlideSync.Plugin.Core
         {
             if (EqualityComparer<T>.Default.Equals(field, value)) return;
             field = value;
+            Raise(name);
+        }
+
+        void Raise(string name)
+        {
             var h = PropertyChanged;
             if (h != null) h(this, new PropertyChangedEventArgs(name));
         }
@@ -327,5 +429,40 @@ namespace ClassSlideSync.Plugin.Core
         /// <summary>Where the ledger and logs live. Overridable so tests can redirect it.</summary>
         [JsonIgnore]
         public string DataFolder { get; set; }
+    }
+
+    /// <summary>
+    /// 一条「科目 → 课件文件夹」映射（2026-10-16 用户第 1 条：上课时自动打开这个学科放 PPT 的文件夹）。
+    /// ClassIsland 的科目名可以是复合的（课表里"劳动/英语"、简称"劳/英"），
+    /// 匹配规则见 <see cref="SyncSettings.FindSubjectFolder"/>。
+    /// </summary>
+    public sealed class SubjectFolder : INotifyPropertyChanged
+    {
+        string subject = "";
+        string folder = "";
+
+        /// <summary>课表里的科目名，和 ClassIsland 科目列表里显示的一致（例：语文）。</summary>
+        public string Subject
+        {
+            get { return subject; }
+            set { Set(ref subject, value == null ? "" : value.Trim()); }
+        }
+
+        /// <summary>这个科目放课件的文件夹全路径。</summary>
+        public string Folder
+        {
+            get { return folder; }
+            set { Set(ref folder, value == null ? "" : value.Trim()); }
+        }
+
+        public event PropertyChangedEventHandler PropertyChanged;
+
+        void Set(ref string field, string value, [CallerMemberName] string name = null)
+        {
+            if (string.Equals(field, value, StringComparison.Ordinal)) return;
+            field = value;
+            var h = PropertyChanged;
+            if (h != null) h(this, new PropertyChangedEventArgs(name));
+        }
     }
 }

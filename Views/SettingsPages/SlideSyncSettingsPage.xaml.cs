@@ -1,3 +1,4 @@
+using Avalonia.Controls;
 using Avalonia.Interactivity;
 using ClassIsland.Core.Abstractions.Controls;
 using ClassIsland.Core.Attributes;
@@ -39,5 +40,28 @@ public partial class SlideSyncSettingsPage : SettingsPageBase
         {
             Plugin.Service.ShowCardNow();
         }
+    }
+
+    /// <summary>学科文件夹表：加一行（用户 2026-10-16 第 1 条）。</summary>
+    void OnAddSubjectFolder(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            Settings.SubjectFolders.Add(new SubjectFolder());
+        }
+        catch { }
+    }
+
+    /// <summary>学科文件夹表：删掉这一行（按钮的 Tag 里带着那一行）。</summary>
+    void OnRemoveSubjectFolder(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            if (sender is Button b && b.Tag is SubjectFolder folder)
+            {
+                Settings.SubjectFolders.Remove(folder);
+            }
+        }
+        catch { }
     }
 }

@@ -141,6 +141,39 @@ namespace ClassSlideSync.Plugin.Core
             return best;
         }
 
+        /// <summary>
+        /// 只拿得到“文档名”（窗口标题里的，比如“测试课件.pptx”）时按文件名找最近一条记录。
+        /// 2026-10-17 加：WPS 打开文件的头十几秒 COM 不回话，用标题里的名字就能立刻把卡片点亮。
+        /// 同名不同目录时取最近用过的那份（老师刚打开的多半就是它）。
+        /// </summary>
+        public SessionRecord FindByName(string fileName)
+        {
+            if (string.IsNullOrWhiteSpace(fileName) || ByFile == null) return null;
+            string want = fileName.Trim();
+            SessionRecord best = null;
+            string bestPath = "";
+            foreach (var kv in ByFile)
+            {
+                var list = kv.Value;
+                if (list == null) continue;
+                for (int i = 0; i < list.Count; i++)
+                {
+                    var r = list[i];
+                    if (r == null || string.IsNullOrEmpty(r.FilePath)) continue;
+                    string name;
+                    try { name = Path.GetFileName(r.FilePath); } catch { name = r.FilePath; }
+                    if (!string.Equals(name, want, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (best == null || string.CompareOrdinal(r.StartedAt ?? "", best.StartedAt ?? "") > 0)
+                    {
+                        best = r;
+                        bestPath = r.FilePath;
+                    }
+                }
+            }
+            if (best != null && best.FilePath != bestPath) best.FilePath = bestPath;
+            return best;
+        }
+
         public void Add(SessionRecord r)
         {
             var k = Key(r.FilePath);

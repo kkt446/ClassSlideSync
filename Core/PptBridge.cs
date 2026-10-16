@@ -60,6 +60,8 @@ namespace ClassSlideSync.Plugin.Core
         static extern bool IsWindowVisible(IntPtr hWnd);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         static extern int GetClassNameW(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern int GetWindowTextW(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
 
         [ComImport, Guid("00000010-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
         interface IRunningObjectTable
@@ -124,6 +126,20 @@ namespace ClassSlideSync.Plugin.Core
         /// `screenClass`；WPS 演示 12.1 是 `PP12FrameClass`）。见 SuiteOnScreen。
         /// </summary>
         static readonly string[] SuiteWindowClasses = { "PPTFrameClass", "PP12FrameClass", "screenClass" };
+
+        /// <summary>
+        /// 2026-10-17 实测（用户报「关掉 PPT 再打开，插件要好几十秒才响应」时顺手枚举了本机窗口）：
+        /// 现在这版 WPS 的文档/放映窗口是 Qt 做的，类名 `Qt5QWindowIcon`，而且**主进程是 wps.exe**
+        /// （枚举结果：wps.exe / wpscloudsvr.exe，一个 wpp.exe 都没有）。这个类名太通用，所以只在
+        /// "窗口属于演示软件进程"时才认（见 IsSuiteFrame），免得别的 Qt 程序把卡片勾出来。
+        /// </summary>
+        static readonly string[] SuiteQtFrameClasses = { "Qt5QWindowIcon" };
+
+        /// <summary>
+        /// 这些进程的窗口才可能是演示窗口。wps.exe 只出现在这里、**不**进 SuiteProcessNames：
+        /// 它是开机常驻的（WPS 文字/表格也用），进了进程判据卡片就永远关不掉。
+        /// </summary>
+        static readonly string[] SuiteWindowOwnerNames = { "POWERPNT", "wpp", "wps" };
 
         public object Com { get; private set; }
         public string ProgId { get; private set; }
@@ -263,11 +279,67 @@ namespace ClassSlideSync.Plugin.Core
             GetWindowThreadProcessId(h, out pid);
             try
             {
-                string n = System.Diagnostics.Process.GetProcessById((int)pid).ProcessName;
-                return n.Equals("POWERPNT", StringComparison.OrdinalIgnoreCase)
-                    || n.Equals("wpp", StringComparison.OrdinalIgnoreCase);
+                // 2026-10-16：这个 Process 以前不 Dispose —— 调度器每 2 秒问一次"桌面上有没有演示窗口"，
+                // 一上午就能漏掉几千个句柄。用户反馈用久了 WPS 关不干净，顺手一起收掉。
+                using (var p = System.Diagnostics.Process.GetProcessById((int)pid))
+                {
+                    string n = p.ProcessName;
+                    if (n.Equals("POWERPNT", StringComparison.OrdinalIgnoreCase)
+                        || n.Equals("wpp", StringComparison.OrdinalIgnoreCase)) return true;
+                    // 2026-10-17：wps.exe 是新版 WPS 的真正窗口宿主（WPS 文字/表格也在里面）。
+                    // 只有类名是我们认得的 WPS Qt 主框架时才算它是"演示窗口"——判错的代价只是卡片
+                    // 多显示一句"正在识别课件…"，判漏的代价是老师开着课件插件却毫不知情。
+                    if (n.Equals("wps", StringComparison.OrdinalIgnoreCase))
+                    {
+                        for (int i = 0; i < SuiteQtFrameClasses.Length; i++)
+                            if (string.Equals(cls, SuiteQtFrameClasses[i], StringComparison.Ordinal)) return true;
+                    }
+                    return false;
+                }
             }
             catch { return false; }
+        }
+
+        /// <summary>
+        /// 桌面上可见的演示窗口各自“打开的文档名”（从窗口标题里取，不需要 COM）。
+        ///
+        /// 2026-10-17 用户实测：WPS 打开一个文件的头十几秒里，它的对象模型**接受调用但不回话**，
+        /// 于是“这到底是什么课件”全压在 COM 上，卡片只能干等，用户看到的就是
+        /// 「一直在识别课件，过十秒才识别出来」。窗口标题是免费的（GetWindowTextW，微秒级），
+        /// 拿到文档名就能去台账里翻出“上次讲到第几页”，卡片立刻有内容；COM 回话后再补实时页码。
+        /// </summary>
+        public static string[] SuiteFrameDocuments()
+        {
+            var list = new List<string>();
+            EnumWindowsProc cb = delegate (IntPtr h, IntPtr lparam)
+            {
+                try
+                {
+                    if (!IsWindowVisible(h)) return true;
+                    if (!IsSuiteFrame(h)) return true;
+                    var sb = new StringBuilder(512);
+                    GetWindowTextW(h, sb, sb.Capacity);
+                    string doc = DocumentFromTitle(sb.ToString());
+                    if (doc.Length > 0 && !list.Contains(doc)) list.Add(doc);
+                }
+                catch { }
+                return true;
+            };
+            try { EnumWindows(cb, IntPtr.Zero); } catch { }
+            GC.KeepAlive(cb);
+            return list.ToArray();
+        }
+
+        /// <summary>从窗口标题里抠出文档名：“测试课件.pptx - WPS Office” → “测试课件.pptx”。</summary>
+        static string DocumentFromTitle(string title)
+        {
+            if (string.IsNullOrWhiteSpace(title)) return "";
+            int i = title.IndexOf(" - ", StringComparison.Ordinal);
+            string head = (i > 0 ? title.Substring(0, i) : title).Trim();
+            string[] exts = { ".ppt", ".pptx", ".pptm", ".pps", ".ppsx", ".dps", ".dpt" };
+            for (int k = 0; k < exts.Length; k++)
+                if (head.EndsWith(exts[k], StringComparison.OrdinalIgnoreCase)) return head;
+            return "";
         }
 
         /// <summary>只看进程名（大小写不敏感），给上面几个判断用。</summary>
@@ -276,7 +348,10 @@ namespace ClassSlideSync.Plugin.Core
             try
             {
                 var ps = System.Diagnostics.Process.GetProcessesByName(name);
-                return ps != null && ps.Length > 0;
+                if (ps == null || ps.Length == 0) return false;
+                // 同上：这批 Process 句柄要还回去（老的写法只看了长度就丢掉，句柄一直挂着）。
+                for (int i = 0; i < ps.Length; i++) { try { ps[i].Dispose(); } catch { } }
+                return true;
             }
             catch { return false; }
         }
@@ -898,6 +973,25 @@ namespace ClassSlideSync.Plugin.Core
             return null;
         }
 
+        /// <summary>
+        /// 放映刚结束时课件停在编辑视图的第几页（1 起，取不到返回 0）。
+        /// 2026-10-16 用户第 6 条：老师在最后一面直接结束放映，放映窗口一消失页码就再也问不到了；
+        /// 而 PowerPoint/WPS 结束放映后编辑视图会停在这一页，趁收尾的 2 秒窗口把它读回来。
+        /// </summary>
+        public int EditingSlide()
+        {
+            try
+            {
+                var pres = FindPresentation(null);          // 当前活动课件
+                var windows = pres == null ? null : P(pres, "Windows");
+                var w = windows == null ? null : PIndex(windows, "Item", 1);
+                var view = w == null ? null : P(w, "View");
+                var slide = view == null ? null : P(view, "Slide");
+                return AsInt(P(slide, "SlideIndex")) ?? 0;
+            }
+            catch { return 0; }
+        }
+
         object TrySet(object target, string name, object value)
         {
             if (target == null) return null;
@@ -1044,8 +1138,27 @@ namespace ClassSlideSync.Plugin.Core
 
         public void Dispose()
         {
-            try { if (Com != null) Marshal.ReleaseComObject(Com); } catch { }
+            // 2026-10-16 用户第 5 条（上完课关 WPS 时直接卡死）：这里原来只释放了 Com。
+            // keepAlive / keepAliveShow 这两个"防止 Office 顺手关掉自动化文档"的引用一直挂着，
+            // 每丢一次桥就漏一组 RCW；而 WPS 退出时要等所有外部客户端放手，于是它自己关不掉。
+            Release(ref keepAliveShow);
+            Release(ref keepAlive);
+            try { if (Com != null && Marshal.IsComObject(Com)) Marshal.FinalReleaseComObject(Com); } catch { }
             Com = null;
+
+            // 2026-10-17：这里原来跟着一句 GC.Collect() + WaitForPendingFinalizers() 想催终结器。
+            // 强回收本身没必要（FinalReleaseComObject 已经把引用计数打到 0，COM 服务器当场就知道
+            // 客户端走了，不用等 GC），而且它把 NativeOverlayCard 的 WndProc 委托一起收走了 ——
+            // 事件日志：A callback was made on a garbage collected delegate of type
+            // …NativeOverlayCard+WndProcDelegate::Invoke（at DispatchMessage / Run），
+            // 运行时直接 FailFast，把 ClassIsland.Desktop 整个进程带崩。所以强回收不再做。
+        }
+
+        static void Release(ref object o)
+        {
+            if (o == null) return;
+            try { if (Marshal.IsComObject(o)) Marshal.FinalReleaseComObject(o); } catch { }
+            o = null;
         }
     }
 }

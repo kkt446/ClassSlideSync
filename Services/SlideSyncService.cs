@@ -1,6 +1,8 @@
 using System;
 using Avalonia.Controls;
 using ClassIsland.Core;
+using ClassIsland.Core.Abstractions.Services;
+using ClassIsland.Shared;
 using ClassSlideSync.Plugin.Core;
 using ClassSlideSync.Plugin.Ui;
 
@@ -35,6 +37,9 @@ namespace ClassSlideSync.Plugin.Services
         int restarts;
         string lastStatus = "";
         string lastClockNote = "";
+        // 上一次替它开过课件文件夹的那节课（用户 2026-10-16 第 1 条）：同一节课只开一次，
+        // 下课清零，下一节课再开。值就是课表读数（"第3节 09:40-10:20"）。
+        string lastLessonKey = "";
         bool clockLogged;
         DateTime lastPrune = DateTime.MinValue;
         // 课表说了算、且现在不在正课时间里 → 卡片整体藏起来（下课就消失，用户 2026-10-13 要求）。
@@ -120,6 +125,7 @@ namespace ClassSlideSync.Plugin.Services
                 string reason = "";
                 bool timetableGoverns = false;
                 bool inClass = false;
+                string lessonKey = "";
 
                 if (settings.AutoStartBeforeClass)
                 {
@@ -131,6 +137,7 @@ namespace ClassSlideSync.Plugin.Services
                         ledger.Log("clock: " + (v.Known ? "课表 " + v.All : "没有课表"));
                     }
                     inClass = v.InPeriod;
+                    lessonKey = v.InPeriod ? v.Detail : "";
                     // 今天课表上有课 → 显示与否由课表说了算（下课铃一响就隐藏，用户 2026-10-13 要求）。
                     timetableGoverns = v.Known && v.Periods > 0;
                     if (v.InLesson) { want = true; reason = "上课时段 " + v.Detail; }
@@ -142,6 +149,14 @@ namespace ClassSlideSync.Plugin.Services
                         lastClockNote = note;
                         ledger.Log("clock: " + note);
                     }
+                }
+
+                // 用户 2026-10-16 第 1 条：正课一开始就把这一科的课件文件夹打开（同一节课只开一次）。
+                // 值取课表读数（含节次与时间），下课铃一响 lessonKey 变空，下一节课重新开。
+                if (inClass && lessonKey.Length > 0 && lessonKey != lastLessonKey)
+                {
+                    lastLessonKey = lessonKey;
+                    TryOpenSubjectFolder();
                 }
 
                 // 用户 2026-10-15 的要求："插件在后台一直常驻，只看 WPS 演示 / PowerPoint 的进程 ——
@@ -203,6 +218,14 @@ namespace ClassSlideSync.Plugin.Services
                     live.SuppressCard = suppressCard;
                     live.SuiteRunning = suiteShowing;
                     live.SuiteName = suiteName;
+
+                    // 2026-10-17 用户实测「关掉 PPT 再打开，插件要好几十秒才响应」：那几十秒里引擎
+                    // 线程正卡在 WPS 的 COM 调用上（它自己没辙，只能等），但卡片不该跟着一起僵住。
+                    // 心跳超过 2.5 秒没动，就用内存里的状态兜一次，让老师至少看到「正在识别课件…」。
+                    if (suiteShowing && (DateTime.UtcNow - live.LastStepUtc).TotalSeconds > 2.5)
+                    {
+                        live.PushCheapState();
+                    }
                 }
 
                 if ((DateTime.Now - lastPrune).TotalHours > 24) PruneHistory();
@@ -231,6 +254,88 @@ namespace ClassSlideSync.Plugin.Services
             catch { return detail; }
         }
 
+        /// <summary>
+        /// 老师把卡片拖到别处了（2026-10-16 第 3 条）：把新位置写回设置，下次启动就从这儿出现。
+        /// 卡片自己已经先摆好了，这里只负责记住；Plugin 订阅了 Settings.PropertyChanged，
+        /// 赋值会顺带落盘。
+        /// </summary>
+        void OnPositionChanged(bool onRight, int verticalPercent)
+        {
+            try
+            {
+                settings.CardOnLeft = !onRight;
+                settings.CardVerticalPercent = verticalPercent;
+                ledger.Log("card moved: side=" + (onRight ? "right" : "left") + " v=" + verticalPercent + "%");
+            }
+            catch (Exception ex) { try { ledger?.Log("card move failed: " + ex.Message); } catch { } }
+        }
+
+        /// <summary>
+        /// 上课了：把当前科目对应的课件文件夹打开（2026-10-16 第 1 条）。
+        /// 按 docs.classisland.tech 的标准，外部导航交给宿主的 IUriNavigationService.Navigate
+        /// （ClassIsland 自己也是 shell-execute 打开文件/文件夹的，见 ClassIsland.dll 里的
+        /// ProcessStartInfo.UseShellExecute）；它要是抛异常，再退回落回 .NET 的 ShellExecute。
+        /// </summary>
+        void TryOpenSubjectFolder()
+        {
+            string subject = "";
+            string folder = "";
+            try
+            {
+                if (!settings.AutoOpenSubjectFolder) return;
+                subject = CurrentSubjectName();
+                if (subject.Length == 0) { ledger.Log("subject folder: 课表没给出科目名，跳过"); return; }
+                folder = settings.FindSubjectFolder(subject);
+                if (folder.Length == 0) { ledger.Log("subject folder: " + subject + " 没有配文件夹"); return; }
+                if (!System.IO.Directory.Exists(folder)) { ledger.Log("subject folder: " + folder + " 不存在"); return; }
+
+                bool handed = false;
+                try
+                {
+                    var nav = IAppHost.TryGetService<IUriNavigationService>();
+                    if (nav != null)
+                    {
+                        nav.Navigate(new Uri(folder));
+                        handed = true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ledger.Log("subject folder: Navigate 失败（" + ex.GetType().Name + "），改用 ShellExecute");
+                }
+
+                if (!handed)
+                {
+                    System.Diagnostics.Process.Start(
+                        new System.Diagnostics.ProcessStartInfo(folder) { UseShellExecute = true });
+                }
+
+                ledger.Log("subject folder: opened " + folder + " for " + subject);
+            }
+            catch (Exception ex)
+            {
+                try { ledger?.Log("subject folder failed: " + subject + " -> " + folder + " : " + ex.Message); } catch { }
+            }
+        }
+
+        /// <summary>当前科目名（ClassIsland 课表里的"科目"，课间/没有课表时是空串）。</summary>
+        string CurrentSubjectName()
+        {
+            try
+            {
+                var lessons = IAppHost.TryGetService<ILessonsService>();
+                var subject = lessons == null ? null : lessons.CurrentSubject;   // 属性在父接口 IPublicLessonsService 上
+                if (subject == null) return "";
+                string name = subject.Name;
+                return string.IsNullOrWhiteSpace(name) ? "" : name.Trim();
+            }
+            catch (Exception ex)
+            {
+                try { ledger?.Log("subject read failed: " + ex.Message); } catch { }
+                return "";
+            }
+        }
+
         void Arm(string reason)
         {
             if (armed) return;
@@ -241,6 +346,9 @@ namespace ClassSlideSync.Plugin.Services
             var c = new NativeOverlayCard();
             c.Configure(Appearance, settings.AutoShowOverlay, settings.AutoHide, settings.AutoHideSeconds);
             c.JumpRequested += OnJumpRequested;
+            c.PositionChanged += OnPositionChanged;   // 用户第 3 条：拖完记住位置
+            // 卡片的显示/隐藏变化写进 app.log：老师报"卡片该出来却没出来"时，日志要能直接看出来。
+            c.Log = m => { try { ledger.Log("card: " + m); } catch { } };
             c.Start();
             card = c;
 
@@ -298,6 +406,7 @@ namespace ClassSlideSync.Plugin.Services
             if (c != null)
             {
                 try { c.JumpRequested -= OnJumpRequested; } catch { }
+                try { c.PositionChanged -= OnPositionChanged; } catch { }
                 try { c.Dispose(); } catch { }
             }
 

@@ -309,7 +309,10 @@ namespace ClassSlideSync.Plugin.Core
             }
             else if (follow)
             {
-                a.BgR = theme.BgR; a.BgG = theme.BgG; a.BgB = theme.BgB;
+                // 2026-10-16 用户第 2 条：跟随时用「ClassIsland 卡片那种白底」，不再照抄主题的
+                // BackgroundColor —— 本机把主界面底色设成了纯黑（#000000FF），照抄就得到一张黑卡片，
+                // 跟宿主其他半透明白卡片完全不是一个观感。文字色随后按亮度自动切成深色。
+                a.BgR = 255; a.BgG = 255; a.BgB = 255;
             }
 
             int pct = s.CardOpacityPercent;
