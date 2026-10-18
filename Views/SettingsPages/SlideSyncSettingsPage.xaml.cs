@@ -42,6 +42,24 @@ public partial class SlideSyncSettingsPage : SettingsPageBase
         }
     }
 
+    /// <summary>
+    /// 新手引导：走 ClassIsland 自带的教程机制（TeachingTip 一步步指），
+    /// 内容和「教程中心」里那一条是同一份，见 <see cref="TutorialGuide"/>。
+    /// </summary>
+    void OnStartTutorialClick(object sender, RoutedEventArgs e)
+    {
+        if (TutorialGuide.Start())
+        {
+            GuideHint.IsVisible = false;
+            return;
+        }
+
+        // 起不来（比如宿主的教程服务不认我们的 JSON）也要说一声，不能让按钮点了像没点。
+        GuideHint.Text = "没能启动引导：当前 ClassIsland 版本可能不支持内置教程。"
+                       + "可以先看 README 的「怎么用」一节，功能本身不受影响。";
+        GuideHint.IsVisible = true;
+    }
+
     /// <summary>学科文件夹表：加一行（用户 2026-10-16 第 1 条）。</summary>
     void OnAddSubjectFolder(object sender, RoutedEventArgs e)
     {

@@ -70,6 +70,10 @@ namespace ClassSlideSync.Plugin.Services
         /// <summary>最近一次进入待命的原因，设置页/日志用它解释"插件现在为什么开着"。</summary>
         public string ArmReason { get; private set; }
 
+        // 卡片最后一次拿到的状态 = 老师此刻屏幕上看到的东西。
+        // 点跳页时用它取“那一页”，而不是让引擎再去查一遍台账（见 OnJumpRequested）。
+        volatile CardState lastState;
+
         /// <summary>ClassIsland 此刻的主题（主色、圆角、字体、字号）；卡片外观的第一来源。</summary>
         public ClassIslandTheme Theme { get; private set; }
 
@@ -165,12 +169,16 @@ namespace ClassSlideSync.Plugin.Services
                 // 但**不能只看进程名**：这台机器上 WPS 12.1 把演示窗口挂在 wps.exe 上（wpp.exe 只是
                 // 后台引擎），只认进程名时老师开着 PPT 插件也认为"演示软件不在" —— 所以进程在、
                 // 或者桌面上有演示窗口（窗口类名 PPTFrameClass / PP12FrameClass / screenClass），都算。
-                bool suiteProcess = PptBridge.SuiteActive();
+                bool seewoProcess = SeewoBridge.LooksRunning();
+                bool pptProcess = PptBridge.SuiteActive();
+                bool suiteProcess = pptProcess || seewoProcess;
                 bool suiteOnScreen = PptBridge.SuiteOnScreen();
-                if (suiteProcess) suiteName = PptBridge.SuiteName();
+                if (pptProcess) suiteName = PptBridge.SuiteName();
+                else if (seewoProcess) suiteName = "希沃白板";
                 if (suiteProcess && suiteName.Length == 0) suiteName = "演示软件";
-                bool bridgeHoldsDeck = engine != null && engine.Last != null && PptBridge.LooksLikePath(engine.Last.FilePath);
-                suiteShowing = suiteProcess && (bridgeHoldsDeck || suiteOnScreen);
+                bool bridgeHoldsDeck = engine != null && engine.Last != null
+                    && (PptBridge.LooksLikePath(engine.Last.FilePath) || SeewoBridge.IsSeewoKey(engine.Last.FilePath));
+                suiteShowing = suiteProcess && (bridgeHoldsDeck || suiteOnScreen || seewoProcess);
 
                 // 只在变化时记一行：老师报"我开 PPT 卡片没出来"时，这一行直接告诉我们卡在哪一步
                 // （进程没认出来 / 桌面上没看到演示窗口 / 桥接那个实例里没有课件）。
@@ -179,6 +187,7 @@ namespace ClassSlideSync.Plugin.Services
                     lastSuiteProcess = suiteProcess;
                     lastSuiteShowing = suiteShowing;
                     ledger.Log("suite: 进程=" + (suiteProcess ? "在" : "不在")
+                        + " 希沃=" + (seewoProcess ? "在" : "不在")
                         + " 桌面窗口=" + (suiteOnScreen ? "有" : "无")
                         + " 桥上有课件=" + (bridgeHoldsDeck ? "是" : "否")
                         + " → 卡片" + (suiteShowing ? "显示" : "隐藏"));
@@ -198,7 +207,8 @@ namespace ClassSlideSync.Plugin.Services
                 // 而退出 —— 一退出卡片就没了，老师看到的就是"啥都没弹"。进程枚举有时候认不出 WPS
                 // 的某些版本/时机（SuiteIsRunning 的名字表是猜的），手上这份课件的证据更可靠。
                 var lastSnap = engine == null ? null : engine.Last;
-                bool bridgeHasDeck = lastSnap != null && PptBridge.LooksLikePath(lastSnap.FilePath);
+                bool bridgeHasDeck = lastSnap != null
+                    && (PptBridge.LooksLikePath(lastSnap.FilePath) || SeewoBridge.IsSeewoKey(lastSnap.FilePath));
 
                 if (want && !armed) Arm(reason);
                 else if (!want && armed)
@@ -346,6 +356,7 @@ namespace ClassSlideSync.Plugin.Services
             var c = new NativeOverlayCard();
             c.Configure(Appearance, settings.AutoShowOverlay, settings.AutoHide, settings.AutoHideSeconds);
             c.JumpRequested += OnJumpRequested;
+            c.HistoryJumpRequested += OnHistoryJumpRequested;   // 历史面板里点某一条 → 跳到那份文件的这一页
             c.PositionChanged += OnPositionChanged;   // 用户第 3 条：拖完记住位置
             // 卡片的显示/隐藏变化写进 app.log：老师报"卡片该出来却没出来"时，日志要能直接看出来。
             c.Log = m => { try { ledger.Log("card: " + m); } catch { } };
@@ -406,6 +417,7 @@ namespace ClassSlideSync.Plugin.Services
             if (c != null)
             {
                 try { c.JumpRequested -= OnJumpRequested; } catch { }
+                try { c.HistoryJumpRequested -= OnHistoryJumpRequested; } catch { }
                 try { c.PositionChanged -= OnPositionChanged; } catch { }
                 try { c.Dispose(); } catch { }
             }
@@ -504,11 +516,36 @@ namespace ClassSlideSync.Plugin.Services
 
         void OnJumpRequested()
         {
+            // 点卡片正文/跳页行 → 跳到卡片上写着的那一页。
+            // 必须用“老师看到的那个状态”里的页码：工作线程执行跳页要等下一次 Step（几十~几百毫秒），
+            // 这段时间里希沃退出授课（课件被关）、另一个套件的旧课件被认出来，键就变了
+            // （2026-10-18 日志：14:26:26 卡片上是希沃的 1->8，14:26:32 点跳转跳到了 WPS 第 6 页）。
+            var st = lastState;
+            int page = st == null ? 0 : st.Previous;   // 跳页行/正文写的都是 Previous（见 Paint）
+            RequestJump(page > 0 ? page : 0);
+        }
+
+        void OnHistoryJumpRequested(string filePath, int slide)
+        {
+            // 文件夹面板里的历史行可能是另一份课件的，必须把文件一起交给引擎；
+            // 单文件历史面板传的是同一条记录的文件（旧行为不变）。
+            RequestJump(filePath, slide);
+        }
+
+        void RequestJump(int slide)
+        {
+            RequestJump(null, slide);
+        }
+
+        void RequestJump(string filePath, int slide)
+        {
             try
             {
                 var e = engine;
                 if (e == null) return;
-                e.RequestJump();
+                // slide > 0 = 历史面板选中的具体页；0 = 沿用原来的“上次停的那一页”。
+                if (slide > 0) e.RequestJumpTo(filePath, slide);
+                else e.RequestJump();
                 // 这里不能报“已跳到第 N 页”：RequestJump 只是把请求丢给工作线程（见 SessionEngine），
                 // 此时 engine.Last 还是跳之前的页码，会印出“已跳转到第 1 页”这种假消息。真正的结果由
                 // 工作线程 SetStatus 推回来。
@@ -529,6 +566,8 @@ namespace ClassSlideSync.Plugin.Services
             {
                 var c = card;
                 if (c == null) return;
+                // 先记下“屏幕上现在是什么”，跳页时 (可能就在几毫秒后) 会用这一份。
+                lastState = st;
                 if (st.Status != lastStatus)
                 {
                     lastStatus = st.Status;

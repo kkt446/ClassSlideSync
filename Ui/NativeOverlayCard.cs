@@ -96,6 +96,12 @@ namespace ClassSlideSync.Plugin.Ui
         const int BaseCardWidth = 236;
         const int BaseCardHeight = 150;
         const int BaseTabWidth = 32;
+        /// <summary>历史面板最多列几条。卡片不做滚动，多出来的旧记录就不显示了。</summary>
+        const int MaxHistoryRows = 6;
+        /// <summary>「打开过的课件」最多列几份。第 9 份起不画（也不做滚动）。</summary>
+        const int MaxFileRows = 8;
+        /// <summary>右下角文件夹图标的稿子尺寸（96 dpi），实际绘制走 Scaled()。</summary>
+        const int FolderIconSize = 24;
         int dpi = 96;
 
         int Scaled(int v) { return (int)Math.Round(v * dpi / 96.0); }
@@ -114,6 +120,23 @@ namespace ClassSlideSync.Plugin.Ui
         bool fontInstalled;
         string fontNote = "";
         bool expanded;
+
+        // 历史面板（用户 2026-10-18 要求：从卡片上翻这份课件的历史页码并跳过去）。
+        // 命中矩形和页码都在 Paint 里现算，只在浮层线程读写，不需要额外加锁。
+        bool historyPanel;
+        Rect32 historyHit;
+        Rect32 backHit;
+        readonly Rect32[] historyRowHits = new Rect32[MaxHistoryRows];
+        readonly int[] historyRowSlides = new int[MaxHistoryRows];
+        // 面板二（某份文件的历史）点开的那份文件；为 null 时沿用旧的“本课件历史”。
+        CardFileItem? selectedFile;
+        // true = 面板二是从「打开过的课件」进来的，返回要回面板一，而不是直接回卡片。
+        bool historyBackToFiles;
+
+        // 面板一（文件夹 → 打开过的全部课件）。folderHit 是右下角那个文件夹图标。
+        bool filePanel;
+        Rect32 folderHit;
+        readonly Rect32[] fileRowHits = new Rect32[MaxFileRows];
 
         // 拖拽（2026-10-16 用户要求：悬浮窗可以鼠标拖着走，松手记住位置）。
         // 按下时先只记"预备"，移动超过几个像素才算真拖 —— 否则每一次点击都会被当成抖动的拖拽，
@@ -143,6 +166,13 @@ namespace ClassSlideSync.Plugin.Ui
 
         /// <summary>Raised on the overlay thread when the teacher clicks the page number.</summary>
         public event Action JumpRequested;
+
+        /// <summary>
+        /// 历史面板里点了一条记录（浮层线程）。参数是「哪份文件 + 要跳到的页码」；真正的
+        /// COM / MCP 调用由服务转给引擎的工作线程，浮层线程不碰。
+        /// 文件夹面板可以跨文件翻历史，所以文件必须跟着页码一起走。
+        /// </summary>
+        public event Action<string, int> HistoryJumpRequested;
 
         /// <summary>
         /// 老师把卡片拖到新位置并松手时触发（浮层线程）：参数是"贴不贴右边"和竖直百分比。
@@ -189,6 +219,11 @@ namespace ClassSlideSync.Plugin.Ui
                 lastError.Length > 0 ? "  << " + lastError : "")
                 + " | state: shown=" + shown + " deck=" + now.DeckOpen + " suiteOnly=" + now.SuiteOnly
                 + " showing=" + now.Showing + " applies=" + applyCount + " file=" + now.FileName
+                // hist/prev 是「历史 · N 次」入口与「第 N 页」的来源：入口看不见时，先看这两个数
+                // 是不是 0（键查不到台账），再看 card 高度有没有随 hist>0 长高（排版算错）。
+                + " hist=" + HistoryTotal(now) + "/" + HistoryRows(now)
+                + " files=" + (now == null || now.Files == null ? 0 : now.Files.Count) + "/" + FileRows(now)
+                + " prev=" + (now == null ? 0 : now.Previous) + (historyPanel ? " panel" : "") + (filePanel ? " filesPanel" : "")
                 + " stage=" + stage
                 + " | look: " + look.Describe() + (fontNote.Length > 0 ? "  << " + fontNote : "");
         }
@@ -372,8 +407,105 @@ namespace ClassSlideSync.Plugin.Ui
         {
             EnsureFont();
             ApplyMetrics();
+            CardState st;
+            lock (gate) { st = pending; }
+            ApplyContentHeight(st);
             ApplyWindowRegion();
             ApplyAlpha();
+        }
+
+        static int HistoryTotal(CardState st)
+        {
+            return st == null ? 0 : st.HistoryTotal;
+        }
+
+        /// <summary>面板二显示哪份文件的历史：从文件夹进来的用被点的那份，否则用卡片的当前课件。</summary>
+        List<CardHistoryItem> HistoryItems(CardState st)
+        {
+            if (historyPanel && selectedFile != null && selectedFile.History != null) return selectedFile.History;
+            return st == null ? null : st.History;
+        }
+
+        int HistoryRows(CardState st)
+        {
+            var rows = HistoryItems(st);
+            return rows == null ? 0 : Math.Min(rows.Count, MaxHistoryRows);
+        }
+
+        /// <summary>面板一实际画几行。状态里最多 8 份，卡片再兜一层，防止上层以后放宽了数量。</summary>
+        int FileRows(CardState st)
+        {
+            if (st == null || st.Files == null) return 0;
+            return Math.Min(st.Files.Count, MaxFileRows);
+        }
+
+        /// <summary>
+        /// 展开态正文需要的高度，单位是 96 dpi 的稿子像素。这张表必须和 <see cref="Paint"/> 里
+        /// 那串 <c>y += step…</c> 一一对应：以前这里拿 look.CardHeight（外观估算值）再加常数，
+        /// 一旦 Paint 增删一行、或者老师关掉某一行（ShowContext/ShowStatusLine）、或者缩放不是 1，
+        /// 两边就会差几像素。差在最后一行上，表现就是「历史 · N 次」被挤出可视区
+        /// （用户 2026-10-18 在 125% 缩放的机器上报"看不到这个入口"）。
+        /// 现在排版只有这一份行高表，DPI 只在最后乘一次。
+        /// </summary>
+        int ContentHeight96(CardState st)
+        {
+            int h = 10;
+            // 面板的抬头自己就是标题（面板二是被点的那份文件名），再画一行“当前课件”会张冠李戴；
+            // 旧的单文件历史面板保持原样，仍然在顶部显示当前文件名。
+            bool showTopName = look.ShowFileName && !filePanel && !(historyPanel && selectedFile != null);
+            if (showTopName) h += 22;
+            if (filePanel)
+            {
+                // 抬头 + 每份课件一行（空台账也留一行“还没有记录”）+ 返回 + 下边距
+                return h + 26 + Math.Max(1, FileRows(st)) * 26 + 26 + 10;
+            }
+            if (historyPanel)
+            {
+                // 抬头 + 每条一行 + 返回 + 下边距
+                return h + 26 + HistoryRows(st) * 26 + 26 + 10;
+            }
+            h += 50;                                                    // 大页码
+            h += 22;                                                    // 副标题
+            if (look.ShowJumpLine && st != null && st.Previous > 0) h += 26;
+            if (BitsText(st).Length > 0) h += 18;
+            if (HistoryTotal(st) > 0) h += 26;                          // 历史入口
+            // 状态行按“留了一行”算，不按此刻有没有字算：每次 ShowStatus 都改高度的话，
+            // 卡片会在点跳转的瞬间长高／缩回去（老师眼前一跳一跳的）。
+            if (look.ShowStatusLine) h += 18;
+            // 文件夹图标挪到右上角、收起箭头左边（2026-10-18 用户反馈“太高了，文件夹往上放放”），
+            // 不再为它单留一行，卡片高度回到加图标之前。
+            return h + 10;
+        }
+
+        /// <summary>正文下方那行小字（课表上下文 · 提示）。高度计算和绘制共用，免得两边不一致。</summary>
+        string BitsText(CardState st)
+        {
+            if (st == null || !look.ShowContext) return "";
+            var bits = st.Context.Length > 0 ? st.Context : "";
+            if (st.Hint.Length > 0) bits += (bits.Length > 0 ? "  ·  " : "") + st.Hint;
+            return bits;
+        }
+
+        /// <summary>
+        /// 卡片高度随内容走：展开态按实际要画的行数算，历史面板打开时按条数继续长高。
+        /// 上限是工作区高度——再高就会有一截画到屏幕外，老师点不到。
+        /// 收起态保持原高，贴边药丸的大小和位置不受历史入口影响。
+        /// </summary>
+        void ApplyContentHeight(CardState st)
+        {
+            int h96 = look.CardHeight;
+            if (expanded)
+            {
+                int need = ContentHeight96(st);
+                // 面板是“一屏列表”，高度就是内容高度：多留一截空白会让面板看着像没画完。
+                // 普通卡片则取大值：look.CardHeight 含老师的缩放（CardScale），内容表是 96dpi 行高；
+                // 放大卡片时窗口跟着变大，缩小时也不会把内容挤掉。
+                if (historyPanel || filePanel) h96 = need;
+                else if (need > h96) h96 = need;
+            }
+            int h = Scaled(h96);
+            if (screenHeight > 0 && h > screenHeight) h = screenHeight;
+            if (h > 0) cardHeight = h;
         }
 
         /// <summary>
@@ -489,6 +621,9 @@ namespace ClassSlideSync.Plugin.Ui
             expanded = true;
             lastActivity = DateTime.UtcNow;
             RestartHideTimer();
+            CardState st;
+            lock (gate) { st = pending; }
+            ApplyContentHeight(st);   // 历史入口那一行只在展开态占高度
             Place();
             ApplyWindowRegion();   // 展开态整窗可见，收起态只有那个小把手
             InvalidateRect(hwnd, IntPtr.Zero, false);
@@ -498,9 +633,101 @@ namespace ClassSlideSync.Plugin.Ui
         {
             if (!expanded) return;
             expanded = false;
+            // 面板是临时菜单：收起来之后下次展开应该回到正常卡片，而不是停在文件/历史列表上。
+            ResetPanels();
+            CardState st;
+            lock (gate) { st = pending; }
+            ApplyContentHeight(st);
             Place();
             ApplyWindowRegion();
             InvalidateRect(hwnd, IntPtr.Zero, false);
+        }
+
+        /// <summary>把两层菜单状态一起清掉。收起卡片、课件关掉时都走这里，避免残留的选中项。</summary>
+        void ResetPanels()
+        {
+            filePanel = false;
+            historyPanel = false;
+            selectedFile = null;
+            historyBackToFiles = false;
+        }
+
+        /// <summary>面板开/关/换层共用的重排：高度、贴边位置、圆角 region、重画一次都做齐。</summary>
+        void Relayout()
+        {
+            CardState st;
+            lock (gate) { st = pending; }
+            ApplyContentHeight(st);
+            Place();
+            ApplyWindowRegion();
+            InvalidateRect(hwnd, IntPtr.Zero, false);
+        }
+
+        /// <summary>打开「打开过的课件」面板。台账为空也打开：显示一行“还没有记录”比点了没反应好。</summary>
+        void OpenFilePanel()
+        {
+            if (filePanel) return;
+            filePanel = true;
+            historyPanel = false;
+            selectedFile = null;
+            historyBackToFiles = false;
+            lastActivity = DateTime.UtcNow;
+            RestartHideTimer();   // 老师主动点开的面板，15 秒倒计时重新开始
+            Relayout();
+        }
+
+        void CloseFilePanel()
+        {
+            if (!filePanel) return;
+            filePanel = false;
+            selectedFile = null;
+            Relayout();
+        }
+
+        /// <summary>从面板一某一行进入那份文件的历史（面板二）。</summary>
+        void OpenFileHistory(CardState st, int index)
+        {
+            if (st == null || st.Files == null || index < 0 || index >= FileRows(st)) return;
+            var f = st.Files[index];
+            if (f == null) return;
+            filePanel = false;
+            historyPanel = true;
+            selectedFile = f;
+            historyBackToFiles = true;
+            lastActivity = DateTime.UtcNow;
+            RestartHideTimer();
+            Relayout();
+        }
+
+        void OpenHistoryPanel()
+        {
+            if (historyPanel) return;
+            // 卡片底部「历史 · N 次」入口：看的是当前课件的单文件历史，返回直接回卡片。
+            historyPanel = true;
+            filePanel = false;
+            selectedFile = null;
+            historyBackToFiles = false;
+            lastActivity = DateTime.UtcNow;
+            RestartHideTimer();   // 老师主动点开的面板，15 秒倒计时重新开始
+            Relayout();
+        }
+
+        void CloseHistoryPanel()
+        {
+            if (!historyPanel) return;
+            if (historyBackToFiles)
+            {
+                // 面板二是从文件夹面板进来的：返回应该回面板一，让老师继续翻别的课件。
+                historyPanel = false;
+                filePanel = true;
+                historyBackToFiles = false;
+            }
+            else
+            {
+                historyPanel = false;
+                selectedFile = null;
+            }
+            Relayout();
         }
 
         void RestartHideTimer()
@@ -565,8 +792,10 @@ namespace ClassSlideSync.Plugin.Ui
                         // Dragged to (or started on) a monitor with a different scale factor:
                         // recompute the card's metrics and re-hang it on that monitor's edge.
                         dpi = (int)(wParam.ToInt64() & 0xFFFF);
-                        ApplyMetrics();
                         ApplyWorkArea(WorkingArea());
+                        // ApplyLook 会按新 DPI 重算宽度、内容高度和窗口 region；原来这里只调
+                        // ApplyMetrics，圆角区域会停留在旧尺寸上。
+                        ApplyLook();
                         Place();
                         InvalidateRect(hWnd, IntPtr.Zero, false);
                         return IntPtr.Zero;
@@ -652,16 +881,22 @@ namespace ClassSlideSync.Plugin.Ui
             applyCount++;
             CardState st;
             lock (gate) { st = pending; }
-            appliedHash = st.Hash();
-            ApplyLook();
-            // 外观可能刚刚变过（换边、改垂直位置、改缩放），所以每次都要重新摆一遍。
-            Place();
-
             // 只有"有课件"（正在放映，或者打开着某份课件）时卡片才该出现。待命期间（比如上课前
             // 1 分钟）还没有课件，屏幕上必须干干净净；设置页的"预览"给 20 秒豁免。
             bool hasDeck = st.DeckOpen;
             bool preview = DateTime.UtcNow < previewUntil;
             bool shouldShow = hasDeck || preview;
+            // 课件关了、预览到点了：面板不能继续留在屏幕上。
+            if (!shouldShow) ResetPanels();
+            // 单文件历史面板的数据源被清空时也收起来；文件夹进来的面板二看的是快照，
+            // 台账后来被清空也不该把老师正在翻的那一页抽走。
+            else if (historyPanel && !historyBackToFiles && HistoryTotal(st) == 0) historyPanel = false;
+
+            appliedHash = st.Hash();
+            ApplyLook();
+            // 外观可能刚刚变过（换边、改垂直位置、改缩放），所以每次都要重新摆一遍。
+            Place();
+
             if (shouldShow != shown)
             {
                 shown = shouldShow;
@@ -765,12 +1000,81 @@ namespace ClassSlideSync.Plugin.Ui
             if (!expanded) { DoExpand(); return; }
             // 收回箭头比跳页优先：它就画在卡片里，点错了把放映跳走是事故。
             if (Inside(collapseHit, x, y)) { DoCollapse(); return; }
+
+            // 文件夹面板（面板一）：点某份课件进它的历史，点“返回”回正常卡片。
+            if (filePanel)
+            {
+                CardState fs;
+                lock (gate) { fs = pending; }
+                for (int i = 0; i < MaxFileRows; i++)
+                {
+                    if (!Inside(fileRowHits[i], x, y)) continue;
+                    OpenFileHistory(fs, i);
+                    return;
+                }
+                if (Inside(backHit, x, y)) { CloseFilePanel(); return; }
+                return;   // 面板里点空白处：不替老师把面板收掉
+            }
+
+            // 历史面板：点某条记录就跳到那一页，点“返回”回上一层。这是老师自己点开的
+            // 显式菜单，所以不受 ClickToJump / showingCard 的限制（那两条是防误触整卡跳页的）。
+            if (historyPanel)
+            {
+                CardState hs;
+                lock (gate) { hs = pending; }
+                var items = HistoryItems(hs);
+                for (int i = 0; i < MaxHistoryRows; i++)
+                {
+                    int slide = historyRowSlides[i];
+                    if (slide <= 0 || !Inside(historyRowHits[i], x, y)) continue;
+                    // 面板二里每条记录自己就带着文件路径（可能和当前课件不是同一份），
+                    // 跳页必须按“这条记录的文件 + 页码”发，不能只发页码。
+                    string filePath = items != null && i < items.Count ? items[i].FilePath : "";
+                    CloseHistoryPanel();
+                    var jump = HistoryJumpRequested;
+                    if (jump != null) jump(filePath ?? "", slide);
+                    return;
+                }
+                if (Inside(backHit, x, y)) { CloseHistoryPanel(); return; }
+                return;   // 面板里点空白处：不跳页，也不替老师把面板收掉
+            }
+
+            // 右下角文件夹图标：进“打开过的全部课件”。必须排在整卡跳页之前，
+            // 否则放映中 showingCard=true，这个图标永远点不开。
+            if (folderHit.R > folderHit.L && Inside(folderHit, x, y)) { OpenFilePanel(); return; }
+
+            // 入口行要排在“整卡点击跳页”之前：放映中 showingCard=true，后面那段会把
+            // 任何不在跳转行上的点击都拦掉，历史入口就永远点不开了。
+            if (historyHit.R > historyHit.L && Inside(historyHit, x, y)) { OpenHistoryPanel(); return; }
+
             if (!look.ClickToJump) return;
             // 正在放映时只有“上次停在第 N 页”那一行可点：老师随手点在卡片别处就把放映跳走，
             // 是比不响应更糟的事故。
             if (showingCard && !Inside(jumpHit, x, y)) return;
             var h = JumpRequested;
             if (h != null) h();
+        }
+
+        /// <summary>
+        /// 右上角那个文件夹图标：实心黄色文件夹（2026-10-18 用户给了图样，要求“用这个样子”），
+        /// 左上小 tab + 夹身，叠一层更亮的夹盖，全用 GDI 圆角矩形拼，不引图片资源。
+        /// 尺寸从传入矩形算（约 24 逻辑像素），96/144 dpi 下形状一致，只是整体放大。
+        /// </summary>
+        void DrawFolderIcon(GdiCanvas g, Rect32 r, Color32 c)
+        {
+            int s = Math.Max(1, (r.B - r.T) / 12);   // 24px 时 s=2
+            var body = Color32.FromArgb(255, 0xF7, 0xC3, 0x3F);   // 文件夹主色（暖黄）
+            var lid = Color32.FromArgb(255, 0xFF, 0xDD, 0x7A);    // 夹盖更亮一点，做出层次
+            var edge = Color32.FromArgb(255, 0xE0, 0xA5, 0x1E);   // 描边，深一档
+
+            // 夹身：左上角被 tab 抬起，所以整块从 y+4s 开始，圆角 2s
+            g.FillRounded(body, new Rect32(r.L + 2 * s, r.T + 4 * s, r.R - 2 * s, r.B - 2 * s), 2 * s, true, true);
+            // tab：夹身左上那一小块
+            g.FillRounded(body, new Rect32(r.L + 2 * s, r.T + 2 * s, r.L + 7 * s, r.T + 6 * s), s, true, true);
+            // 夹盖：一条更亮的横带，压住 tab 与夹身的接缝
+            g.FillRounded(lid, new Rect32(r.L + 3 * s, r.T + 5 * s, r.R - 3 * s, r.T + 7 * s), 0, false, false);
+            // 描边：给图标一个轮廓，白底卡片上也不至于糊成一团
+            g.StrokeRounded(edge, new Rect32(r.L + 2 * s, r.T + 4 * s, r.R - 2 * s, r.B - 2 * s), 2 * s, true, true);
         }
 
         static bool Inside(Rect32 r, int x, int y)
@@ -815,6 +1119,17 @@ namespace ClassSlideSync.Plugin.Ui
                         int radius = Scaled(look.Radius);
                         g.Clear(bg);
 
+                        // 命中区每次重画都先清空：分页/历史一变，旧矩形不能继续可点。
+                        historyHit = new Rect32(0, 0, 0, 0);
+                        backHit = new Rect32(0, 0, 0, 0);
+                        for (int i = 0; i < MaxHistoryRows; i++)
+                        {
+                            historyRowHits[i] = new Rect32(0, 0, 0, 0);
+                            historyRowSlides[i] = 0;
+                        }
+                        folderHit = new Rect32(0, 0, 0, 0);
+                        for (int i = 0; i < MaxFileRows; i++) fileRowHits[i] = new Rect32(0, 0, 0, 0);
+
                         if (!expanded)
                         {
                             // 收起态：贴屏幕边缘的一个小把手（像本体的侧边条），箭头用主题色点睛。
@@ -844,7 +1159,10 @@ namespace ClassSlideSync.Plugin.Ui
                             int lineTiny = Scaled(18), stepTiny = Scaled(18);
                             int lineJump = Scaled(22), stepJump = Scaled(26);
 
-                            if (look.ShowFileName)
+                            // 面板二（某份文件的历史）自己就是标题，不再画顶部“当前课件”那一行：
+                            // 否则老师点开的是另一份课件，标题却写着当前这份，会看错。
+                            bool panelTwo = historyPanel && selectedFile != null;
+                            if (look.ShowFileName && !filePanel && !panelTwo)
                             {
                                 string title = st.FileName.Length > 0 ? st.FileName : (st.Showing ? "正在放映" : "课件续页");
                                 // 右边留出收回箭头的位置，长文件名不会从箭头底下穿过去。
@@ -853,59 +1171,162 @@ namespace ClassSlideSync.Plugin.Ui
                                 y += stepSmall;
                             }
 
-                            int page = st.Showing ? st.Current : st.Previous;
-                            string pageText = page > 0 ? page.ToString() : "—";
-                            g.Text(pageText, g.FontBig, st.Showing ? accent : text,
-                                   new Rect32(pad, y, w - pad, y + lineBig), Align.Left, false);
-                            y += stepBig;
-
-                            string caption = st.Showing
-                                ? (look.ShowSlideCount && st.SlideCount > 0 ? "正在放映 · 共 " + st.SlideCount + " 页" : "正在放映")
-                                : (st.Previous > 0 ? "上次停在这一页"
-                                   : (st.SuiteOnly ? "正在识别课件…" : "等待放映"));
-                            g.Text(g.Ellipsis(caption, g.FontSmall, inner), g.FontSmall, muted,
-                                   new Rect32(pad, y, w - pad, y + lineSmall), Align.Left, false);
-                            y += stepSmall;
-
-                            // “上次停在第 N 页”是这插件存在的理由，所以它单占一行、带主题色底，
-                            // 而且只有这一行可点（见 OnClick）。
-                            showingCard = st.Showing || st.SuiteOnly;   // 等课件时整张卡片都不可点（只有收回箭头能点）
-                            jumpHit = new Rect32(0, 0, 0, 0);
-                            if (look.ShowJumpLine && st.Previous > 0)
+                            if (filePanel)
                             {
-                                string jump = st.Showing
-                                    ? "上次停在第 " + st.Previous + " 页 · 点这里跳过去"
-                                    : "点击从第 " + st.Previous + " 页开始放映";
-                                var row = new Rect32(pad - Scaled(7), y - Scaled(2), w - pad + Scaled(7), y + lineJump - Scaled(2));
-                                g.FillRounded(jumpFill, row, Scaled(6), true, true);
-                                g.Text(g.Ellipsis(jump, g.FontSmall, inner), g.FontSmall, accent,
-                                       new Rect32(pad, y, w - pad, y + lineJump), Align.Left, false);
-                                jumpHit = row;
+                                // 面板一：台账里所有打开过的课件。抬头不显示路径，老师不需要看 c:\...。
+                                g.Text("打开过的课件", g.FontSmall, muted,
+                                       new Rect32(pad, y, w - pad, y + lineSmall), Align.Left, false);
                                 y += stepJump;
-                            }
 
-                            var bits = "";
-                            if (look.ShowContext)
-                            {
-                                if (st.Context.Length > 0) bits = st.Context;
-                                if (st.Hint.Length > 0) bits += (bits.Length > 0 ? "  ·  " : "") + st.Hint;
-                            }
-                            if (bits.Length > 0)
-                            {
-                                g.Text(g.Ellipsis(bits, g.FontTiny, inner), g.FontTiny, muted,
-                                       new Rect32(pad, y, w - pad, y + lineTiny), Align.Left, false);
-                                y += stepTiny;
-                            }
+                                int rows = FileRows(st);
+                                if (rows == 0)
+                                {
+                                    // 台账为空也把面板打开：显示一句“还没有记录”，老师知道是没记录，
+                                    // 而不是图标坏了。这一层只留“返回”。
+                                    g.Text("还没有记录", g.FontTiny, muted,
+                                           new Rect32(pad, y, w - pad, y + lineJump), Align.Left, false);
+                                    y += stepJump;
+                                }
+                                for (int i = 0; i < rows; i++)
+                                {
+                                    var f = st.Files[i];
+                                    if (f == null) continue;
+                                    var row = new Rect32(pad - Scaled(7), y - Scaled(2), w - pad + Scaled(7), y + lineJump - Scaled(2));
+                                    fileRowHits[i] = row;
+                                    // 正在讲的这份用强调色，左边再补一小条，扫一眼就知道“现在在哪份”。
+                                    if (f.IsCurrent)
+                                        g.FillRounded(accent, new Rect32(pad - Scaled(7), y + Scaled(4), pad - Scaled(4), y + lineJump - Scaled(4)), Scaled(2), true, true);
+                                    // 行尾的「第 N 页 · 3 小时前」右对齐；文件名先按剩余宽度截断，两段不会叠。
+                                    int detailW = g.TextWidth(f.Detail, g.FontTiny);
+                                    int nameW = inner - detailW - Scaled(10);
+                                    if (nameW < Scaled(24)) nameW = inner;   // 细节太长时宁可截细节，也不把文件名挤没
+                                    g.Text(g.Ellipsis(f.DisplayName, g.FontTiny, nameW), g.FontTiny,
+                                           f.IsCurrent ? accent : text,
+                                           new Rect32(pad, y, w - pad, y + lineJump), Align.Left, false);
+                                    if (detailW > 0 && detailW < inner - Scaled(24))
+                                        g.Text(f.Detail, g.FontTiny, muted,
+                                               new Rect32(pad, y, w - pad, y + lineJump), Align.Right, false);
+                                    y += stepJump;
+                                }
 
-                            if (look.ShowStatusLine && status.Length > 0)
-                                g.Text(g.Ellipsis(status, g.FontTiny, inner), g.FontTiny, accent,
-                                       new Rect32(pad, y, w - pad, y + lineTiny), Align.Left, false);
+                                var fileBack = new Rect32(pad - Scaled(7), y - Scaled(2), w - pad + Scaled(7), y + lineJump - Scaled(2));
+                                backHit = fileBack;
+                                g.Text("\u2039 返回", g.FontTiny, accent,
+                                       new Rect32(pad, y, w - pad, y + lineJump), Align.Left, false);
+                            }
+                            else if (historyPanel)
+                            {
+                                // 面板二：整块替换正常卡片正文。不做滚动，最多列 6 条。
+                                // 抬头是被点的那份文件名（从文件夹进来时），旧的底部入口仍然显示“本课件历史”。
+                                var items = HistoryItems(st);
+                                int total = selectedFile != null ? selectedFile.Total : HistoryTotal(st);
+                                string head = selectedFile != null && !string.IsNullOrEmpty(selectedFile.DisplayName)
+                                    ? selectedFile.DisplayName
+                                    : (total > 0 ? "本课件历史 · " + total + " 次" : "本课件历史");
+                                // 收起箭头在右上角，抬头也要给它让位，不然两段字会叠在一起。
+                                g.Text(g.Ellipsis(head, g.FontSmall, inner - Scaled(22)), g.FontSmall, muted,
+                                       new Rect32(pad, y, w - pad, y + lineSmall), Align.Left, false);
+                                y += stepJump;
+
+                                int rows = HistoryRows(st);
+                                for (int i = 0; i < rows; i++)
+                                {
+                                    var item = items[i];
+                                    var hit = new Rect32(pad - Scaled(7), y - Scaled(2), w - pad + Scaled(7), y + lineJump - Scaled(2));
+                                    historyRowHits[i] = hit;
+                                    historyRowSlides[i] = item.Slide;
+                                    // 最近一条用强调色，其余弱化——一眼看出“上次停在哪”。
+                                    g.Text(g.Ellipsis(item.Label, g.FontTiny, inner), g.FontTiny,
+                                           item.IsLatest ? accent : muted,
+                                           new Rect32(pad, y, w - pad, y + lineJump), Align.Left, false);
+                                    y += stepJump;
+                                }
+
+                                var back = new Rect32(pad - Scaled(7), y - Scaled(2), w - pad + Scaled(7), y + lineJump - Scaled(2));
+                                backHit = back;
+                                g.Text("\u2039 返回", g.FontTiny, accent,
+                                       new Rect32(pad, y, w - pad, y + lineJump), Align.Left, false);
+                            }
+                            else
+                            {
+                                int page = st.Showing ? st.Current : st.Previous;
+                                string pageText = page > 0 ? page.ToString() : "—";
+                                g.Text(pageText, g.FontBig, st.Showing ? accent : text,
+                                       new Rect32(pad, y, w - pad, y + lineBig), Align.Left, false);
+                                y += stepBig;
+
+                                string caption = st.Showing
+                                    ? (look.ShowSlideCount && st.SlideCount > 0 ? "正在放映 · 共 " + st.SlideCount + " 页" : "正在放映")
+                                    : (st.Previous > 0 ? "上次停在这一页"
+                                       : (st.SuiteOnly ? "正在识别课件…" : "等待放映"));
+                                g.Text(g.Ellipsis(caption, g.FontSmall, inner), g.FontSmall, muted,
+                                       new Rect32(pad, y, w - pad, y + lineSmall), Align.Left, false);
+                                y += stepSmall;
+
+                                // “上次停在第 N 页”是这插件存在的理由，所以它单占一行、带主题色底，
+                                // 而且只有这一行可点（见 OnClick）。
+                                showingCard = st.Showing || st.SuiteOnly;   // 等课件时整张卡片都不可点（只有收回箭头能点）
+                                jumpHit = new Rect32(0, 0, 0, 0);
+                                if (look.ShowJumpLine && st.Previous > 0)
+                                {
+                                    string jump = st.Showing
+                                        ? "上次停在第 " + st.Previous + " 页 · 点这里跳过去"
+                                        : "点击从第 " + st.Previous + " 页开始放映";
+                                    var row = new Rect32(pad - Scaled(7), y - Scaled(2), w - pad + Scaled(7), y + lineJump - Scaled(2));
+                                    g.FillRounded(jumpFill, row, Scaled(6), true, true);
+                                    g.Text(g.Ellipsis(jump, g.FontSmall, inner), g.FontSmall, accent,
+                                           new Rect32(pad, y, w - pad, y + lineJump), Align.Left, false);
+                                    jumpHit = row;
+                                    y += stepJump;
+                                }
+
+                                // 和高度计算共用同一份“要不要画这行”的判断（见 BitsText）。
+                                string bits = BitsText(st);
+                                if (bits.Length > 0)
+                                {
+                                    g.Text(g.Ellipsis(bits, g.FontTiny, inner), g.FontTiny, muted,
+                                           new Rect32(pad, y, w - pad, y + lineTiny), Align.Left, false);
+                                    y += stepTiny;
+                                }
+
+                                // 历史入口：弱化色，和上面带底色的跳转行区分开——它是“打开一个列表”，
+                                // 不是“立刻跳页”，误点的后果不一样。
+                                int total = HistoryTotal(st);
+                                if (total > 0)
+                                {
+                                    string hist = "历史 · " + total + " 次 \u203A";
+                                    historyHit = new Rect32(pad - Scaled(7), y - Scaled(2), w - pad + Scaled(7), y + lineJump - Scaled(2));
+                                    g.Text(g.Ellipsis(hist, g.FontTiny, inner), g.FontTiny, muted,
+                                           new Rect32(pad, y, w - pad, y + lineJump), Align.Left, false);
+                                    y += stepJump;
+                                }
+
+                                // 状态行就算这一秒没字也要占位（见 ContentHeight96），文件夹图标才能稳定贴在右下角。
+                                if (look.ShowStatusLine)
+                                {
+                                    if (status.Length > 0)
+                                        g.Text(g.Ellipsis(status, g.FontTiny, inner), g.FontTiny, accent,
+                                               new Rect32(pad, y, w - pad, y + lineTiny), Align.Left, false);
+                                    y += stepTiny;
+                                }
+                            }
 
                             // 右上角的"收回"箭头：点一下就把卡片贴回屏幕边（老师上完课想清屏时用）。
                             // 箭头指的方向 = 卡片要缩去的那一边，所以右边贴边的卡片是"❯"。
+                            // 历史面板里也保留它：面板开着时老师照样能一键清屏。
                             var arrow = new Rect32(w - pad - Scaled(16), Scaled(6), w - pad + Scaled(2), Scaled(6) + Scaled(18));
                             collapseHit = arrow;
                             g.Text(look.OnRight ? "\u276F" : "\u276E", g.FontSmall, muted, arrow, Align.Center, false);
+
+                            // 文件夹图标 → 打开过的全部课件（2026-10-18 用户要求）。原先贴在右下角单占一行，
+                            // 老师嫌卡片太高，改成塞进右上角、放在收起箭头左边，垂直与箭头对齐。
+                            // 自绘（tab + 开口的夹身）不引图片资源；命中矩形四周加 6px 免瞄准。
+                            int icon = Scaled(FolderIconSize);
+                            int iconX = arrow.L - Scaled(10) - icon;
+                            int iconY = Scaled(6) + (Scaled(18) - icon) / 2;
+                            var iconRect = new Rect32(iconX, iconY, iconX + icon, iconY + icon);
+                            DrawFolderIcon(g, iconRect, muted);
+                            folderHit = new Rect32(iconX - Scaled(6), iconY - Scaled(6), iconX + icon + Scaled(6), iconY + icon + Scaled(6));
                         }
                     }
 
@@ -1144,7 +1565,7 @@ namespace ClassSlideSync.Plugin.Ui
             public int Height { get { return B - T; } }
         }
 
-        enum Align { Left, Center }
+        enum Align { Left, Center, Right }
 
         /// <summary>Minimal GDI drawing surface: fill, stroke and text. No framework types.</summary>
         sealed class GdiCanvas : IDisposable
@@ -1157,7 +1578,7 @@ namespace ClassSlideSync.Plugin.Ui
             const int FW_NORMAL = 400, FW_SEMIBOLD = 600;
             const uint CLEARTYPE = 5, ANTIALIASED = 4, DEFAULT_CHARSET = 1, DEFAULT_PITCH = 0;
             const int TRANSPARENT = 1;
-            const uint DT_LEFT = 0x00000000, DT_CENTER = 0x00000001, DT_VCENTER = 0x00000004,
+            const uint DT_LEFT = 0x00000000, DT_CENTER = 0x00000001, DT_RIGHT = 0x00000002, DT_VCENTER = 0x00000004,
                        DT_SINGLELINE = 0x00000020, DT_END_ELLIPSIS = 0x00008000, DT_WORDBREAK = 0x00000010,
                        DT_CALCRECT = 0x00000400;
 
@@ -1245,6 +1666,7 @@ namespace ClassSlideSync.Plugin.Ui
                 SetTextColor(dc, Rgb(c.R, c.G, c.B));
                 uint f = DT_SINGLELINE | DT_END_ELLIPSIS;
                 if (align == Align.Center) f |= DT_CENTER;
+                else if (align == Align.Right) f |= DT_RIGHT;
                 else f |= DT_LEFT;
                 if (centerVertically) f |= DT_VCENTER;
                 var rc = new RECT { Left = r.L, Top = r.T, Right = r.R, Bottom = r.B };
@@ -1262,6 +1684,12 @@ namespace ClassSlideSync.Plugin.Ui
                     if (MeasureWidth(t, font) <= maxWidth) return t;
                 }
                 return text;
+            }
+
+            /// <summary>量一段文字的像素宽：文件列表要把“第 N 页 · 3 小时前”右对齐，先得知道它多宽。</summary>
+            public int TextWidth(string text, IntPtr font)
+            {
+                return string.IsNullOrEmpty(text) ? 0 : MeasureWidth(text, font);
             }
 
             int MeasureWidth(string text, IntPtr font)

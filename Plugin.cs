@@ -48,6 +48,10 @@ public class Plugin : PluginBase
         services.AddSingleton(Service);
         services.AddSettingsPage<SlideSyncSettingsPage>();
 
+        // 新手引导：挂进 ClassIsland 自带的教程列表（教程中心里能看到「课件续页」这一组）。
+        // 设置页上的「新手引导」按钮和它用的是同一份教程内容，见 Core/TutorialGuide.cs。
+        TutorialGuide.Register();
+
         // 只启动"调度器"：它每 5 秒问一次课表，决定要不要进入待命（上课前 1 分钟，见 Core/LessonClock.cs）。
         // 真正占资源的东西（COM 轮询、卡片窗口）只在待命期间存在，下课后会被全部销毁。
         AppBase.Current.AppStarted += (_, _) =>

@@ -1,8 +1,18 @@
 using System;
+using System.Collections.Generic;
 using System.Threading;
 
 namespace ClassSlideSync.Plugin.Core
 {
+    /// <summary>One row in the card's history panel: where a lesson stopped, and when.</summary>
+    public sealed class CardHistoryItem
+    {
+        public string FilePath = "";  // 这条记录属于哪份文件（跨文件历史跳页必须认它，不能只认页码）
+        public int Slide;             // 点这行要跳到的页码（那条记录停下的地方）
+        public string Label = "";     // 整行文字；== 不含文件路径，卡片上放不下也没必要
+        public bool IsLatest;         // 最近一条，用强调色标出来
+    }
+
     /// <summary>Everything the card needs to draw itself, as one immutable value.</summary>
     public sealed class CardState
     {
@@ -16,6 +26,18 @@ namespace ClassSlideSync.Plugin.Core
         public string Hint = "";
         public string Context = "";      // subject / lesson name, when ClassIsland knows them
         public string Status = "";       // the last one-off message (e.g. jump result)
+
+        /// <summary>这份课件的总记录数；历史入口上的 N 用它，而不是截断后的 History.Count。</summary>
+        public int HistoryTotal;
+
+        /// <summary>最近几条记录，新的在前。最多 6 条，卡片面板不做滚动。</summary>
+        public List<CardHistoryItem> History = new List<CardHistoryItem>();
+
+        /// <summary>
+        /// 台账里所有打开过的课件（归并后），卡片右下角文件夹面板用。和 History 一样是
+        /// 引擎线程算好的快照，卡片只读；最多 8 份，新的在前。
+        /// </summary>
+        public List<CardFileItem> Files = new List<CardFileItem>();
 
         /// <summary>
         /// true 只表示"演示软件此刻真的打开着某份课件"。不能用 FileName 判断：没有课件时
@@ -36,9 +58,30 @@ namespace ClassSlideSync.Plugin.Core
         /// <summary>Key for change detection: identical states are not re-published.</summary>
         public int Hash()
         {
-            if (Showing) return 100000 + Current * 7 + SlideCount;
-            return 200000 + Previous * 7 + Current + (DeckOpen ? 500000 : 0)
-                   + (SuiteOnly ? 1000000 : 0) + SuiteName.Length * 10000;
+            int h = Showing
+                ? 100000 + Current * 7 + SlideCount
+                : 200000 + Previous * 7 + Current + (DeckOpen ? 500000 : 0)
+                  + (SuiteOnly ? 1000000 : 0) + SuiteName.Length * 10000;
+            // 台账只追加、旧记录不会被改，所以“总数 + 最新一条的页码”足以代表整份历史；
+            // 新记录即使停在同一页也会让总数 +1，卡片照样会重画。
+            h = h * 31 + HistoryTotal;
+            if (History != null && History.Count > 0) h = h * 31 + History[0].Slide;
+            // 文件面板的内容变化也要让卡片重画：新开一份课件、旧记录被清掉、当前文件换人，
+            // 任何一项变了哈希就得变，否则面板会停在上一秒的列表上。
+            if (Files != null)
+            {
+                h = h * 31 + Files.Count;
+                for (int i = 0; i < Files.Count; i++)
+                {
+                    var f = Files[i];
+                    if (f == null) { h = h * 31 + 17; continue; }
+                    h = h * 31 + (f.Key ?? "").GetHashCode();
+                    h = h * 31 + f.Total;
+                    h = h * 31 + (f.IsCurrent ? 1 : 0);
+                    if (f.History != null && f.History.Count > 0) h = h * 31 + f.History[0].Slide;
+                }
+            }
+            return h;
         }
     }
 
@@ -64,6 +107,7 @@ namespace ClassSlideSync.Plugin.Core
         Thread thread;
         volatile bool stop;
         PptBridge bridge;
+        readonly SeewoBridge seewo;
         PptSnapshot last;
         DateTime lastAttachTry = DateTime.MinValue;
         DateTime lastVerify = DateTime.MinValue;
@@ -77,6 +121,10 @@ namespace ClassSlideSync.Plugin.Core
         string lastFilePath = "";
         bool showing;
         bool deckOpen;    // 演示软件里此刻真的开着课件（不是台账里的历史文件名）
+        bool usingSeewo;  // 当前这堂会话是从希沃 MCP 起的（不是 COM）
+        string lastSeewoTitle;   // 希沃停止放映后仍保留课件名，用来收尾/显示
+        string lastSeewoDiag = "";
+        public string LastSeewoError { get; private set; } = "";
         int highest;      // 这节课翻到过的最远一页，只用于日志
         int lastSlide;    // 老师最后停下的那一页 —— 台账记的是这个
         int startSlide;
@@ -87,11 +135,24 @@ namespace ClassSlideSync.Plugin.Core
         DateTime? pendingEnd;
         int pendingEndSlide;
         int jumpPending;   // 1 = 卡片上有人点了跳页，等工作线程去执行
+        int jumpTarget;    // >0 = 这次跳页的显式目标页（点历史行）；0 = 用台账里的结束页
+        string? jumpFile;   // 非空 = 这次跳页的显式文件（跨文件历史行）；null = 沿用卡片展示的那份
+
+        // 「卡片此刻展示的那条记录」：BuildState 写、DoJump 读。
+        // 跳页必须落在老师点的那一刻看到的那一页上，而不能在执行时重新查一遍
+        // （2026-10-18 日志：卡片上是希沃第 8 页，点下去跳了 WPS 第 6 页）。
+        SessionRecord displayed;
+        // 刚结束的那节课：多套件并存时用它压过另一台引擎留下的旧会话。
+        SessionRecord recentEnded;
+        DateTime recentEndedAt = DateTime.MinValue;
+        // 刚讲完的两分钟内，卡片优先展示那一节课，不让别的套件的旧记录抢走（见 PickRecord）。
+        const int RecentSessionSeconds = 120;
 
         public SessionEngine(Ledger ledger, SyncSettings settings)
         {
             this.ledger = ledger;
             this.settings = settings;
+            this.seewo = new SeewoBridge(ledger);
         }
 
         /// <summary>Raised whenever the card's contents change. Fires off the UI thread.</summary>
@@ -236,11 +297,19 @@ namespace ClassSlideSync.Plugin.Core
 
             if (bridge == null)
             {
+                // 希沃白板没有 COM 入口，只能走它自带的 MCP HTTP 服务。先在这里试一次：
+                // 没装/没开时 GetState 会很快返回 false（探测结果有 30 秒 TTL，不会每 250ms 打网络）。
+                if (comBlocked)
+                {
+                    if (TrySeewo()) return;
+                    Push(showing, lastSlide, slideCount);
+                    return;
+                }
+
                 // 1.2 秒试一次：WPS 的 COM 实例要等窗口起来几秒后才登记进 ROT，重试慢的话
                 // 老师刚打开课件那几秒卡片只会显示"正在识别课件…"（2026-10-15 实测大约 4 秒）。
                 if ((DateTime.UtcNow - lastAttachTry).TotalSeconds >= 1.2)
                 {
-                    if (comBlocked) { Push(showing, lastSlide, slideCount); return; }
                     lastAttachTry = DateTime.UtcNow;
                     PptBridge b = null;
                     var swAttach = System.Diagnostics.Stopwatch.StartNew();
@@ -261,6 +330,8 @@ namespace ClassSlideSync.Plugin.Core
                 }
                 if (bridge == null)
                 {
+                    // WPS / PowerPoint 都没接上：希沃在放映就交给希沃（台账键是「希沃:课件名」）。
+                    if (TrySeewo()) return;
                     if (showing) EndSession(0);
                     // 2026-10-17：没有 COM 也先把卡片点亮（窗口标题里的文档名足够翻出"上次讲到第几页"）。
                     ApplyTitleFallback();
@@ -322,7 +393,13 @@ namespace ClassSlideSync.Plugin.Core
             lastSnapAt = DateTime.UtcNow;
 
             // 熔断期间一次 COM 都不发：只把内存里的状态推给卡片，别让老师对着一个僵住的屏幕。
-            if (comBlocked) { Push(showing, lastSlide, slideCount); return; }
+            if (comBlocked)
+            {
+                // 但希沃走的是 HTTP，不受 COM 熔断影响；它还在放映就继续由它给状态。
+                if (TrySeewo()) return;
+                Push(showing, lastSlide, slideCount);
+                return;
+            }
 
             PptSnapshot snap;
             var swSnap = System.Diagnostics.Stopwatch.StartNew();
@@ -333,6 +410,7 @@ namespace ClassSlideSync.Plugin.Core
                 NoteComCost("Snapshot(抛异常)", swSnap.ElapsedMilliseconds);
                 ledger.Log("snapshot threw: " + ex.Message + " -- dropping the COM reference");
                 DropBridge();
+                if (TrySeewo()) return;
                 return;
             }
             swSnap.Stop();
@@ -346,6 +424,27 @@ namespace ClassSlideSync.Plugin.Core
             {
                 ledger.Log("snapshot failed (" + snap.Diag + ") -- dropping the COM reference");
                 DropBridge();
+                // COM 死了不代表没在上课：希沃可能正在另一个进程里放映。
+                if (TrySeewo()) return;
+                return;
+            }
+
+            // COM 桥回到"正在放映"时，如果上一段是希沃记的，先把希沃那段收尾，
+            // 不然会有两条同时开着（台账里两个键，卡片也会串）。
+            if (snap.Showing && usingSeewo)
+            {
+                EndSession(lastSlide);
+                pendingEnd = null;
+                usingSeewo = false;
+            }
+
+            // COM 拿不到"正在放映"时，再看希沃一眼。只在两种情况下查：
+            //   - COM 手里根本没有可用课件（空白稿/没打开），希沃是唯一的线索；
+            //   - 希沃进程确实在跑（便宜的进程检查，有 3 秒缓存），避免每次轮询都打一次 MCP。
+            if (!snap.Showing
+                && (!PptBridge.LooksLikePath(snap.FilePath) || SeewoBridge.LooksRunning())
+                && TrySeewo())
+            {
                 return;
             }
 
@@ -416,6 +515,152 @@ namespace ClassSlideSync.Plugin.Core
             var b = bridge;
             bridge = null;
             if (b != null) { try { b.Dispose(); } catch { } }
+        }
+
+        // ------------------------------------------------------------------ seewo
+
+        /// <summary>
+        /// 希沃白板没有 COM，只有进程内的 MCP HTTP 服务。这里把它的状态翻译成和 COM 一样的
+        /// PptSnapshot，后面 BeginSession / Advance / EndSession / Push 全部复用，卡片和台账
+        /// 不需要知道数据是 COM 来的还是 HTTP 来的。
+        /// 返回 true 表示“这一轮已经由希沃给出了结论”，调用方不要再走 COM 的收尾逻辑。
+        /// </summary>
+        bool TrySeewo()
+        {
+            try
+            {
+                var s = seewo.GetState();
+                if (s == null) return false;
+
+                // 服务不可用（进程没开、端口没探到、请求超时）。如果当前这段本来就是希沃记的：
+                //   - 进程真的没了 -> 当作停止放映，走 2 秒宽限期收尾；
+                //   - 进程还在（MCP 临时抽风）-> 保持现状，别让 COM 分支把会话误收掉。
+                if (!s.Found)
+                {
+                    if (!usingSeewo) return false;
+                    if (!s.Running)
+                    {
+                        ProcessSeewoSnapshot(NewSeewoSnapshot(false, lastSeewoTitle, 0, slideCount, ""));
+                        usingSeewo = false;
+                    }
+                    return true;
+                }
+
+                string title = (s.Title ?? "").Trim();
+                if (title.Length == 0)
+                {
+                    // 希沃这边真的没有打开的课件（shells=[]）。绝不能退回 lastSeewoTitle：
+                    // 老师关掉课件后，卡片会一直挂着上一份课件的名字和页码。
+                    // 但只有当前卡片本来就是希沃的课件（或者会话是希沃起的）才清；
+                    // 否则 COM 那边还开着一份编辑中的课件，不能被希沃的空白状态抢掉。
+                    if (!usingSeewo && !SeewoBridge.IsSeewoKey(lastFilePath)) return false;
+                    ProcessSeewoSnapshot(NewSeewoSnapshot(false, "", 0, 0, s.Diag));
+                    usingSeewo = false;
+                    return true;
+                }
+                lastSeewoTitle = title;
+
+                if (s.Showing)
+                {
+                    if (showing && !usingSeewo)
+                    {
+                        // COM 那边正在放另一个课件，而希沃也开始放映了：希沃是老师此刻看的屏幕，
+                        // 把 COM 那段先收掉，避免两条会话并行。
+                        EndSession(lastSlide);
+                        pendingEnd = null;
+                    }
+                    usingSeewo = true;
+                    ProcessSeewoSnapshot(NewSeewoSnapshot(true, title, s.Current, s.SlideCount, s.Diag));
+                    return true;
+                }
+
+                // 没在放映。纯希沃环境（没有 COM 桥）里，课件开着也应该让卡片显示
+                // 课件名、总页数和上次停在哪一页——和 PPT/WPS 的编辑态一致。
+                // COM 桥还在时不抢：那可能是 PowerPoint 编辑中的另一份课件。
+                if (!usingSeewo)
+                {
+                    if (bridge != null) return false;
+                    usingSeewo = true;
+                }
+                ProcessSeewoSnapshot(NewSeewoSnapshot(false, title, 0, s.SlideCount, s.Diag));
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LastSeewoError = ex.GetType().Name + ": " + ex.Message;
+                return false;
+            }
+        }
+
+        PptSnapshot NewSeewoSnapshot(bool showingNow, string title, int current, int total, string diag = null)
+        {
+            return new PptSnapshot
+            {
+                AppFound = true,
+                AppKind = "希沃白板",
+                ProgId = "EasiNote.McpServer",
+                Showing = showingNow,
+                FilePath = SeewoBridge.KeyFor(title),
+                Current = current,
+                SlideCount = total,
+                Diag = diag ?? ""
+            };
+        }
+
+        void ProcessSeewoSnapshot(PptSnapshot snap)
+        {
+            last = snap;
+            // 诊断行只记变化，别每 250ms 往日志里灌一遍。
+            string d = snap.Diag ?? "";
+            if (d.Length > 0 && d != lastSeewoDiag)
+            {
+                lastSeewoDiag = d;
+                ledger.Log("snapshot: " + snap + " | " + d);
+            }
+            if (!string.IsNullOrEmpty(snap.FilePath))
+            {
+                filePath = snap.FilePath;
+                lastFilePath = snap.FilePath;
+            }
+            else if (!snap.Showing)
+            {
+                // 希沃把课件关了：路径必须清掉，否则卡片会一直挂着上一份课件的名字。
+                filePath = "";
+                lastFilePath = "";
+            }
+            if (snap.SlideCount > 0) slideCount = snap.SlideCount;
+            // 和 COM 分支的 deckOpen=LooksLikePath(filePath) 对齐：只要识到课件名，
+            // 就算这份课件"开着"（编辑态也要让卡片显示课件名和上次页码），而不是只有
+            // 放映时才算。否则编辑态会掉进 SuiteOnly 分支，标题变成"希沃白板"。
+            deckOpen = !string.IsNullOrEmpty(snap.FilePath);
+
+            if (snap.Showing)
+            {
+                if (!showing) BeginSession(snap);
+                else Advance(snap);
+                pendingEnd = null;
+                Push(true, snap.Current, snap.SlideCount);
+            }
+            else
+            {
+                if (showing)
+                {
+                    // 和 COM 分支一样给 2 秒宽限：希沃从放映退回编辑时，MCP 可能短暂报“没在放映”，
+                    // 立刻收尾会把最后翻的那一页丢掉。
+                    if (!pendingEnd.HasValue) { pendingEnd = DateTime.UtcNow; pendingEndSlide = lastSlide; }
+                    else if ((DateTime.UtcNow - pendingEnd.Value).TotalSeconds >= 2)
+                    {
+                        EndSession(pendingEndSlide);
+                        pendingEnd = null;
+                        usingSeewo = false;
+                    }
+                }
+                else
+                {
+                    usingSeewo = false;
+                }
+                Push(false, 0, snap.SlideCount > 0 ? snap.SlideCount : slideCount);
+            }
         }
 
         // ------------------------------------------------------------------ sessions
@@ -490,12 +735,18 @@ namespace ClassSlideSync.Plugin.Core
             if (current.Seconds >= settings.MinSessionSeconds)
             {
                 if (settings.RecordLedger) Commit(current);
-                ledger.Log("session recorded: " + System.IO.Path.GetFileName(current.FilePath) +
+                ledger.Log("session recorded: " + FileLabel(current.FilePath) +
                     " pages " + current.StartSlide + "->" + current.EndSlide +
                     " (max " + highest + ")" +
                     " for " + current.Seconds + "s");
             }
             else ledger.Log("session ignored (only " + current.Seconds + "s)");
+
+            // 记住“刚刚讲完的是哪一节”。希沃退出授课后课件常常立刻被关掉，而 WPS 那边
+            // 可能还开着一份上次留下的旧课件；没有这条信息，卡片下一拍就会换成那份的记录，
+            // 老师刚在希沃操作完、回头点卡片就跳到了别的课件上（2026-10-18 实测）。
+            recentEnded = current;
+            recentEndedAt = DateTime.Now;
             current = null;
         }
 
@@ -510,51 +761,182 @@ namespace ClassSlideSync.Plugin.Core
                 same.SlideCount = r.SlideCount;
                 same.Fingerprint = r.Fingerprint;
             }
-            else ledger.Add(r);
+            else
+            {
+                // 2026-10-18 用户实测：课件只是被打开了一下（还没进全屏放映），
+                // 也会走一次"开始/结束"，于是一条「第 1 页、几秒钟」的记录把上一堂课
+                // 「停在第 9 页」的历史顶掉了。
+                // 判据不能挂时长：希沃在编辑态里开着课件一放就是几分钟（日志里那次 81 秒），
+                // 照样把 9 盖成 2。所以只要一页都没翻就不写；只有该文件还没有任何记录时
+                // （第一次见面）才记，因为那一下确实是有意义的信息。
+                bool noise = r.EndSlide == r.StartSlide && same != null;
+                if (noise)
+                {
+                    ledger.Log("session ignored (no page advance, " + r.Seconds + "s): " + FileLabel(r.FilePath));
+                    return;
+                }
+                ledger.Add(r);
+            }
             ledger.Save();
         }
 
         // ------------------------------------------------------------------ actions
 
         /// <summary>
-        /// Jump the running show to where the last lesson stopped. Called from the UI thread;
-        /// the COM call itself happens on the worker's bridge, which is only ever touched here.
-        /// </summary>
-        /// <summary>
         /// Ask for a jump to where the last lesson stopped. Called from the card's UI thread, so it
         /// only raises a flag -- the COM work happens on the worker thread in <see cref="Step"/>.
         /// </summary>
         public void RequestJump()
         {
+            // 普通跳页没有显式目标：先清掉上一次历史行留下的页码和文件，DoJump 才会用台账里的结束页。
+            Interlocked.Exchange(ref jumpTarget, 0);
+            Interlocked.Exchange(ref jumpFile, null);
             Interlocked.Exchange(ref jumpPending, 1);
             SetStatus("正在跳转…");
         }
 
+        /// <summary>
+        /// 跳到这份课件历史上某一页。和 <see cref="RequestJump"/> 一样只在 UI 线程抬标志，
+        /// 真正的 COM / MCP 调用仍由工作线程在 <see cref="Step"/> 里执行。
+        /// </summary>
+        public void RequestJumpTo(int slide)
+        {
+            RequestJumpTo(null, slide);
+        }
+
+        /// <summary>
+        /// 跳到「某份文件」的某一页（卡片文件夹面板里的跨文件历史）。
+        /// 保留 <see cref="RequestJumpTo(int)"/> 的旧行为：filePath 为空 = 用卡片此刻展示的那份。
+        /// </summary>
+        public void RequestJumpTo(string filePath, int slide)
+        {
+            string file = CardFileList.Normalize(filePath);
+            // 旧重载允许传 0（表示“用台账里的结束页”）；但跨文件跳页如果没有页码就没有意义，
+            // 这里不能悄悄去跳那份文件的最后记录，否则等于替老师选了一页。
+            if (slide <= 0 && file.Length > 0) return;
+            Interlocked.Exchange(ref jumpFile, file);
+            Interlocked.Exchange(ref jumpTarget, slide);
+            Interlocked.Exchange(ref jumpPending, 1);
+            SetStatus("正在跳转…");
+        }
+
+        /// <summary>
+        /// 卡片“正在讲的那份课件”用哪个键查台账。<see cref="BuildState"/> 和 <see cref="DoJump"/>
+        /// 必须共用这一个：两边各算一遍就是多套件并存时错位的根源。
+        /// </summary>
+        string CurrentKey()
+        {
+            return filePath.Length > 0 ? filePath : lastFilePath;
+        }
+
+        static bool SameBucket(string a, string b)
+        {
+            string ka = Ledger.Key(a), kb = Ledger.Key(b);
+            return ka.Length > 0 && ka == kb;
+        }
+
+        /// <summary>
+        /// 卡片此刻该展示的台账记录 —— 同时也是跳页要用的那条记录。
+        /// 显示和动作必须来自同一次计算：以前 BuildState 用 filePath 查一次、DoJump 执行时
+        /// 又重查一次（还多一个 ledger.Newest() 兜底），于是出现“卡片显示希沃第 8 页，
+        /// 点下去跳了 WPS 第 6 页”（2026-10-18 用户实测）。
+        /// </summary>
+        SessionRecord PickRecord(out string histKey, out bool recent)
+        {
+            recent = false;
+            histKey = CurrentKey();
+            var r = histKey.Length > 0 ? ledger.Last(histKey) : null;
+            if (r == null && histKey.Length > 0)
+            {
+                // COM 给的 FullName 可能只是同一份课件的另一种写法（相对路径 / 另一份同名副本），
+                // 精确查会扑空：卡片既没有“上次停在第几页”，也没有历史入口（实测台账里明明有
+                // 7 条，卡片高度却一直停在“无历史”的尺寸，用户报“看不到历史入口”）。
+                // 同名即同一份课件，比“什么都不显示”更接近事实，也不至于张冠李戴到别的课件。
+                var byName = ledger.FindByName(FileLabel(histKey));
+                if (byName != null) { r = byName; histKey = byName.FilePath; }
+            }
+
+            // 最近活动优先：两分钟内刚结束的那节课压过其他套件留下的旧会话。
+            // 没有这一条，希沃一退出授课（课件随即关掉）、WPS 里还开着旧课件时，卡片会立刻
+            // 换成 WPS 的记录 —— 老师眼里“这张卡刚才还是希沃的第 8 页”。
+            // 但**正在放映**时不抢：老师已经在新课件上讲起来了，卡片必须跟着眼前这块屏幕，
+            // 不能被两分钟前那节课的页码顶掉（那样最先看到的是别人的页）。
+            if (!showing
+                && recentEnded != null
+                && (DateTime.Now - recentEndedAt).TotalSeconds <= RecentSessionSeconds
+                && !SameBucket(histKey, recentEnded.FilePath))
+            {
+                recent = true;
+                histKey = recentEnded.FilePath;
+                return recentEnded;
+            }
+            return r;
+        }
+
         void DoJump()
         {
-            var r = ledger.Last(lastFilePath);
-            if (r == null) r = ledger.Newest();   // 刚开机/刚上完课时还不知道是哪个文件
-            if (r == null) { SetStatus("还没有这堂课的记录"); return; }
+            // 历史面板点的行不一定是“最后一次停下”的页，所以先把显式目标取出来。
+            int explicitSlide = Interlocked.Exchange(ref jumpTarget, 0);
+            // 文件夹面板里的历史可能是另一份课件的：文件也必须按点击那一刻带过来，
+            // 不能等到工作线程执行时再按 CurrentKey() 查一遍（那时可能已经换了课件）。
+            string explicitFile = CardFileList.Normalize(Interlocked.Exchange(ref jumpFile, null));
+            // 优先用卡片上正在显示的那条记录：从点击到工作线程执行之间，换套件、关课件都可能
+            // 让 filePath 变成另一份课件，重查一次就会跳到别的记录上（2026-10-18 实测：
+            // 14:26:26 记录落到希沃的 1->8，14:26:29 希沃里课件关了，14:26:32 点跳转却跳了
+            // WPS 的第 6 页）。查不到时才重新算一遍，也不再退到 ledger.Newest()（全库最新一条
+            // 往往是另一台引擎的旧课件）。
+            string histKey;
+            bool recent;
+            var r = displayed;
+            if (r == null) r = PickRecord(out histKey, out recent);
+            // 显式文件优先；没有就退回旧逻辑：用卡片展示的那条记录里的文件。
+            string jumpPath = explicitFile;
+            if (jumpPath.Length == 0 && r != null) jumpPath = CardFileList.Normalize(r.FilePath);
+            if (jumpPath.Length == 0)
+            {
+                SetStatus("还没有这堂课的记录");
+                ledger.Log("jump ignored: no record for " + FileLabel(CurrentKey()));
+                return;
+            }
+            int target = explicitSlide > 0 ? explicitSlide : (r != null ? r.EndSlide : 0);
+            if (target <= 0)
+            {
+                SetStatus("这条记录没有页码");
+                ledger.Log("jump ignored: no slide for " + FileLabel(jumpPath));
+                return;
+            }
+
+            // 希沃台账的键是「希沃:课件名」，不是磁盘路径：既不能 GetFileName，也不能
+            // PptBridge.Launch（那会拿这个假路径去起 PowerPoint）。走 MCP 的 goto_slide。
+            // 旧版污染键（c:\…\希沃:xxx）在 CardFileList.Normalize 里已经还原，这里只认干净的。
+            if (SeewoBridge.IsSeewoKey(jumpPath))
+            {
+                SetStatus("正在跳转…");
+                string seewoErr = seewo.GotoSlide(target);
+                SetStatus(seewoErr.Length == 0 ? "已跳到第 " + target + " 页" : seewoErr);
+                ledger.Log("jump -> " + target + " (seewo): " + (seewoErr.Length == 0 ? "ok" : seewoErr));
+                return;
+            }
 
             var b = bridge;
             if (b == null)
             {
                 // 老师点了“从第 N 页开始放映”，这时候连 PowerPoint 一起拉起来才是他要的。
                 SetStatus("正在打开 PowerPoint…");
-                b = PptBridge.Launch(r.FilePath);
+                b = PptBridge.Launch(jumpPath);
                 if (b == null) { SetStatus("打不开 PowerPoint"); return; }
                 bridge = b;   // 让后面的轮询也用上这个实例
-                ledger.Log("jump: launched " + b.ProgId + " for " + r.FilePath);
+                ledger.Log("jump: launched " + b.ProgId + " for " + jumpPath);
             }
 
             bool wasShowing = last != null && last.Showing;
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            var err = b.JumpToSlide(r.EndSlide, settings.JumpResetsAnimation, r.FilePath);
+            var err = b.JumpToSlide(target, settings.JumpResetsAnimation, jumpPath);
             sw.Stop();
             SetStatus(err.Length == 0
-                ? (wasShowing ? "已跳到第 " + r.EndSlide + " 页" : "已从第 " + r.EndSlide + " 页开始放映")
+                ? (wasShowing ? "已跳到第 " + target + " 页" : "已从第 " + target + " 页开始放映")
                 : err);
-            ledger.Log("jump -> " + r.EndSlide + " : " + (err.Length == 0 ? "ok" : err)
+            ledger.Log("jump -> " + target + " : " + (err.Length == 0 ? "ok" : err)
                 + " (" + sw.ElapsedMilliseconds + " ms"
                 + (string.IsNullOrEmpty(b.LastViewRoute) ? "" : ", view=" + b.LastViewRoute) + ")");
         }
@@ -600,8 +982,7 @@ namespace ClassSlideSync.Plugin.Core
             st.Current = currentSlide;
             st.SlideCount = count;
             lock (gate) { st.Status = status; }
-            try { st.FileName = string.IsNullOrEmpty(lastFilePath) ? "" : System.IO.Path.GetFileName(lastFilePath); }
-            catch { st.FileName = lastFilePath; }
+            st.FileName = FileLabel(lastFilePath);
 
             var ctx = LessonContext;
             if (ctx != null)
@@ -615,10 +996,14 @@ namespace ClassSlideSync.Plugin.Core
                 catch { }
             }
 
-            // 没有在放映时 lastFilePath 是空的，此时退回到“最近一条记录”，
-            // 否则老师刚上完课、放映一结束，卡片就会说“还没有这堂课的记录”。
-            var r = ledger.Last(lastFilePath);
-            if (r == null) r = ledger.Newest();
+            // 只认“这份课件”的记录。以前查不到时会退回到 ledger.Newest()（全库最新一条），
+            // 结果希沃那边退出授课、filePath 被清空之后，卡片上直接冒出上一份 WPS 课件的历史
+            // （2026-10-18 用户报“历史变成以前翻过的测试课件”）。宁可不显示，也不张冠李戴。
+            string histKey;
+            bool recent;
+            var r = PickRecord(out histKey, out recent);
+            // 这一条就是卡片正在展示的记录，DoJump 直接用它 —— 显示什么就跳什么。
+            displayed = r;
             if (r != null)
             {
                 st.Previous = r.EndSlide > 0 ? r.EndSlide : r.StartSlide;
@@ -628,30 +1013,66 @@ namespace ClassSlideSync.Plugin.Core
                 if (finished) st.Previous = 0;
                 st.PreviousAgeDays = Age(r);
                 if (string.IsNullOrEmpty(r.Fingerprint)) st.PreviousTrusted = true;
+                else if (SeewoBridge.IsSeewoKey(r.FilePath)) st.PreviousTrusted = true;   // 希沃没有文件路径，谈不上指纹
                 else
                 {
                     var fpFile = Ledger.Fingerprint(r.FilePath);
                     st.PreviousTrusted = fpFile.Length > 0 && fpFile == r.Fingerprint;
                 }
-                if (string.IsNullOrEmpty(st.FileName))
+                // 标题必须跟着这条记录走：recent 的时候 filePath 往往已经是另一套件的课件，
+                // 否则会出现“标题写着 WPS 的课件、页码却是希沃的第 8 页”。
+                if (recent || string.IsNullOrEmpty(st.FileName))
                 {
-                    try { st.FileName = System.IO.Path.GetFileName(r.FilePath); } catch { }
+                    st.FileName = FileLabel(r.FilePath);
                 }
                 st.Hint = st.PreviousTrusted
                     ? "记录于 " + ShortAge(st.PreviousAgeDays)
                     : "文件在那之后被改过，页码可能已偏移";
                 if (finished) st.Hint = "上次已讲到最后一页";
+                // 刚讲完的这份：明说一句，免得老师把它当成“别的套件里那份课件”。
+                if (recent) st.Hint = "刚讲完 · " + (st.PreviousTrusted ? "点这里接着讲" : "文件改过，页码可能偏移");
             }
             else st.Hint = "还没有这堂课的记录";
 
+            // 历史列表跟着“卡片正在讲的那份课件”走：有当前文件就用当前文件，没有就退回
+            // 上面兜底用的最近一条记录。这样卡片标题显示的是哪份课件，历史就是哪份的。
+            if (string.IsNullOrEmpty(histKey) && r != null) histKey = r.FilePath;
+            st.HistoryTotal = ledger.Count(histKey);
+            if (st.HistoryTotal > 0)
+            {
+                var recents = ledger.Recent(histKey, 6);
+                for (int i = 0; i < recents.Count; i++)
+                {
+                    var hr = recents[i];
+                    st.History.Add(new CardHistoryItem
+                    {
+                        // EndSlide 正是“下次接着讲的那一页”，历史跳转也应该落在那里。
+                        // 文件也一起带上：以后单文件面板也可能点开旧污染键里的记录。
+                        FilePath = CardFileList.Normalize(hr.FilePath),
+                        Slide = hr.EndSlide,
+                        Label = HistoryLabel(hr),
+                        IsLatest = i == 0
+                    });
+                }
+            }
+
+            // 文件夹面板的完整列表：所有打开过的课件（归并同名/旧污染键），新的在前。
+            // 放在这里一次算好，卡片和面板都只读这份快照（见 CardFileList 的线程说明）。
+            st.Files = CardFileList.Build(ledger, histKey, CardFileList.MaxFiles, 6);
+
             // 演示软件开着、课件还没打开：这时候台账里的"最近一条记录"跟眼前无关（那份课件还没被
             // 打开），所以标题写软件名、页码留空、也不给跳页行，只说一句在等什么（用户 2026-10-15）。
-            if (st.SuiteOnly)
+            // 例外：刚讲完两分钟内（recent）——那节课就是老师刚才在用的，不能因为课件关了就把
+            // 它连带历史一起擦掉，否则卡片会瞬间变成“等待打开课件”（用户 2026-10-18 报的就是这个）。
+            if (st.SuiteOnly && !recent)
             {
                 st.FileName = SuiteName;
                 st.Previous = 0;
                 st.Context = "";
                 st.Hint = "打开课件就能接着上次讲";
+                // 课件还没打开时，台账里那份“最近记录”跟眼前无关，别拿它的历史冒充“本课件”。
+                st.History.Clear();
+                st.HistoryTotal = 0;
             }
             return st;
         }
@@ -663,13 +1084,48 @@ namespace ClassSlideSync.Plugin.Core
             return (DateTime.Now - t).TotalDays;
         }
 
-        static string ShortAge(double days)
+        internal static string ShortAge(double days)
         {
             if (days < 0) return "刚刚";
             if (days < 1.0 / 24) return "刚刚";
             if (days < 1) return (int)(days * 24) + " 小时前";
             if (days < 30) return (int)days + " 天前";
             return (int)(days / 30) + " 个月前";
+        }
+
+        /// <summary>
+        /// 历史面板里一行的文字：页码、哪天讲的、讲了多久。故意不带文件路径——
+        /// 卡片只有两百多像素宽，路径既放不下，也不是老师点这一行时想看的。
+        /// </summary>
+        internal static string HistoryLabel(SessionRecord r)
+        {
+            int slide = r.EndSlide > 0 ? r.EndSlide : r.StartSlide;
+            var sb = new System.Text.StringBuilder();
+            sb.Append("第 ").Append(slide).Append(" 页");
+            DateTime t;
+            if (DateTime.TryParse(r.StartedAt, out t)) sb.Append(" · ").Append(t.ToString("MM-dd HH:mm"));
+            sb.Append(" · 讲了 ").Append(Duration(r.Seconds));
+            return sb.ToString();
+        }
+
+        static string Duration(int seconds)
+        {
+            if (seconds < 0) seconds = 0;
+            if (seconds < 60) return seconds + " 秒";
+            if (seconds < 3600) return (seconds / 60) + " 分钟";
+            return (seconds / 3600) + " 小时 " + ((seconds % 3600) / 60) + " 分";
+        }
+
+        /// <summary>
+        /// 台账键既可能是真实路径，也可能是「希沃:课件名」。后者直接取冒号后的名字，
+        /// 不能走 Path.GetFileName（它会把整串当文件名，某些非法字符组合还会抛异常）。
+        /// </summary>
+        static string FileLabel(string key)
+        {
+            if (string.IsNullOrEmpty(key)) return "";
+            if (SeewoBridge.IsSeewoKey(key)) return SeewoBridge.DisplayName(key);
+            try { return System.IO.Path.GetFileName(key); }
+            catch { return key; }
         }
 
         public void Stop()
@@ -685,6 +1141,9 @@ namespace ClassSlideSync.Plugin.Core
             // 也不要为了"关 WPS 更干净"去冒崩进程的险。
             if (joined) DropBridge();
             else { try { ledger.Log("engine thread still busy in COM -- 这次不释放 COM 引用，避免释放竞态"); } catch { } }
+
+            // HTTP 客户端没有 COM 的释放竞态问题，无论线程是否退出都可以安全关闭。
+            try { seewo.Dispose(); } catch { }
         }
 
         public void Dispose() { Stop(); }

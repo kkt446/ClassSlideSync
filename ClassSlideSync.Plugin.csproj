@@ -40,6 +40,20 @@
         <None Update="icon.png">
             <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
         </None>
+        <!-- 纯页码示例课件：整个 test\ 目录随输出走，老师装完插件就能拿它试功能。
+             用 Include（不是 Update）：test\ 是子目录，默认的 None 通配并不包含它的内容。
+             CreateCipx 是 ZipDirectory 整个输出目录，所以这个子目录会一起打进 .cipx。 -->
+        <None Include="test\纯页码课件.pptx">
+            <!-- 必须给 Link：不是写在项目根下的文件，CopyToOutputDirectory 默认会把它拍到
+                 输出目录根上，运行时按 test\纯页码课件.pptx 就找不到了。 -->
+            <Link>test\纯页码课件.pptx</Link>
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </None>
+    </ItemGroup>
+
+    <ItemGroup>
+        <!-- 新手引导的教程 JSON（ClassIsland 原生 Tutorial 格式），运行时从程序集里读。 -->
+        <EmbeddedResource Include="Assets\Tutorials\getStarted.json" />
     </ItemGroup>
 
 </Project>

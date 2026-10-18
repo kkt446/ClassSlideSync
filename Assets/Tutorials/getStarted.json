@@ -1,0 +1,295 @@
+{
+  "Id": "ClassSlideSync.Plugin.Tutorials",
+  "Title": "课件续页",
+  "Description": "记住每份课件讲到第几页，下次接着讲。",
+  "Tutorials": [
+    {
+      "ActualBanner": "avares://ClassIsland/Assets/DefaultTutorialBanner.webp",
+      "Id": "slidesync.getStarted",
+      "Title": "新手引导：课件续页怎么用",
+      "Description": "一共 10 步，看完就会用。",
+      "Ordinary": 0,
+      "Banner": "",
+      "Paragraphs": [
+        {
+          "Id": "slidesync.getStarted.basics",
+          "Title": "课件续页 · 一次讲清楚",
+          "Description": "引导会停在这一页上，点「下一步」继续。",
+          "TopLevelClassName": "ClassIsland.Views.TutorialCenterWindow",
+          "InitializeActions": [],
+          "Content": [
+            {
+              "Title": "这个插件干什么",
+              "Content": "课件续页会记住每一份课件讲到了第几页；下次打开同一份课件，它直接告诉你上次停在哪一页。",
+              "IconExpression": "",
+              "HeroImage": "",
+              "TargetSelector": "",
+              "HighlightTarget": false,
+              "PointToTarget": false,
+              "RightButtonText": "下一步",
+              "RightButtonActions": [
+                {
+                  "Kind": 1,
+                  "StringParameter": ""
+                }
+              ],
+              "LeftButtonText": "",
+              "LeftButtonActions": [],
+              "InitializeActions": [],
+              "WaitForNextCommand": false,
+              "UseLightDismiss": false,
+              "PlacementMode": 2
+            },
+            {
+              "Title": "怎么开始",
+              "Content": "在 ClassIsland 里像平时一样打开课件——PowerPoint 或者 WPS 演示都行，屏幕边上就会浮出小窗。",
+              "IconExpression": "",
+              "HeroImage": "",
+              "TargetSelector": "",
+              "HighlightTarget": false,
+              "PointToTarget": false,
+              "RightButtonText": "下一步",
+              "RightButtonActions": [
+                {
+                  "Kind": 1,
+                  "StringParameter": ""
+                }
+              ],
+              "LeftButtonText": "上一步",
+              "LeftButtonActions": [
+                {
+                  "Kind": 2,
+                  "StringParameter": ""
+                }
+              ],
+              "InitializeActions": [],
+              "WaitForNextCommand": false,
+              "UseLightDismiss": false,
+              "PlacementMode": 2
+            },
+            {
+              "Title": "小窗上有什么",
+              "Content": "小窗上写着文件名、上次停在第几页，中间是一个大页码；点「点击从第 N 页开始放映」那一行，幻灯片就从第 N 页接着放。",
+              "IconExpression": "",
+              "HeroImage": "",
+              "TargetSelector": "",
+              "HighlightTarget": false,
+              "PointToTarget": false,
+              "RightButtonText": "下一步",
+              "RightButtonActions": [
+                {
+                  "Kind": 1,
+                  "StringParameter": ""
+                }
+              ],
+              "LeftButtonText": "上一步",
+              "LeftButtonActions": [
+                {
+                  "Kind": 2,
+                  "StringParameter": ""
+                }
+              ],
+              "InitializeActions": [],
+              "WaitForNextCommand": false,
+              "UseLightDismiss": false,
+              "PlacementMode": 2
+            },
+            {
+              "Title": "翻页怎么记",
+              "Content": "放映时你翻到第几页，它自动跟着记；一退出放映就落账。只是打开课件、没真正放映的那几秒钟，不会覆盖上次的记录。",
+              "IconExpression": "",
+              "HeroImage": "",
+              "TargetSelector": "",
+              "HighlightTarget": false,
+              "PointToTarget": false,
+              "RightButtonText": "下一步",
+              "RightButtonActions": [
+                {
+                  "Kind": 1,
+                  "StringParameter": ""
+                }
+              ],
+              "LeftButtonText": "上一步",
+              "LeftButtonActions": [
+                {
+                  "Kind": 2,
+                  "StringParameter": ""
+                }
+              ],
+              "InitializeActions": [],
+              "WaitForNextCommand": false,
+              "UseLightDismiss": false,
+              "PlacementMode": 2
+            },
+            {
+              "Title": "没人理它会自己贴边",
+              "Content": "15 秒没人操作，小窗自动贴到屏幕边缘收起，只留一个小把手；点一下把手就展开，双击（或者点那个箭头）再收起。",
+              "IconExpression": "",
+              "HeroImage": "",
+              "TargetSelector": "",
+              "HighlightTarget": false,
+              "PointToTarget": false,
+              "RightButtonText": "下一步",
+              "RightButtonActions": [
+                {
+                  "Kind": 1,
+                  "StringParameter": ""
+                }
+              ],
+              "LeftButtonText": "上一步",
+              "LeftButtonActions": [
+                {
+                  "Kind": 2,
+                  "StringParameter": ""
+                }
+              ],
+              "InitializeActions": [],
+              "WaitForNextCommand": false,
+              "UseLightDismiss": false,
+              "PlacementMode": 2
+            },
+            {
+              "Title": "底部「历史 · N 次」",
+              "Content": "小窗底部的「历史 · N 次」是这份课件讲过的每一次：点其中一条，就直接跳到那一次停下的页码。",
+              "IconExpression": "",
+              "HeroImage": "",
+              "TargetSelector": "",
+              "HighlightTarget": false,
+              "PointToTarget": false,
+              "RightButtonText": "下一步",
+              "RightButtonActions": [
+                {
+                  "Kind": 1,
+                  "StringParameter": ""
+                }
+              ],
+              "LeftButtonText": "上一步",
+              "LeftButtonActions": [
+                {
+                  "Kind": 2,
+                  "StringParameter": ""
+                }
+              ],
+              "InitializeActions": [],
+              "WaitForNextCommand": false,
+              "UseLightDismiss": false,
+              "PlacementMode": 2
+            },
+            {
+              "Title": "右上角的文件夹图标",
+              "Content": "点右上角那个文件夹图标，能看到所有打开过的课件；点进某一份看它的历史，再点历史就跳到那份文件对应的页码。",
+              "IconExpression": "",
+              "HeroImage": "",
+              "TargetSelector": "",
+              "HighlightTarget": false,
+              "PointToTarget": false,
+              "RightButtonText": "下一步",
+              "RightButtonActions": [
+                {
+                  "Kind": 1,
+                  "StringParameter": ""
+                }
+              ],
+              "LeftButtonText": "上一步",
+              "LeftButtonActions": [
+                {
+                  "Kind": 2,
+                  "StringParameter": ""
+                }
+              ],
+              "InitializeActions": [],
+              "WaitForNextCommand": false,
+              "UseLightDismiss": false,
+              "PlacementMode": 2
+            },
+            {
+              "Title": "设置页里能调什么",
+              "Content": "插件设置页分成「基本」「运行时机」「卡片外观」「显示内容」「交互」几块：上课前多久自动待命、下课后保留多久、无人操作几秒自动贴边、最短记录时长、历史保留几天，都能在这里调；卡片贴左边还是右边、颜色圆角大小，以及显示内容里的文件名、页码、状态行、「点击从第 N 页开始放映」那一行，也各有开关。",
+              "IconExpression": "",
+              "HeroImage": "",
+              "TargetSelector": "",
+              "HighlightTarget": false,
+              "PointToTarget": false,
+              "RightButtonText": "下一步",
+              "RightButtonActions": [
+                {
+                  "Kind": 1,
+                  "StringParameter": ""
+                }
+              ],
+              "LeftButtonText": "上一步",
+              "LeftButtonActions": [
+                {
+                  "Kind": 2,
+                  "StringParameter": ""
+                }
+              ],
+              "InitializeActions": [],
+              "WaitForNextCommand": false,
+              "UseLightDismiss": false,
+              "PlacementMode": 2
+            },
+            {
+              "Title": "数据存在哪里",
+              "Content": "记录只存在本机：ClassIsland 目录下 data\\Config\\Plugins\\ClassSlideSync.Plugin\\，保留 21 天，不会上传。",
+              "IconExpression": "",
+              "HeroImage": "",
+              "TargetSelector": "",
+              "HighlightTarget": false,
+              "PointToTarget": false,
+              "RightButtonText": "下一步",
+              "RightButtonActions": [
+                {
+                  "Kind": 1,
+                  "StringParameter": ""
+                }
+              ],
+              "LeftButtonText": "上一步",
+              "LeftButtonActions": [
+                {
+                  "Kind": 2,
+                  "StringParameter": ""
+                }
+              ],
+              "InitializeActions": [],
+              "WaitForNextCommand": false,
+              "UseLightDismiss": false,
+              "PlacementMode": 2
+            },
+            {
+              "Title": "附：一份示例课件",
+              "Content": "插件目录 test\\ 下带了一份「纯页码课件.pptx」，十页只有页码和一个大数字，想试功能可以直接拿它放映一遍。",
+              "IconExpression": "",
+              "HeroImage": "",
+              "TargetSelector": "",
+              "HighlightTarget": false,
+              "PointToTarget": false,
+              "RightButtonText": "完成",
+              "RightButtonActions": [
+                {
+                  "Kind": 6,
+                  "StringParameter": ""
+                }
+              ],
+              "LeftButtonText": "上一步",
+              "LeftButtonActions": [
+                {
+                  "Kind": 2,
+                  "StringParameter": ""
+                }
+              ],
+              "InitializeActions": [],
+              "WaitForNextCommand": false,
+              "UseLightDismiss": false,
+              "PlacementMode": 2
+            }
+          ],
+          "IsBarrierEnabled": true,
+          "Xmlns": {}
+        }
+      ],
+      "Xmlns": {}
+    }
+  ],
+  "Xmlns": {}
+}

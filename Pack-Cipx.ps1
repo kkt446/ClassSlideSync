@@ -1,4 +1,4 @@
-# 一键打包成 ClassIsland 能直接导入的 .cipx
+﻿# 一键打包成 ClassIsland 能直接导入的 .cipx
 #
 #   用法（在仓库根目录）：
 #       pwsh -ep bypass -File .\Pack-Cipx.ps1

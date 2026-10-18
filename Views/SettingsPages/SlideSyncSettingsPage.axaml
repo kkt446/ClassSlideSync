@@ -359,6 +359,22 @@
                        Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                        Margin="0 10 0 0"/>
 
+            <Separator Margin="0 16 0 4" />
+            <ciControls:IconText Glyph="&#xE897;" Text="新手引导" Margin="0 0 0 4" />
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE897;}"
+                                       Header="新手引导"
+                                       Description="分 10 步介绍这个插件怎么用：小窗上有什么、翻页怎么记、历史怎么翻、设置怎么调。">
+                <controls:SettingsExpander.Footer>
+                    <Button Content="开始引导" Click="OnStartTutorialClick"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <TextBlock x:Name="GuideHint" IsVisible="False" TextWrapping="Wrap"
+                       FontSize="{DynamicResource MainWindowSecondaryFontSize}"
+                       Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                       Margin="0 6 0 0"/>
+
         </StackPanel>
     </ScrollViewer>
 </ci:SettingsPageBase>
