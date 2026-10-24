@@ -301,6 +301,9 @@ namespace ClassSlideSync.Plugin.Core
             a.FollowsTheme = follow;
 
             // ---- 底色 ----
+            // bgFromTheme：这张卡片的底色是不是「从 ClassIsland 主界面抄来的」。只有这种情形才把
+            // 滑块当成「相对宿主的不透明度」（见下面 alpha 那段），自定义底色仍然是绝对百分比。
+            bool bgFromTheme = false;
             int r, g, b, alpha;
             if (ClassIslandTheme.TryParseColor(s.CardBackgroundColor, out r, out g, out b, out alpha))
             {
@@ -309,16 +312,41 @@ namespace ClassSlideSync.Plugin.Core
             }
             else if (follow)
             {
-                // 2026-10-16 用户第 2 条：跟随时用「ClassIsland 卡片那种白底」，不再照抄主题的
-                // BackgroundColor —— 本机把主界面底色设成了纯黑（#000000FF），照抄就得到一张黑卡片，
-                // 跟宿主其他半透明白卡片完全不是一个观感。文字色随后按亮度自动切成深色。
-                a.BgR = 255; a.BgG = 255; a.BgB = 255;
+                // 2026-10-23 用户第 3 条（原话「插件改为 classisland 的透明…有时是透明但是不明显；
+                // 有时是直接纯白了，改成跟 classisland 一样的透明效果」）：跟随时用 ClassIsland
+                // 主界面**实测**的底色，不再硬编码纯白。
+                //
+                // 实测（本机，2026-10-23）：Settings.json 里 Theme=1 = 明亮主题（不像界面文字那样
+                // 靠猜，主题值来自 ThemeService：0 跟随系统 / 1 明亮 / 2 黑暗），岛的底色来自
+                // FluentAvalonia 明亮画刷 SolidBackgroundFillColorSecondary = #EEEEEE，整块不透明度
+                // = Settings.Opacity = 0.5；对 10-13 22:53 的整屏截图 bar.png 做「同一个岛压两种
+                // 不同背景」的两点取样反解，同样得到 底色 238、alpha 0.50。两条路互相印证。
+                //
+                // 注意不能照抄 Settings.BackgroundColor：本机那个值是 #000000FF（纯黑），而它只在
+                // 「背景颜色」开关打开（IsCustomBackgroundColorEnabled）时才被用于主界面；关着的时候
+                // 界面走的是主题画刷。照抄它会得到一张黑卡片，跟宿主完全不是一个观感。
+                a.BgR = 238; a.BgG = 238; a.BgB = 238;
+                bgFromTheme = true;
             }
 
             int pct = s.CardOpacityPercent;
             if (pct < 20) pct = 20;
             if (pct > 100) pct = 100;
-            a.BgAlpha = pct * 255 / 100;
+            if (bgFromTheme)
+            {
+                // 2026-10-23 用户反馈（原话「可以了，但是你开主页面不要虚化啊」）：底色沿用实测的
+                // #EEEEEE（和 ClassIsland 主界面同一个色），但**不再乘**宿主自己的 Opacity。
+                // 乘上去等于把宿主那层 0.5 半透明再叠一层到卡片上，卡片浮在彩色幻灯片上时就整块
+                // 发雾、泛出背景色，看着像虚化。滑块改回「绝对不透明度」：100% 完全不透，90% 只留
+                // 一点点，往下拖才逐级变透。
+                a.BgAlpha = pct * 255 / 100;
+            }
+            else
+            {
+                a.BgAlpha = pct * 255 / 100;
+            }
+            if (a.BgAlpha < 20) a.BgAlpha = 20;
+            if (a.BgAlpha > 255) a.BgAlpha = 255;
 
             // ---- 强调色 ----
             if (ClassIslandTheme.TryParseColor(s.AccentColor, out r, out g, out b, out alpha))

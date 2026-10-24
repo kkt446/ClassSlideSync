@@ -265,6 +265,29 @@ namespace ClassSlideSync.Plugin.Core
             return best;
         }
 
+        /// <summary>
+        /// 按文件内容指纹找最近一条记录。课件被改名或挪了目录之后文件名对不上，
+        /// 但内容没变 —— 页码仍然可信，历史也不该忽然消失。
+        /// </summary>
+        public SessionRecord? FindByFingerprint(string path)
+        {
+            string fp = Fingerprint(path);
+            if (fp.Length == 0 || ByFile == null) return null;
+            SessionRecord? best = null;
+            foreach (var kv in ByFile)
+            {
+                var list = kv.Value;
+                if (list == null) continue;
+                for (int i = 0; i < list.Count; i++)
+                {
+                    var r = list[i];
+                    if (r == null || string.IsNullOrEmpty(r.Fingerprint) || r.Fingerprint != fp) continue;
+                    if (best == null || string.CompareOrdinal(r.StartedAt ?? "", best.StartedAt ?? "") > 0) best = r;
+                }
+            }
+            return best;
+        }
+
         public void Add(SessionRecord r)
         {
             // 写和读用同一个桶：老台账里伪键带着旧的进程目录，继续往那个桶里追加，

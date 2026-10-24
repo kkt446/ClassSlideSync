@@ -9,6 +9,7 @@
       xmlns:controls="clr-namespace:FluentAvalonia.UI.Controls;assembly=FluentAvalonia"
       xmlns:ciControls="clr-namespace:ClassIsland.Core.Controls;assembly=ClassIsland.Core"
       mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
+      x:Name="PageRoot"
       x:DataType="local:SlideSyncSettingsPage">
 
     <!--
@@ -155,12 +156,16 @@
                     <ItemsControl ItemsSource="{Binding Settings.SubjectFolders}">
                         <ItemsControl.ItemTemplate>
                             <DataTemplate x:DataType="core:SubjectFolder">
-                                <Grid ColumnDefinitions="140,*,Auto" Margin="0 0 0 6">
-                                    <TextBox Grid.Column="0" Margin="0 0 8 0" Watermark="科目"
-                                             Text="{Binding Subject, Mode=TwoWay}"/>
+                                <Grid ColumnDefinitions="150,*,Auto,Auto" Margin="0 0 0 6">
+                                    <ComboBox Grid.Column="0" Margin="0 0 8 0"
+                                              ItemsSource="{Binding #PageRoot.SubjectOptions}"
+                                              SelectedItem="{Binding Subject, Mode=TwoWay}"
+                                              HorizontalAlignment="Stretch"/>
                                     <TextBox Grid.Column="1" Watermark="D:\课件\语文"
                                              Text="{Binding Folder, Mode=TwoWay}"/>
-                                    <Button Grid.Column="2" Margin="8 0 0 0" Content="删除"
+                                    <Button Grid.Column="2" Margin="8 0 0 0" Content="选择…"
+                                            Tag="{Binding}" Click="OnPickSubjectFolder"/>
+                                    <Button Grid.Column="3" Margin="6 0 0 0" Content="删除"
                                             Tag="{Binding}" Click="OnRemoveSubjectFolder"/>
                                 </Grid>
                             </DataTemplate>
@@ -210,7 +215,7 @@
 
             <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xF37D;}"
                                        Header="不透明度"
-                                       Description="太高挡课件，太低看不清字。">
+                                       Description="100% = 与 ClassIsland 主界面一样透（跟随主题时）；太高挡课件，太低看不清字。">
                 <controls:SettingsExpander.Footer>
                     <Slider Width="180" Minimum="20" Maximum="100" TickFrequency="5" IsSnapToTickEnabled="True"
                             Classes="auto-tooltip" ci:SliderDragTooltipAssist.StringFormat="F0"

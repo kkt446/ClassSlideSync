@@ -35,6 +35,8 @@ namespace ClassSlideSync.Plugin.Core
         bool followClassIslandTheme = true;
         string accentColor = "";
         string cardBackgroundColor = "";
+        // 跟随 ClassIsland 时 100% = 和主界面一样透（宿主 Opacity 0.5 × #EEEEEE，实测见 Core/Appearance.cs）；
+        // 自定义底色时仍是绝对百分比。默认 100 就是为了让「开箱即与 ClassIsland 一致」。
         int cardOpacityPercent = 90;
         int cardCornerRadius = -1;      // -1 = 跟随 ClassIsland 的圆角
         double cardScale = 1.0;
@@ -209,7 +211,11 @@ namespace ClassSlideSync.Plugin.Core
             set { Set(ref cardBackgroundColor, Normalize(value)); }
         }
 
-        /// <summary>卡片不透明度（百分比）。太高挡课件，太低看不清字。</summary>
+        /// <summary>
+        /// 卡片不透明度（百分比）。太高挡课件，太低看不清字。
+        /// 跟随 ClassIsland 主题时它是「相对宿主」的：100% = 主界面的透明度（本机 #EEEEEE @ 50%），
+        /// 往下调更透明；自定义底色时它就是绝对的整窗不透明度。
+        /// </summary>
         public int CardOpacityPercent
         {
             get { return cardOpacityPercent; }

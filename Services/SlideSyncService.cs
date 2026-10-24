@@ -353,6 +353,8 @@ namespace ClassSlideSync.Plugin.Services
             ArmReason = reason;
             ledger.Log("arm: " + reason);
 
+            // Avalonia 的 Window 必须在 UI 线程构造（后台线程会抛 "Call from invalid thread"）。
+            // Arm 由调度器 Timer 线程调用，所以这里同步切到宿主 UI 线程建窗口。
             var c = new NativeOverlayCard();
             c.Configure(Appearance, settings.AutoShowOverlay, settings.AutoHide, settings.AutoHideSeconds);
             c.JumpRequested += OnJumpRequested;
@@ -363,9 +365,9 @@ namespace ClassSlideSync.Plugin.Services
             c.Start();
             card = c;
 
-            // The card builds its window on its own thread, so a creation failure is invisible here
-            // unless it is written down. Waiting for the thread (off the host's UI thread) is the
-            // only way to tell "the teacher sees a card" from "the thread died quietly".
+            // The card is created on the host UI thread; a failure there is invisible here unless it
+            // is written down. The delayed Diag line is the only way to tell "the teacher sees a
+            // card" from "the window was never shown".
             System.Threading.Tasks.Task.Run(async () =>
             {
                 await System.Threading.Tasks.Task.Delay(1500);

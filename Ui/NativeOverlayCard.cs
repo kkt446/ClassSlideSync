@@ -150,6 +150,11 @@ namespace ClassSlideSync.Plugin.Ui
         // 只有"关掉课件再打开一份"才算新的一轮（用户 2026-10-13 要求：打开课件先弹小窗，
         // 15 秒后自己贴边收回）。
         bool expandedForDeck;
+        // 2026-10-23 用户第 2 条：从一份课件换到另一份（WPS 里打开别的文件、希沃里换课件）时，
+        // 卡片要"再弹一次"，而不是因为他上一份已经收起过就一直是把手。判据是"文件名 + 页数"，
+        // 换文件一定变；同一份课件被改过（页数变了）也当新的一轮，反正只是弹一次。
+        string lastDeckKey = "";
+        DateTime deckLatchUntil = DateTime.MinValue;
         bool autoHideEnabled = true;
         bool autoShow = true;
         int autoHideSeconds = 15;
@@ -581,7 +586,22 @@ namespace ClassSlideSync.Plugin.Ui
         void ApplyAlpha()
         {
             if (hwnd == IntPtr.Zero) return;
-            try { SetLayeredWindowAttributes(hwnd, 0, (byte)Math.Max(20, Math.Min(255, look.BgAlpha)), LWA_ALPHA); }
+            try
+            {
+                // 展开的卡片用设置里的不透明度（默认 90%，基本实心，和 ClassIsland 主界面的浅灰白
+                // 一个观感）；贴边收起后那条小药丸单独再透一档——它只有几十像素宽，透一点才不显眼，
+                // 用户 2026-10-23 就是因为药丸"又不透明了"才提的。
+                int alpha = look.BgAlpha;
+                if (!expanded)
+                {
+                    // 贴边收起后的药丸：直接用 ClassIsland 主界面那层透明（50%），不再跟展开卡片
+                    // 共用一个值。用户 2026-10-24 的原话：「打开悬浮窗是还是这个亮度，缩成药丸时
+                    // 为 classisland 一样的透明」。
+                    alpha = 128;
+                }
+
+                SetLayeredWindowAttributes(hwnd, 0, (byte)Math.Max(20, Math.Min(255, alpha)), LWA_ALPHA);
+            }
             catch { }
         }
 
@@ -626,6 +646,7 @@ namespace ClassSlideSync.Plugin.Ui
             ApplyContentHeight(st);   // 历史入口那一行只在展开态占高度
             Place();
             ApplyWindowRegion();   // 展开态整窗可见，收起态只有那个小把手
+            ApplyAlpha();          // 药丸 50% / 展开卡片按设置：状态一变就得跟着变，不能等下一拍 ApplyPending
             InvalidateRect(hwnd, IntPtr.Zero, false);
         }
 
@@ -640,6 +661,7 @@ namespace ClassSlideSync.Plugin.Ui
             ApplyContentHeight(st);
             Place();
             ApplyWindowRegion();
+            ApplyAlpha();          // 收起成药丸立刻回到 50% 透明，否则要等下一次状态推送才变
             InvalidateRect(hwnd, IntPtr.Zero, false);
         }
 
@@ -884,8 +906,24 @@ namespace ClassSlideSync.Plugin.Ui
             // 只有"有课件"（正在放映，或者打开着某份课件）时卡片才该出现。待命期间（比如上课前
             // 1 分钟）还没有课件，屏幕上必须干干净净；设置页的"预览"给 20 秒豁免。
             bool hasDeck = st.DeckOpen;
+            // 2026-10-23 用户报：「显示出来后，正在识别课件时拖动悬浮窗会直接隐藏」。识别那一两秒
+            // 里 DeckOpen 会抖（COM 还没回话、标题兜底还没命中），卡片就跟着闪没了。认出过一次
+            // 之后保持 8 秒，抖动不算"课件没了"。
+            if (hasDeck)
+            {
+                deckLatchUntil = DateTime.UtcNow.AddSeconds(8);
+            }
+            else if (DateTime.UtcNow < deckLatchUntil)
+            {
+                hasDeck = true;
+            }
             bool preview = DateTime.UtcNow < previewUntil;
             bool shouldShow = hasDeck || preview;
+            // 拖动过程中无论如何不能把自己藏掉——否则一松手就找不着了。
+            if (dragging || dragArmed)
+            {
+                shouldShow = true;
+            }
             // 课件关了、预览到点了：面板不能继续留在屏幕上。
             if (!shouldShow) ResetPanels();
             // 单文件历史面板的数据源被清空时也收起来；文件夹进来的面板二看的是快照，
@@ -925,6 +963,16 @@ namespace ClassSlideSync.Plugin.Ui
                 // 2026-10-16 用户报的 bug（第 4 条）：放映中每翻一页引擎都会重推状态（哈希变了），
                 // 原来这里在 st.Showing 时无条件 DoExpand()，老师刚点收起箭头，下一页又自己弹开。
                 // 现在一份课件只自动弹一次（expandedForDeck），之后翻页只改数字，不再动展开状态。
+                // 2026-10-23（用户第 2 条）：换课件时把"这一轮已经弹过"的记号复位，于是新课件
+                // 会再弹一次；同一份课件里翻页仍然不受影响（记号还是 true）。
+                string deckKey = st.FileName.Length > 0 ? (st.FileName + "|" + st.SlideCount) : "";
+                if (deckKey.Length > 0)
+                {
+                    bool switchedDeck = lastDeckKey.Length > 0 && !string.Equals(deckKey, lastDeckKey, StringComparison.Ordinal);
+                    lastDeckKey = deckKey;
+                    if (switchedDeck) expandedForDeck = false;
+                }
+
                 if (!expandedForDeck)
                 {
                     expandedForDeck = true;
@@ -934,12 +982,16 @@ namespace ClassSlideSync.Plugin.Ui
             else if (!hasDeck)
             {
                 expandedForDeck = false;   // 课件关掉了，下次打开是新的一轮
+                lastDeckKey = "";          // 同一份课件重新打开也算新的一轮，要再弹一次
             }
             // A slideshow window is topmost, and so are apps like the browser a teacher left open.
             // Being topmost is not enough -- the card has to be re-raised into the front of that
             // band every time it changes, or the show (or that browser) ends up covering it.
             if (expanded)
                 SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            // 展开 ⇄ 收起的透明度不一样（见 ApplyAlpha），而 ApplyAlpha 以前只在初始化时算过一次，
+            // 所以药丸一直沿用展开时那档亮度——2026-10-23 用户报「缩成药丸时还是这个亮度」就是这个。
+            ApplyAlpha();
             InvalidateRect(hwnd, IntPtr.Zero, false);
         }
 
@@ -1173,9 +1225,14 @@ namespace ClassSlideSync.Plugin.Ui
 
                             if (filePanel)
                             {
-                                // 面板一：台账里所有打开过的课件。抬头不显示路径，老师不需要看 c:\...。
-                                g.Text("打开过的课件", g.FontSmall, muted,
+                                // 面板一：台账里打开过的课件。抬头不显示路径，老师不需要看 c:\...。
+                                // 2026-10-23 用户第 3 条（"全部课件历史记录长的太丑"）重排：
+                                // 抬头压一条分隔线、文件名升到 FontSmall、当前行整行淡强调底 + 左侧竖条、
+                                // 返回改成居中弱化文字。行高和面板总高都不变，只换排版。
+                                g.Text("课件库", g.FontTiny, muted,
                                        new Rect32(pad, y, w - pad, y + lineSmall), Align.Left, false);
+                                int sepY = y + lineSmall - Scaled(2);
+                                g.FillRounded(hairline, new Rect32(pad, sepY, w - pad, sepY + Math.Max(1, Scaled(1))), 0, false, false);
                                 y += stepJump;
 
                                 int rows = FileRows(st);
@@ -1193,26 +1250,31 @@ namespace ClassSlideSync.Plugin.Ui
                                     if (f == null) continue;
                                     var row = new Rect32(pad - Scaled(7), y - Scaled(2), w - pad + Scaled(7), y + lineJump - Scaled(2));
                                     fileRowHits[i] = row;
-                                    // 正在讲的这份用强调色，左边再补一小条，扫一眼就知道“现在在哪份”。
+                                    // 正在讲的这份：整行淡强调底 + 左边一小条，扫一眼就知道“现在在哪份”。
                                     if (f.IsCurrent)
-                                        g.FillRounded(accent, new Rect32(pad - Scaled(7), y + Scaled(4), pad - Scaled(4), y + lineJump - Scaled(4)), Scaled(2), true, true);
+                                    {
+                                        g.FillRounded(Color32.Mix(bg, accent, 0.10), row, Scaled(6), true, true);
+                                        g.FillRounded(accent, new Rect32(row.L + Scaled(2), y + Scaled(4), row.L + Scaled(4), y + lineJump - Scaled(4)), Scaled(1), true, true);
+                                    }
                                     // 行尾的「第 N 页 · 3 小时前」右对齐；文件名先按剩余宽度截断，两段不会叠。
                                     int detailW = g.TextWidth(f.Detail, g.FontTiny);
-                                    int nameW = inner - detailW - Scaled(10);
+                                    int nameW = inner - detailW - Scaled(14);
                                     if (nameW < Scaled(24)) nameW = inner;   // 细节太长时宁可截细节，也不把文件名挤没
-                                    g.Text(g.Ellipsis(f.DisplayName, g.FontTiny, nameW), g.FontTiny,
+                                    g.Text(g.Ellipsis(f.DisplayName, g.FontSmall, nameW), g.FontSmall,
                                            f.IsCurrent ? accent : text,
-                                           new Rect32(pad, y, w - pad, y + lineJump), Align.Left, false);
+                                           new Rect32(pad, y, w - pad, y + lineJump - Scaled(1)), Align.Left, false);
                                     if (detailW > 0 && detailW < inner - Scaled(24))
                                         g.Text(f.Detail, g.FontTiny, muted,
-                                               new Rect32(pad, y, w - pad, y + lineJump), Align.Right, false);
+                                               new Rect32(pad, y, w - pad, y + lineJump - Scaled(1)), Align.Right, false);
                                     y += stepJump;
                                 }
 
                                 var fileBack = new Rect32(pad - Scaled(7), y - Scaled(2), w - pad + Scaled(7), y + lineJump - Scaled(2));
                                 backHit = fileBack;
-                                g.Text("\u2039 返回", g.FontTiny, accent,
-                                       new Rect32(pad, y, w - pad, y + lineJump), Align.Left, false);
+                                int backSep = y + lineJump - Scaled(2);
+                                g.FillRounded(hairline, new Rect32(pad, backSep, w - pad, backSep + Math.Max(1, Scaled(1))), 0, false, false);
+                                g.Text("\u2039 返回", g.FontTiny, muted,
+                                       new Rect32(pad, y, w - pad, y + lineJump), Align.Center, false);
                             }
                             else if (historyPanel)
                             {

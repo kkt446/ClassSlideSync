@@ -704,10 +704,24 @@ namespace ClassSlideSync.Plugin.Core
 
         void Advance(PptSnapshot snap)
         {
+            // 一拍之内换了课件：WPS 里关掉 A 直接双击 B，Step 仍然走 Advance。若不在这里分界，
+            // B 的页码会被写进 A 的记录 —— A 变成 B 的页，B 一条都没有（同一份也就算了，
+            // 两份不同的课件这么串，第二天谁的“上次停在第几页”都是错的）。
+            if (current != null
+                && !string.IsNullOrEmpty(snap.FilePath)
+                && PptBridge.LooksLikePath(snap.FilePath)
+                && !string.IsNullOrEmpty(current.FilePath)
+                && !SameBucket(snap.FilePath, current.FilePath))
+            {
+                EndSession(lastSlide);   // 先把上一份收尾（EndSlide 取 max，见下）
+                BeginSession(snap);
+                return;
+            }
+
             if (snap.Current > highest) highest = snap.Current;
-            // 记“最后停在哪一页”，不是“翻到过的最远页”：老师上完课往往会把课件翻回第 1 页保存，
-            // 那一页才是下次要接着讲的地方。
-            if (snap.Current > 0) { lastSlide = snap.Current; current.EndSlide = lastSlide; }
+            // 记“翻到过的最远页”，不是“关掉时停在哪一页”：老师上完课常把课件翻回第 1 页再关，
+            // 那一页不是下次要接着讲的地方。EndSlide 的语义就是这份课件讲到哪儿了。
+            if (snap.Current > 0) { lastSlide = snap.Current; current.EndSlide = highest; }
             if (snap.SlideCount > 0)
             {
                 current.SlideCount = snap.SlideCount;
@@ -728,7 +742,9 @@ namespace ClassSlideSync.Plugin.Core
             if (current == null) return;
             if (endSlide <= 0) endSlide = lastSlide;
             if (endSlide <= 0) endSlide = current.StartSlide;   // 都拿不到时至少别写成 0（用户第 6 条）
-            current.EndSlide = endSlide > 0 ? endSlide : 1;
+            // EndSlide 一律取“翻到过的最远页”：关课件前翻回第 1 页不该把这堂课讲到哪儿抹掉。
+            int end = Math.Max(highest, endSlide);
+            current.EndSlide = end > 0 ? end : 1;
             current.EndedAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
             current.Seconds = (int)(DateTime.Now - startAt).TotalSeconds;
             current.Fingerprint = currentFp;
@@ -845,6 +861,7 @@ namespace ClassSlideSync.Plugin.Core
         {
             recent = false;
             histKey = CurrentKey();
+            string curKey = histKey;   // 眼前这份课件的键（改名后 histKey 可能会挪到旧桶上）
             var r = histKey.Length > 0 ? ledger.Last(histKey) : null;
             if (r == null && histKey.Length > 0)
             {
@@ -854,7 +871,17 @@ namespace ClassSlideSync.Plugin.Core
                 // 同名即同一份课件，比“什么都不显示”更接近事实，也不至于张冠李戴到别的课件。
                 var byName = ledger.FindByName(FileLabel(histKey));
                 if (byName != null) { r = byName; histKey = byName.FilePath; }
+                else
+                {
+                    // 改名或换目录后文件名对不上，但文件内容没变：按指纹认回来，
+                    // histKey 留在原来的桶里，历史记录照旧看得见。
+                    var byFp = ledger.FindByFingerprint(curKey);
+                    if (byFp != null) { r = byFp; histKey = byFp.FilePath; }
+                }
             }
+            // 记录指向的那份文件已经不在了（改名/移动），而眼前这份确实存在：把记录认到眼前的路径上。
+            // 不做这一步，卡片会得出“文件在那之后被改过”的结论，点跳转还会去打开一个不存在的文件。
+            r = Retarget(r, curKey);
 
             // 最近活动优先：两分钟内刚结束的那节课压过其他套件留下的旧会话。
             // 没有这一条，希沃一退出授课（课件随即关掉）、WPS 里还开着旧课件时，卡片会立刻
@@ -871,6 +898,32 @@ namespace ClassSlideSync.Plugin.Core
                 return recentEnded;
             }
             return r;
+        }
+
+        /// <summary>
+        /// 台账记录里的文件已经不在了（改名/移动），眼前这份却存在：返回一份指向眼前路径的副本。
+        /// 原记录不动 —— 历史里那条仍然属于它自己的文件，只是“这次要跳的那份”换成了眼前的。
+        /// </summary>
+        static SessionRecord? Retarget(SessionRecord? r, string path)
+        {
+            if (r == null || string.IsNullOrEmpty(path)) return r;
+            if (string.Equals(r.FilePath, path, StringComparison.OrdinalIgnoreCase)) return r;
+            // 只在“两边都是磁盘路径”时换路径：希沃的记录是伪键，绝不能认到眼前这份 WPS 课件上。
+            if (!PptBridge.LooksLikePath(r.FilePath) || !PptBridge.LooksLikePath(path)) return r;
+            if (File.Exists(r.FilePath) || !File.Exists(path)) return r;
+            return new SessionRecord
+            {
+                FilePath = path,
+                StartedAt = r.StartedAt,
+                EndedAt = r.EndedAt,
+                StartSlide = r.StartSlide,
+                EndSlide = r.EndSlide,
+                SlideCount = r.SlideCount,
+                Fingerprint = r.Fingerprint,
+                Seconds = r.Seconds,
+                Subject = r.Subject,
+                LessonName = r.LessonName,
+            };
         }
 
         void DoJump()
@@ -1124,7 +1177,22 @@ namespace ClassSlideSync.Plugin.Core
         {
             if (string.IsNullOrEmpty(key)) return "";
             if (SeewoBridge.IsSeewoKey(key)) return SeewoBridge.DisplayName(key);
-            try { return System.IO.Path.GetFileName(key); }
+            try
+            {
+                string name = System.IO.Path.GetFileName(key);
+
+                // 2026-10-24：WPS 在**没有打开任何文档**时，Presentation.Name 会返回软件自己的名字
+                // （"WPS 演示" / "WPS Office" / "PowerPoint"），它没有扩展名、也不像路径。以前这里
+                // 原样收下，卡片就显示「WPS 演示」并当成一份课件去记，日志里
+                // `card: show=True deck=True file=WPS 演示` 就是它。认不出文件名就当作没认出课件，
+                // 交给标题兜底或下一轮 COM 再说。
+                if (name.IndexOf('.') < 0 && name.IndexOf('\\') < 0 && name.IndexOf('/') < 0)
+                {
+                    return "";
+                }
+
+                return name;
+            }
             catch { return key; }
         }
 

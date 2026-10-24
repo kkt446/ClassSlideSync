@@ -1,7 +1,13 @@
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using Avalonia.Controls;
 using Avalonia.Interactivity;
+using Avalonia.Platform.Storage;
 using ClassIsland.Core.Abstractions.Controls;
+using ClassIsland.Core.Abstractions.Services;
 using ClassIsland.Core.Attributes;
+using ClassIsland.Shared;
 using ClassSlideSync.Plugin.Core;
 
 namespace ClassSlideSync.Plugin.Views.SettingsPages;
@@ -26,12 +32,106 @@ public partial class SlideSyncSettingsPage : SettingsPageBase
         Appearance = new SlideSyncAppearanceViewModel(plugin.Settings, plugin.Service);
         InitializeComponent();
         DataContext = this;
+        RefreshSubjects();
         AttachedToVisualTree += (_, _) =>
         {
             // 打开设置页就重算一次：ClassIsland 的主题色是可以中途改的，这里顺势重新探一次。
             try { Plugin.Service?.RecomputeAppearance(); } catch { }
             Appearance.Refresh();
+            // 课表可能比设置页晚加载完，每次进来都重新对一遍科目名单。
+            RefreshSubjects();
         };
+    }
+
+    /// <summary>
+    /// 课表里的科目名单，给每行的下拉用。读的是 ClassIsland 档案里的 <c>Subject.Name</c>，
+    /// 另外把用户已经填过的名字也并进来——课表里删掉的旧配置不能因此变成空白。
+    /// </summary>
+    public ObservableCollection<string> SubjectOptions { get; } = new();
+
+    void RefreshSubjects()
+    {
+        try
+        {
+            var names = new List<string>();
+            var profiles = IAppHost.TryGetService<IProfileService>();
+            if (profiles?.Profile?.Subjects != null)
+            {
+                foreach (var subject in profiles.Profile.Subjects.Values)
+                {
+                    var name = subject?.Name?.Trim();
+                    if (!string.IsNullOrEmpty(name) && !names.Contains(name))
+                    {
+                        names.Add(name);
+                    }
+                }
+            }
+
+            // 已配置、但课表里已经没有的科目，也要能显示出来。
+            foreach (var folder in Settings.SubjectFolders)
+            {
+                var name = folder?.Subject?.Trim();
+                if (!string.IsNullOrEmpty(name) && !names.Contains(name))
+                {
+                    names.Add(name);
+                }
+            }
+
+            var same = names.Count == SubjectOptions.Count;
+            for (var i = 0; i < names.Count && same; i++)
+            {
+                same = string.Equals(names[i], SubjectOptions[i], StringComparison.Ordinal);
+            }
+
+            if (same)
+            {
+                return;
+            }
+
+            SubjectOptions.Clear();
+            foreach (var name in names)
+            {
+                SubjectOptions.Add(name);
+            }
+        }
+        catch
+        {
+            // 档案还没就绪时静默跳过，下次打开设置页会再试一次。
+        }
+    }
+
+    /// <summary>路径列：用系统的文件夹选择器，省得手打路径。</summary>
+    async void OnPickSubjectFolder(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            if (sender is not Button b || b.Tag is not SubjectFolder folder)
+            {
+                return;
+            }
+
+            var top = TopLevel.GetTopLevel(this);
+            if (top?.StorageProvider == null)
+            {
+                return;
+            }
+
+            var picked = await top.StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
+            {
+                Title = "选择这个科目的课件文件夹",
+                AllowMultiple = false
+            });
+
+            var path = picked != null && picked.Count > 0 ? picked[0].TryGetLocalPath() : null;
+            if (!string.IsNullOrEmpty(path))
+            {
+                folder.Folder = path;
+            }
+        }
+        catch
+        {
+            // 用户取消或平台不支持时不动原值。
+        }
     }
 
     void OnPreviewClick(object sender, RoutedEventArgs e)
