@@ -5,17 +5,44 @@ using ClassIsland.Shared;
 
 namespace ClassSlideSync.Plugin.Core
 {
+    /// <summary>
+    /// 用 ClassIsland 的课表回答一个问题："现在该不该把插件开着？"
+    ///
+    /// 规则（都能在设置页里调）：某个"上课"时间点开始前 leadSeconds 秒进入待命，这个时间点
+    /// 结束后再留 graceSeconds 秒。其余时间插件不占任何东西——不轮询 COM、不建窗口。
+    ///
+    /// 判断本身在 <see cref="LessonWindow"/> 里（纯计算，可离线测）；这里只负责把课表读出来。
+    /// </summary>
     public static class LessonClock
     {
         public sealed class Verdict
         {
+            /// <summary>false = 没拿到课表（没排课/服务拿不到），调用方要自己兜底。</summary>
             public bool Known;
+            /// <summary>true = 现在处在某个上课时段（含提前量与延后量）。</summary>
             public bool InLesson;
+            /// <summary>true = 正在正课时间里（不含提前量与延后量）。卡片显示与否看这个。</summary>
             public bool InPeriod;
+            /// <summary>日志用："第3节 09:40-10:20"；不在时段里时是最近的下一个时段。</summary>
             public string Detail = "";
+            /// <summary>今天的上课时间点全表，只在第一轮日志里打一次，方便核对插件读到的课表对不对。</summary>
             public string All = "";
+            /// <summary>距离进入待命还有多少秒（已经待命就是 0）。</summary>
             public int SecondsUntilArmed;
+            /// <summary>今天课表上的节数。0 = 没有课表，此时卡片退回"打开课件就显示"的老规矩。</summary>
             public int Periods;
+
+            /// <summary>
+            /// 功能7（2026-10-24）：true = 已经进入下一节课前的 lead 窗口、但还没打铃。
+            /// 只有这种时候卡片才允许显示「课前预备态」；上课后由正常的课件识别接管。
+            /// </summary>
+            public bool InPreClass;
+            /// <summary>预备窗口对应的那一节是第几节（1 起）；不在预备窗口时为 0。</summary>
+            public int PreClassPeriod;
+            /// <summary>预备窗口对应的科目名（取自课表的 NextClassSubject.Name）；取不到为空。</summary>
+            public string PreClassSubject = "";
+            /// <summary>日志用："预备 第3节 09:40（还有 87s）"。</summary>
+            public string PreClassDetail = "";
         }
 
         public static Verdict Check(int leadSeconds, int graceSeconds)
@@ -38,6 +65,7 @@ namespace ClassSlideSync.Plugin.Core
                 foreach (var item in items)
                 {
                     if (item == null) continue;
+                    // TimeLayoutItem.TimeType: 0 = 上课, 1 = 课间, 2 = 分割线, 3 = 行动
                     if (item.TimeType != 0) continue;
                     starts.Add(item.StartTime);
                     ends.Add(item.EndTime);
@@ -51,9 +79,30 @@ namespace ClassSlideSync.Plugin.Core
                 v.All = r.All;
                 v.SecondsUntilArmed = left;
                 v.Periods = r.Periods;
+                v.InPreClass = r.InPreClass;
+                v.PreClassPeriod = r.PreClassPeriod;
+
+                if (v.InPreClass)
+                {
+                    // 「这一科」必须问课表的下一节，不能看 CurrentSubject：预备窗口通常还在上一节
+                    // 的课间，CurrentSubject 要么是空的、要么还是上一科（见 ClassIsland 的
+                    // ILessonsService.NextClassSubject）。
+                    string subject = "";
+                    try
+                    {
+                        var next = lessons.NextClassSubject;
+                        if (next != null && next.Name != null) subject = next.Name.Trim();
+                    }
+                    catch { }
+                    v.PreClassSubject = subject;
+                    v.PreClassDetail = "预备 第" + v.PreClassPeriod + "节 " + LessonWindow.Fmt(r.PreClassStart)
+                                       + "（还有 " + r.SecondsToStart + "s）"
+                                       + (subject.Length > 0 ? " · " + subject : "");
+                }
             }
             catch
             {
+                // 课表服务出问题不能连累插件：当作"不知道"，让调用方用兜底逻辑。
             }
             return v;
         }

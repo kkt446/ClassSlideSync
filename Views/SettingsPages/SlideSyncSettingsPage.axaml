@@ -1,4 +1,4 @@
-<ci:SettingsPageBase x:Class="ClassSlideSync.Plugin.Views.SettingsPages.SlideSyncSettingsPage"
+﻿<ci:SettingsPageBase x:Class="ClassSlideSync.Plugin.Views.SettingsPages.SlideSyncSettingsPage"
       xmlns="https://github.com/avaloniaui"
       xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
       xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
@@ -12,11 +12,32 @@
       x:Name="PageRoot"
       x:DataType="local:SlideSyncSettingsPage">
 
-    
+    <ci:SettingsPageBase.Resources>
+        <!-- 「控制面板底色」那行：ColorPicker 要 Color，设置字段是 "#AARRGGBB" 字符串。
+             转换器见同目录 SlideSyncSettingsPage.xaml.cs 里的 HexColorConverter
+             （控制面板的设置页签也用它，同一份实现）。 -->
+        <local:HexColorConverter x:Key="HexColor" />
+    </ci:SettingsPageBase.Resources>
+
+    <!--
+      布局照抄本体自己的设置页：settings-container 负责宽度与间距（960 / 4），
+      SettingsExpander 负责卡片外观，图标用 Fluent 字形，颜色一律 DynamicResource，
+      于是老师换主题色或明暗主题时，这一页跟着变，不会变成界面上的异物。
+    -->
     <ScrollViewer>
         <StackPanel Classes="settings-container animated-intro">
 
             <ciControls:IconText Glyph="&#xEF27;" Text="基本" Margin="0 0 0 4" />
+
+            <!-- 2026-10-24 用户要求「插件设置新增打开主设置」：把控制面板的入口也放到设置页，
+                 老师不必先让卡片露出来再点齿轮。 -->
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE8A7;}"
+                                       Header="打开控制面板"
+                                       Description="课件库、全部设置和关于都在这里；也可以在悬浮卡片上点齿轮打开。">
+                <controls:SettingsExpander.Footer>
+                    <Button x:Name="OpenPanelButton" Content="打开" VerticalAlignment="Center" />
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
 
             <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xEA2F;}"
                                        Header="授课时显示悬浮卡片"
@@ -51,6 +72,26 @@
                 </controls:SettingsExpander.Footer>
             </controls:SettingsExpander>
 
+            <!-- 2026-10-24 功能4：下课弹通知。只有课件已经关掉才弹，还在放映时不打扰。 -->
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xEA8F;}"
+                                       Header="下课时弹一条系统通知"
+                                       Description="下课铃响、课件也关掉之后，右下角弹一条：这一节记到第几页、还剩几页。课件还开着就不弹。">
+                <controls:SettingsExpander.Footer>
+                    <ToggleSwitch VerticalAlignment="Center"
+                                  IsChecked="{Binding Settings.ClassEndNotification, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <!-- 2026-10-24 控制面板：卡片拿不到键盘焦点，搜索只能放进独立窗口，这个开关控制卡片上的齿轮。 -->
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE713;}"
+                                       Header="在卡片上显示控制面板按钮"
+                                       Description="卡片右上角出现一个齿轮，点开独立的面板：搜索课件、看历史、打开文件夹。">
+                <controls:SettingsExpander.Footer>
+                    <ToggleSwitch VerticalAlignment="Center"
+                                  IsChecked="{Binding Settings.EnableControlPanel, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
             <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xF031;}"
                                        Header="最短记录时长"
                                        Description="短于该时长的放映当作误触，不写进台账（秒）。">
@@ -70,6 +111,20 @@
                 <controls:SettingsExpander.Footer>
                     <ToggleSwitch VerticalAlignment="Center"
                                   IsChecked="{Binding Settings.AutoStartBeforeClass, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <!-- 功能7：课前预览上次没讲完的课件。直接绑同一个 SyncSettings 实例，
+                 拨动开关立刻写回 Settings.ReadyCardEnabled，不需要额外的保存/刷新代码。 -->
+            <controls:SettingsExpander x:Name="ReadyCardRow"
+                                       IconSource="{ciControls:FluentIconSource &#xE81C;}"
+                                       Header="课前预览上次没讲完的课件"
+                                       Description="上课前两分钟，如果这一科上次没讲完，卡片先亮出来，写着上次停在第几页。关掉就只在真正放映时出现。"
+                                       IsVisible="{Binding Settings.AutoStartBeforeClass}">
+                <controls:SettingsExpander.Footer>
+                    <ToggleSwitch x:Name="ReadyCardToggle"
+                                  VerticalAlignment="Center"
+                                  IsChecked="{Binding Settings.ReadyCardEnabled, Mode=TwoWay}"/>
                 </controls:SettingsExpander.Footer>
             </controls:SettingsExpander>
 
@@ -152,11 +207,24 @@
                     <ItemsControl ItemsSource="{Binding Settings.SubjectFolders}">
                         <ItemsControl.ItemTemplate>
                             <DataTemplate x:DataType="core:SubjectFolder">
-                                <Grid ColumnDefinitions="150,*,Auto,Auto" Margin="0 0 0 6">
+                                <Grid ColumnDefinitions="160,*,Auto,Auto" Margin="0 0 0 6">
+                                    <!-- 科目优先给下拉（选项 = 课表里的科目 + 这条记录原来的值）；
+                                         课表没加载/读不出来时，SubjectFolder.UseDropdown 为 false，
+                                         这里就退回原来的可编辑文本框，绝不把旧值弄丢。
+                                         注意：绑定只能落在 x:DataType 指明的 SubjectFolder 成员上。
+                                         以前这里写 $parent[local:SlideSyncSettingsPage].…，Avalonia 会在运行时
+                                         按程序集名 Assembly.Load 解析类型，而插件是动态加载的，直接抛
+                                         FileNotFoundException 把整个设置页打崩（2026-10-24 真机崩溃）。 -->
                                     <ComboBox Grid.Column="0" Margin="0 0 8 0"
-                                              ItemsSource="{Binding #PageRoot.SubjectOptions}"
+                                              IsVisible="{Binding UseDropdown}"
+                                              ItemsSource="{Binding Options}"
                                               SelectedItem="{Binding Subject, Mode=TwoWay}"
+                                              PlaceholderText="语文"
                                               HorizontalAlignment="Stretch"/>
+                                    <TextBox Grid.Column="0" Margin="0 0 8 0"
+                                             IsVisible="{Binding UseTextBox}"
+                                             Watermark="语文"
+                                             Text="{Binding Subject, Mode=TwoWay}"/>
                                     <TextBox Grid.Column="1" Watermark="D:\课件\语文"
                                              Text="{Binding Folder, Mode=TwoWay}"/>
                                     <Button Grid.Column="2" Margin="8 0 0 0" Content="选择…"
@@ -290,13 +358,60 @@
                 </controls:SettingsExpander.Footer>
             </controls:SettingsExpander>
 
+            <!-- 2026-10-24 23:06 老师要求：缩成药丸后默认长一点，长度也要能改。
+                 宽度是露在屏幕边缘那一条有多宽，长度是沿屏幕边缘方向有多长，两个方向分开调。 -->
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE89D;}"
+                                       Header="收起药丸的长度"
+                                       Description="缩成药丸后沿屏幕边缘那一向有多长（像素）。">
+                <controls:SettingsExpander.Footer>
+                    <NumericUpDown Width="140" Minimum="96" Maximum="480" Increment="8"
+                                   VerticalAlignment="Center"
+                                   Value="{Binding Settings.CollapsedTabLength, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <!-- 药丸里的两行页码在 50% 透明下看不清，所以药丸单独给一档透明度。 -->
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE7F4;}"
+                                       Header="收起药丸的透明度"
+                                       Description="缩成药丸后这一条的透明程度（100% 完全不透明）。里面有两行页码，太透会看不清。">
+                <controls:SettingsExpander.Footer>
+                    <Slider Width="220" Minimum="30" Maximum="100" TickFrequency="5" IsSnapToTickEnabled="True"
+                            VerticalAlignment="Center"
+                            Value="{Binding Settings.CollapsedTabOpacityPercent, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <!-- 同一个要求的另一半：面板不要亚克力，直接上实色，颜色归老师管。
+                 8 位写法是 #AARRGGBB（Alpha 在前，和 Avalonia 的颜色口径一致）。 -->
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE523;}"
+                                       Header="控制面板底色"
+                                       Description="点齿轮打开的面板底色，默认纯白 #FFFFFFFF。">
+                <controls:SettingsExpander.Footer>
+                    <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                        <ColorPicker Width="140" Height="32"
+                                     VerticalAlignment="Center"
+                                     BorderBrush="#33000000" BorderThickness="1"
+                                     IsAlphaVisible="True"
+                                     Color="{Binding Settings.PanelBackgroundColor, Mode=TwoWay, Converter={StaticResource HexColor}}"/>
+                        <!-- 把存下来的原样显示出来：老师能确认自己填的串被存成了什么，
+                             也看得出 6 位和 8 位的区别。 -->
+                        <TextBlock VerticalAlignment="Center"
+                                   FontSize="{DynamicResource MainWindowSecondaryFontSize}"
+                                   Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                   Text="{Binding Settings.PanelBackgroundColor}"/>
+                    </StackPanel>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
             <Separator Margin="0 12 0 4" />
             <ciControls:IconText Glyph="&#xE6EF;" Text="显示内容" Margin="0 0 0 4" />
 
             <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xEFBF;}"
                                        Header="显示内容"
                                        Description="卡片上出现哪几行。">
-                
+                <!-- FluentAvalonia 2.4.1 的 SettingsExpanderItem 上没有 IsOn 属性，
+                     开关必须自己放进 Footer（本体 CountDownComponentSettingsControl 就是这么写的），
+                     用 Classes="switcher" 会去套一个依赖该属性的模板，所以不能那么写。 -->
                 <controls:SettingsExpanderItem Content="课件文件名">
                     <controls:SettingsExpanderItem.Footer>
                         <ToggleSwitch VerticalAlignment="Center" IsChecked="{Binding Settings.CardShowFileName, Mode=TwoWay}"/>

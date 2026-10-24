@@ -56,4 +56,64 @@
         <EmbeddedResource Include="Assets\Tutorials\getStarted.json" />
     </ItemGroup>
 
+    <!-- ===== 横幅 helper（Tools\ToastHelper）=====
+         helper 是一个独立的小 exe：弹 Windows 操作中心横幅需要 WinRT 投影
+         （Windows.UI.Notifications + Windows.Data.Xml.Dom，net8.0-windows10.0.19041.0 起才有），
+         而插件的目标框架被 ClassIsland 的动态加载钉死在 net8.0-windows，不能改，也不能给插件加 NuGet。
+         所以它自己单独编译，主工程构建时顺带构建它、再把整个输出目录拷到 $(OutDir)ToastHelper\。
+         .cipx 是「把整个输出目录打 zip」，因此插件包天然带上它，老师装上插件就自带横幅能力。 -->
+    <PropertyGroup>
+        <ToastHelperProject>$(MSBuildProjectDirectory)\Tools\ToastHelper\ToastHelper.csproj</ToastHelperProject>
+        <ToastHelperOut>$(MSBuildProjectDirectory)\Tools\ToastHelper\bin\$(Configuration)\net8.0-windows10.0.19041.0</ToastHelperOut>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <!-- 增量判断用：helper 的源码/工程文件变了才重新编它。 -->
+        <ToastHelperSource Include="$(MSBuildProjectDirectory)\Tools\ToastHelper\*.cs;$(ToastHelperProject)" />
+    </ItemGroup>
+
+    <Target Name="BuildToastHelper"
+            BeforeTargets="Build"
+            Condition="Exists('$(ToastHelperProject)')"
+            Inputs="@(ToastHelperSource)"
+            Outputs="$(OutDir)ToastHelper\ToastHelper.exe">
+        <!-- 用 Exec 起一个子 dotnet，而不是 MSBuild 任务：MSBuild 任务会把主工程的全局属性
+             （Configuration/Platform/TargetFramework）带进子工程，helper 的 TFM 会被覆盖成
+             net8.0-windows，WinRT 投影就编不出来了。子进程完全隔离，最干净。 -->
+        <PropertyGroup>
+            <_ToastDotnet>$(DOTNET_HOST_PATH)</_ToastDotnet>
+            <_ToastDotnet Condition="'$(_ToastDotnet)' == ''">dotnet</_ToastDotnet>
+        </PropertyGroup>
+        <Exec Command="&quot;$(_ToastDotnet)&quot; build &quot;$(ToastHelperProject)&quot; -c $(Configuration) -v:m -nologo" />
+    </Target>
+
+    <Target Name="CopyToastHelper"
+            AfterTargets="Build"
+            BeforeTargets="CreateCipx"
+            Condition="Exists('$(ToastHelperOut)\ToastHelper.exe')">
+        <ItemGroup>
+            <_ToastHelperFile Include="$(ToastHelperOut)\**\*" />
+        </ItemGroup>
+        <Copy SourceFiles="@(_ToastHelperFile)"
+              DestinationFiles="@(_ToastHelperFile->'$(OutDir)ToastHelper\%(RecursiveDir)%(Filename)%(Extension)')"
+              SkipUnchangedFiles="true" />
+        <!-- 登记成构建产物：这样 `dotnet build -t:Rebuild` 的 Clean 会顺手删掉，
+             否则旧版 helper 会一直残留在输出目录里被打进下一个 .cipx。 -->
+        <ItemGroup>
+            <FileWrites Include="@(_ToastHelperFile->'$(OutDir)ToastHelper\%(RecursiveDir)%(Filename)%(Extension)')" />
+        </ItemGroup>
+    </Target>
+
+    <ItemGroup>
+        <!-- tools\ToastHelper 是一个独立的小工具工程（横幅通知），它有自己的 csproj 与 obj/bin。
+             主工程的默认 Compile/Avalonia 通配会把它的源码和生成文件一起吞进来，导致 CS0579 重复特性
+             和 Windows.Data/UI 找不到。这里显式排除整个 tools\ 目录，主工程只保留 tools 下的脚本。 -->
+        <Compile Remove="tools\**\*.cs" />
+        <AvaloniaXaml Remove="tools\**\*" />
+        <AvaloniaResource Remove="tools\**\*" />
+        <EmbeddedResource Remove="tools\**\*" />
+        <None Remove="tools\**\obj\**" />
+        <None Remove="tools\**\bin\**" />
+    </ItemGroup>
+
 </Project>

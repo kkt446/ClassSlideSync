@@ -1,23 +1,40 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Text.Json;
 
 namespace ClassSlideSync.Plugin.Core
 {
+    /// <summary>
+    /// ClassIsland 此刻在用的主题，直接从 <c>data\Settings.json</c> 读。
+    ///
+    /// 为什么要读文件而不是问 ClassIsland 要：2.1.0.1 的 <c>IThemeService</c> 只暴露
+    /// ThemeUpdated / CurrentRealThemeMode / SetTheme / AnimationLevel，<b>没有</b>任何取当前主色的
+    /// 属性；<c>Application.Current.Resources</c> 在运行期也只有 7 个转换器和字体键，没有主题色。
+    /// 而 Settings.json 是这些值的唯一真源，读它才可能做到"老师一换主题色，卡片跟着变"。
+    ///
+    /// 颜色字符串是 <c>#RRGGBBAA</c>（Alpha 在<b>最后</b>）。这是实测结论，不是猜的：
+    /// 本机 Settings.json 里 CustomForegroundColor=#1E90FFFF 正好是标准色 DodgerBlue、
+    /// SecondaryColor=#7FFFD4FF 正好是标准色 aquamarine、PrimaryColor=#FF9D11FF 是 ClassIsland
+    /// 的品牌橙；按 AARRGGBB 解释则会得到"半透明蓝 / 半透明淡紫 / 全透明蓝"，讲不通。
+    /// </summary>
     public sealed class ClassIslandTheme
     {
+        /// <summary>主题值的来源（写进日志，方便判断"卡片颜色不对"是读不到还是解析错）。</summary>
         public string Source = "(未读到 ClassIsland 的 Settings.json，使用内置默认值)";
 
         public bool Loaded;
 
+        // 原始字符串，保留下来写日志用
         public string PrimaryHex = "#FF9D11FF";
         public string SecondaryHex = "#7FFFD4FF";
         public string BackgroundHex = "#000000FF";
         public string ForegroundHex = "";
 
+        // 解析后的主色 / 底色
         public int AccentR = 0xFF, AccentG = 0x9D, AccentB = 0x11;
         public int BgR = 0x00, BgG = 0x00, BgB = 0x00;
 
+        /// <summary>主界面（岛）自身的不透明度，0-1。</summary>
         public double IslandOpacity = 0.5;
         public int Radius = 8;
         public double Scale = 1.0;
@@ -28,10 +45,17 @@ namespace ClassSlideSync.Plugin.Core
         public int EmphasizedFontSize = 18;
         public int LargeFontSize = 20;
 
+        /// <summary>ClassIsland 自己在用的字体族名（HarmonyOS Sans SC）。</summary>
         public string FontFamily = "Microsoft YaHei UI";
 
+        /// <summary>字体文件路径；找到了才能让卡片用上 ClassIsland 的同款字体。</summary>
         public string FontFile = "";
 
+        /// <summary>
+        /// 强调色最终是不是取自 Avalonia 运行时的 SystemAccentColor。
+        /// ClassIsland 的“主题色来源”选“系统主题色”时，Settings.json 里的 PrimaryColor 根本不生效，
+        /// 屏幕上真正的强调色只有运行时才拿得到（见 Services/SlideSyncService.ProbeUiTheme）。
+        /// </summary>
         public bool AccentFromUi;
         public string AccentNote = "settings.json:PrimaryColor";
 
@@ -75,6 +99,8 @@ namespace ClassSlideSync.Plugin.Core
                         t.EmphasizedFontSize = (int)Num(root, "MainWindowEmphasizedFontSize", t.EmphasizedFontSize);
                         t.LargeFontSize = (int)Num(root, "MainWindowLargeFontSize", t.LargeFontSize);
 
+                        // MainWindowFont 形如 "avares://ClassIsland/Assets/Fonts/#HarmonyOS Sans SC, ..."，
+                        // 取第一个 "#" 后面的族名即可。
                         string font = Str(root, "MainWindowFont", "");
                         string family = FirstFamily(font);
                         if (family.Length > 0) t.FontFamily = family;
@@ -97,6 +123,10 @@ namespace ClassSlideSync.Plugin.Core
             return t;
         }
 
+        /// <summary>
+        /// 从插件自己的配置目录向上找 ClassIsland 的 data 目录：插件是
+        /// <c>data\Config\Plugins\&lt;插件&gt;</c>，data 目录的特征是同时有 Settings.json 和 Config 子目录。
+        /// </summary>
         static string FindDataFolder(string start)
         {
             try
@@ -114,6 +144,10 @@ namespace ClassSlideSync.Plugin.Core
             return null;
         }
 
+        /// <summary>
+        /// 找 ClassIsland 自带的 HarmonyOS Sans SC 字体文件。GDI 不认 Avalonia 的 avares 资源，
+        /// 必须拿到磁盘上的 ttf 再 AddFontResourceEx 私有加载，卡片才能和宿主用同一种字体。
+        /// </summary>
         static string FindFontFile(string family)
         {
             try
@@ -124,6 +158,7 @@ namespace ClassSlideSync.Plugin.Core
                 roots.Add(baseDir);
                 roots.Add(Path.Combine(baseDir, "Assets", "Fonts"));
 
+                // ClassIsland 2 的实际程序在 exe 旁边的 app-x.y.z 目录里，两个方向都找一遍。
                 foreach (var parent in new[] { baseDir, SafeParent(baseDir) })
                 {
                     if (parent == null) continue;
@@ -181,6 +216,7 @@ namespace ClassSlideSync.Plugin.Core
             return fallback;
         }
 
+        /// <summary>#RRGGBB 或 #RRGGBBAA（Alpha 在最后，见类注释）。</summary>
         public static bool TryParseColor(string s, out int r, out int g, out int b, out int a)
         {
             r = g = b = 0; a = 255;
@@ -198,23 +234,40 @@ namespace ClassSlideSync.Plugin.Core
             }
             catch { return false; }
         }
+
+        /// <summary>这个颜色串是不是明确带了 alpha（8 位）。和 TryParseColor 分开，调用方才能区分
+        /// "写了 #RRGGBBFF" 和 "只写了 #RRGGBB、alpha 用默认值"。</summary>
+        public static bool HasExplicitAlpha(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return false;
+            s = s.Trim();
+            if (s.StartsWith("#")) s = s.Substring(1);
+            return s.Length == 8;
+        }
     }
 
+    /// <summary>
+    /// 卡片最终长什么样：ClassIsland 主题 ⊕ 用户自定义。绘制代码只认这个类，
+    /// 于是"跟随主题"和"自定义"的优先级只有一处实现，不会两边打架。
+    /// </summary>
     public sealed class CardAppearance
     {
         public int BgR = 24, BgG = 26, BgB = 32;
+        /// <summary>整窗不透明度 0-255（GDI 没有逐图元 alpha，只能整窗混合）。</summary>
         public int BgAlpha = 230;
 
         public int AccentR = 0xFF, AccentG = 0x9D, AccentB = 0x11;
         public int TextR = 0xF2, TextG = 0xF3, TextB = 0xF5;
         public int MutedR = 0xA8, MutedG = 0xAA, MutedB = 0xAE;
 
-        public int Radius = 8;
+        /// <summary>卡片圆角（96dpi 稿值）。2026-10-24 改版按视觉规格从 8 提到 10。</summary>
+        public int Radius = 10;
         public double CardScale = 1.0;
         public int FontDelta = 0;
         public string FontFamily = "Microsoft YaHei UI";
         public string FontFile = "";
 
+        /// <summary>字号沿用 ClassIsland 自己那套（次要 / 正文 / 强调 / 大号），卡片文字才不会比宿主更"胖"。</summary>
         public int FontSecondary = 14;
         public int FontBody = 16;
         public int FontEmphasized = 18;
@@ -223,6 +276,13 @@ namespace ClassSlideSync.Plugin.Core
         public bool OnRight = true;
         public int VerticalPercent = 50;
         public int TabWidth = 32;
+        /// <summary>
+        /// 收起后药丸的长度（96dpi 稿值，沿屏幕边缘方向）。TabWidth 是垂直于屏幕边缘那条边。
+        /// 2026-10-24：老师要求「缩成药丸时默认长一点」，默认从 96 提到 200，并可由 CollapsedTabLength 调。
+        /// </summary>
+        public int TabLength = 200;
+        /// <summary>收起药丸的整窗 alpha（0..255）。比展开态不透明一档，否则里面那两行小字看不清。</summary>
+        public int PillAlpha = 204;
         public int CardWidth = 236;
         public int CardHeight = 150;
 
@@ -233,19 +293,20 @@ namespace ClassSlideSync.Plugin.Core
         public bool ShowJumpLine = true;
         public bool ClickToJump = true;
 
+        /// <summary>跟随主题还是自定义，写进日志用。</summary>
         public bool FollowsTheme = true;
 
         public string Describe()
         {
             return string.Format(
                 "bg=#{0:X2}{1:X2}{2:X2} alpha={3} accent=#{4:X2}{5:X2}{6:X2} radius={7} scale={8:0.##} " +
-                "font={9}{10} side={11} v={12}% tab={13} lines={14}{15}{16}{17} click={18} follow={19}",
+                "font={9}{10} side={11} v={12}% tab={13}x{20} lines={14}{15}{16}{17} click={18} follow={19}",
                 BgR, BgG, BgB, BgAlpha, AccentR, AccentG, AccentB, Radius, CardScale,
                 FontFamily, FontFile.Length > 0 ? "(ttf)" : "", OnRight ? "right" : "left", VerticalPercent,
                 TabWidth,
                 ShowFileName ? "title," : "", ShowSlideCount ? "count," : "", ShowContext ? "context," : "",
                 ShowStatusLine ? "status," : "",
-                ClickToJump, FollowsTheme);
+                ClickToJump, FollowsTheme, TabLength);
         }
 
         public static CardAppearance Resolve(SyncSettings s, ClassIslandTheme theme)
@@ -257,15 +318,35 @@ namespace ClassSlideSync.Plugin.Core
             bool follow = s.FollowClassIslandTheme;
             a.FollowsTheme = follow;
 
+            // ---- 底色 ----
+            // bgFromTheme：这张卡片的底色是不是「从 ClassIsland 主界面抄来的」。只有这种情形才把
+            // 滑块当成「相对宿主的不透明度」（见下面 alpha 那段），自定义底色仍然是绝对百分比。
             bool bgFromTheme = false;
             int r, g, b, alpha;
+            // 8 位自定义底色（#RRGGBBAA）里的 alpha 是"老师明确写的"，优先级高于不透明度滑块；
+            // -1 = 没写 alpha，仍按滑块算（F1，2026-10-24 第二轮）。
+            int bgAlpha = -1;
             if (ClassIslandTheme.TryParseColor(s.CardBackgroundColor, out r, out g, out b, out alpha))
             {
                 a.BgR = r; a.BgG = g; a.BgB = b;
                 a.FollowsTheme = false;
+                if (ClassIslandTheme.HasExplicitAlpha(s.CardBackgroundColor)) bgAlpha = alpha;
             }
             else if (follow)
             {
+                // 2026-10-23 用户第 3 条（原话「插件改为 classisland 的透明…有时是透明但是不明显；
+                // 有时是直接纯白了，改成跟 classisland 一样的透明效果」）：跟随时用 ClassIsland
+                // 主界面**实测**的底色，不再硬编码纯白。
+                //
+                // 实测（本机，2026-10-23）：Settings.json 里 Theme=1 = 明亮主题（不像界面文字那样
+                // 靠猜，主题值来自 ThemeService：0 跟随系统 / 1 明亮 / 2 黑暗），岛的底色来自
+                // FluentAvalonia 明亮画刷 SolidBackgroundFillColorSecondary = #EEEEEE，整块不透明度
+                // = Settings.Opacity = 0.5；对 10-13 22:53 的整屏截图 bar.png 做「同一个岛压两种
+                // 不同背景」的两点取样反解，同样得到 底色 238、alpha 0.50。两条路互相印证。
+                //
+                // 注意不能照抄 Settings.BackgroundColor：本机那个值是 #000000FF（纯黑），而它只在
+                // 「背景颜色」开关打开（IsCustomBackgroundColorEnabled）时才被用于主界面；关着的时候
+                // 界面走的是主题画刷。照抄它会得到一张黑卡片，跟宿主完全不是一个观感。
                 a.BgR = 238; a.BgG = 238; a.BgB = 238;
                 bgFromTheme = true;
             }
@@ -275,7 +356,17 @@ namespace ClassSlideSync.Plugin.Core
             if (pct > 100) pct = 100;
             if (bgFromTheme)
             {
+                // 2026-10-23 用户反馈（原话「可以了，但是你开主页面不要虚化啊」）：底色沿用实测的
+                // #EEEEEE（和 ClassIsland 主界面同一个色），但**不再乘**宿主自己的 Opacity。
+                // 乘上去等于把宿主那层 0.5 半透明再叠一层到卡片上，卡片浮在彩色幻灯片上时就整块
+                // 发雾、泛出背景色，看着像虚化。滑块改回「绝对不透明度」：100% 完全不透，90% 只留
+                // 一点点，往下拖才逐级变透。
                 a.BgAlpha = pct * 255 / 100;
+            }
+            else if (bgAlpha >= 0)
+            {
+                // 8 位底色自带 alpha：直接用它，不再乘/覆盖滑块，否则老师写 #10203080 还是看不出半透明。
+                a.BgAlpha = bgAlpha;
             }
             else
             {
@@ -284,6 +375,7 @@ namespace ClassSlideSync.Plugin.Core
             if (a.BgAlpha < 20) a.BgAlpha = 20;
             if (a.BgAlpha > 255) a.BgAlpha = 255;
 
+            // ---- 强调色 ----
             if (ClassIslandTheme.TryParseColor(s.AccentColor, out r, out g, out b, out alpha))
             {
                 a.AccentR = r; a.AccentG = g; a.AccentB = b;
@@ -294,6 +386,7 @@ namespace ClassSlideSync.Plugin.Core
                 a.AccentR = theme.AccentR; a.AccentG = theme.AccentG; a.AccentB = theme.AccentB;
             }
 
+            // ---- 文字色：按底色亮度决定深字还是浅字，避免老师选了浅色底就看不见字 ----
             double lum = (0.2126 * a.BgR + 0.7152 * a.BgG + 0.0722 * a.BgB) / 255.0;
             if (lum > 0.55) { a.TextR = 0x1B; a.TextG = 0x1C; a.TextB = 0x1E; }
             else { a.TextR = 0xF2; a.TextG = 0xF3; a.TextB = 0xF5; }
@@ -301,7 +394,12 @@ namespace ClassSlideSync.Plugin.Core
             a.MutedG = Mix(a.TextG, a.BgG, 0.40);
             a.MutedB = Mix(a.TextB, a.BgB, 0.40);
 
-            a.Radius = s.CardCornerRadius >= 0 ? s.CardCornerRadius : (follow ? theme.Radius : 8);
+            // ---- 圆角 / 缩放 / 字体 ----
+            // 2026-10-24 视觉规格定的是 10（原先 8）。跟着 ClassIsland 主题走时以 10 为下限：
+            // 主题默认 8 太方，但老师要是把主题圆角调大到 12/16，卡片照样跟着变圆。
+            a.Radius = s.CardCornerRadius >= 0
+                ? s.CardCornerRadius
+                : (follow ? Math.Max(theme.Radius, 10) : 10);
             if (a.Radius < 0) a.Radius = 0;
             if (a.Radius > 48) a.Radius = 48;
 
@@ -329,9 +427,14 @@ namespace ClassSlideSync.Plugin.Core
                 a.FontFile = theme.FontFile;
             }
 
+            // ---- 位置与尺寸 ----
             a.OnRight = !s.CardOnLeft;
             a.VerticalPercent = s.CardVerticalPercent < 0 ? 0 : (s.CardVerticalPercent > 100 ? 100 : s.CardVerticalPercent);
             a.TabWidth = s.CollapsedTabWidth < 16 ? 16 : (s.CollapsedTabWidth > 96 ? 96 : s.CollapsedTabWidth);
+            // 药丸长度（沿屏幕边缘方向）也跟设置走，夹到和 SyncSettings 一致的 96..480。
+            a.TabLength = s.CollapsedTabLength < 96 ? 96 : (s.CollapsedTabLength > 480 ? 480 : s.CollapsedTabLength);
+            int pillPct = s.CollapsedTabOpacityPercent < 30 ? 30 : (s.CollapsedTabOpacityPercent > 100 ? 100 : s.CollapsedTabOpacityPercent);
+            a.PillAlpha = pillPct * 255 / 100;
 
             a.ShowFileName = s.CardShowFileName;
             a.ShowSlideCount = s.CardShowSlideCount;
@@ -345,16 +448,20 @@ namespace ClassSlideSync.Plugin.Core
             return a;
         }
 
+        /// <summary>
+        /// 96 dpi 下的卡片高度。行高按 ClassIsland 的字号体系（次要 14 / 正文 16 / 大号 20）估算，
+        /// 关掉某一行就少一行高度，卡片不会留一片空白。
+        /// </summary>
         static int EstimatedHeight(CardAppearance a)
         {
-            int h = 10;
+            int h = 10;                       // 上内边距
             if (a.ShowFileName) h += 22;
-            h += 50;
-            h += 22;
+            h += 50;                          // 大页码
+            h += 22;                          // 正在放映 / 上次停在这一页
             if (a.ShowJumpLine) h += 26;
             if (a.ShowContext) h += 18;
             if (a.ShowStatusLine) h += 18;
-            h += 10;
+            h += 10;                          // 下内边距
             return h;
         }
 
