@@ -12,11 +12,7 @@
       x:Name="PageRoot"
       x:DataType="local:SlideSyncSettingsPage">
 
-    <!--
-      布局照抄本体自己的设置页：settings-container 负责宽度与间距（960 / 4），
-      SettingsExpander 负责卡片外观，图标用 Fluent 字形，颜色一律 DynamicResource，
-      于是老师换主题色或明暗主题时，这一页跟着变，不会变成界面上的异物。
-    -->
+    
     <ScrollViewer>
         <StackPanel Classes="settings-container animated-intro">
 
@@ -300,9 +296,7 @@
             <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xEFBF;}"
                                        Header="显示内容"
                                        Description="卡片上出现哪几行。">
-                <!-- FluentAvalonia 2.4.1 的 SettingsExpanderItem 上没有 IsOn 属性，
-                     开关必须自己放进 Footer（本体 CountDownComponentSettingsControl 就是这么写的），
-                     用 Classes="switcher" 会去套一个依赖该属性的模板，所以不能那么写。 -->
+                
                 <controls:SettingsExpanderItem Content="课件文件名">
                     <controls:SettingsExpanderItem.Footer>
                         <ToggleSwitch VerticalAlignment="Center" IsChecked="{Binding Settings.CardShowFileName, Mode=TwoWay}"/>

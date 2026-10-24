@@ -10,50 +10,28 @@ using System.Threading;
 
 namespace ClassSlideSync.Plugin.Core
 {
-    /// <summary>
-    /// One reading of 希沃白板5's MCP service. Values are deliberately "best effort":
-    /// a failed call leaves Showing=false and puts the reason in Diag, but never throws.
-    /// </summary>
     public sealed class SeewoState
     {
-        public bool Found;              // the MCP server answered at least one request
-        public bool Showing;            // shellContext.workingMode says Display
+        public bool Found;
+        public bool Showing;
         public string Title = "";       // courseware name
-        public int Current;             // 1-based page, 0 when unknown
-        public int SlideCount;          // 0 when unknown
+        public int Current;
+        public int SlideCount;
         public string WorkingMode = ""; // raw workingMode ("Display" / "Edit" / ...)
         public string ShellId = "";     // en_find_shells[].id, needed by the other tools
         public string Endpoint = "";    // http://127.0.0.1:7916/mcp
         public string Diag = "";        // one line, already prefixed with "seewo:"
-        public bool Running;            // EasiNote process is alive
+        public bool Running;
     }
 
-    /// <summary>
-    /// Reads 希沃白板5 (EasiNote) through its in-process MCP server.
-    ///
-    /// This is a pure external client: it never loads an EasiNote plugin, never starts
-    /// EasiNote, and never writes to its install folder. The server is discovered from
-    /// %APPDATA%\Seewo\SeewoAIVoiceAssistant\McpServers\EasiNote.mcp.json first, then by
-    /// probing a small candidate port list. Nothing is hard-coded as "the" port: a failed
-    /// endpoint is forgotten and the whole discovery is repeated later.
-    ///
-    /// The protocol is MCP's "streamable HTTP" JSON-RPC transport:
-    ///   initialize -> notifications/initialized -> tools/list -> tools/call
-    /// with Accept: application/json, text/event-stream and Mcp-Session-Id on later calls.
-    /// Responses may be plain JSON or SSE; both are accepted.
-    ///
-    /// All network calls are capped at 1.5 s. Every public method swallows its exceptions
-    /// and reports through the return value / Diag instead, because the engine thread must
-    /// never die because a whiteboard was updating itself.
-    /// </summary>
     public sealed class SeewoBridge : IDisposable
     {
         public const string KeyPrefix = "希沃:";
 
         const string ProtocolVersion = "2024-11-05";
         const int RequestTimeoutMs = 1500;
-        const int ProbeTtlMs = 30000;      // a failed discovery is not repeated for 30 s
-        const int RetryProbeMs = 1000;     // a working endpoint that failed is re-probed soon
+        const int ProbeTtlMs = 30000;
+        const int RetryProbeMs = 1000;
         const int MaxBodyBytes = 512 * 1024;
 
         static readonly int[] CandidatePorts = { 7916, 7917, 13247, 19463, 27733 };
@@ -83,23 +61,13 @@ namespace ClassSlideSync.Plugin.Core
 
         public bool Diag { get; set; }
 
-        // 状态缓存：GetState() 被引擎的高频循环调用，见方法头的节流说明。
         SeewoState cachedState;
         DateTime cachedAt = DateTime.MinValue;
 
-        // 上一次成功的页数：MCP 短暂丢壳时用来兜住卡片，别让"希沃闪了一下"变成"课件关了"。
         int lastSlideCount;
 
-        /// <summary>
-        /// Ask EasiNote for its current state. Never throws; on any failure the returned
-        /// object simply has Showing=false and a human-readable Diag.
-        /// </summary>
         public SeewoState GetState()
         {
-            // 节流：一次取状态要发 3 个 HTTP 请求（en_find_shells / courseware_info /
-            // slide_info），而引擎每 250 毫秒走一步、有 7 个地方会来问希沃。不拦一下就是
-            // 每秒 12 个请求打在本机 MCP 上，白烧 CPU 还把日志刷满。500 毫秒的缓存对翻页
-            // 来说是看不出来的延迟，只有"课件刚打开"那一瞬间可能慢半拍。
             var now = DateTime.UtcNow;
             if (cachedState != null && (now - cachedAt).TotalMilliseconds < 500) return cachedState;
             var st = GetStateUncached();
@@ -108,7 +76,6 @@ namespace ClassSlideSync.Plugin.Core
             return st;
         }
 
-        /// <summary>一次真正的取数：可能发 3 个 HTTP 请求，任何失败都折成 Diag。</summary>
         SeewoState GetStateUncached()
         {
             var st = new SeewoState();
@@ -127,9 +94,6 @@ namespace ClassSlideSync.Plugin.Core
                 st.Endpoint = baseUrl;
                 Interlocked.Exchange(ref lastMcpSeenTicks, DateTime.UtcNow.Ticks);
 
-                // 1) en_find_shells gives us the shell id and the authoritative workingMode.
-                //    searchingMode=All so edit-mode courseware is visible too; a Display shell
-                //    wins over an edit shell when the teacher has several tabs open.
                 var shells = CallTool("en_find_shells", new Dictionary<string, object> { ["searchingMode"] = "All" });
                 if (shells.Ok)
                 {
@@ -137,14 +101,11 @@ namespace ClassSlideSync.Plugin.Core
                 }
                 else
                 {
-                    HandleCallFailure(shells);   // not fatal by itself; the info call may still work
+                    HandleCallFailure(shells);
                 }
                 if (st.ShellId.Length > 0) lastShellId = st.ShellId;
-                else if (lastShellId.Length > 0) st.ShellId = lastShellId;   // 壳重建时别把自己认识的壳丢了
+                else if (lastShellId.Length > 0) st.ShellId = lastShellId;
 
-                // 2) Title / slide count / shellContext.workingMode. shellId is required in the
-                //    measured build; when discovery somehow missed it, try without and let the
-                //    server decide (never assume the call succeeded).
                 var infoArgs = new Dictionary<string, object>();
                 if (st.ShellId.Length > 0) infoArgs["shellId"] = st.ShellId;
                 var info = CallTool("get_current_courseware_info", infoArgs);
@@ -157,9 +118,6 @@ namespace ClassSlideSync.Plugin.Core
                     HandleCallFailure(info);
                     if (st.Title.Length == 0)
                     {
-                        // MCP 偶尔会短暂丢掉 shell（实测：退出授课的一瞬间 en_find_shells 返回空、
-                        // get_current_courseware_info 报"没有绑定 shellId"）。这时候不能当成
-                        // "课件关了"，否则卡片被清空、这堂课也没法收尾 —— 沿用上一次的课件名与页数。
                         if (lastSeewoTitle.Length > 0 && !shells.Ok)
                         {
                             st.Title = lastSeewoTitle;
@@ -176,8 +134,6 @@ namespace ClassSlideSync.Plugin.Core
                 }
                 if (st.ShellId.Length > 0) lastShellId = st.ShellId;
 
-                // 3) Current page. get_slide_info returns Markdown; the measured line is
-                //    "- 序号(1-base): 4" plus "- 工作模式: Edit|Display".
                 var slideArgs = new Dictionary<string, object>();
                 if (st.ShellId.Length > 0) slideArgs["shellId"] = st.ShellId;
                 var slide = CallTool("get_slide_info", slideArgs);
@@ -187,8 +143,6 @@ namespace ClassSlideSync.Plugin.Core
                 }
                 else
                 {
-                    // A missing get_slide_info is not fatal: title/count from the first call
-                    // still let the card show a useful state.
                     HandleCallFailure(slide);
                 }
 
@@ -207,7 +161,6 @@ namespace ClassSlideSync.Plugin.Core
                 if (st.SlideCount > 0) lastSlideCount = st.SlideCount;
                 if (st.Showing)
                 {
-                    // 实测要求的格式：seewo: <课件名> page 4/10 (Display)
                     st.Diag = "seewo: " + st.Title + " page " + (st.Current > 0 ? st.Current.ToString() : "?")
                         + "/" + (st.SlideCount > 0 ? st.SlideCount.ToString() : "?")
                         + " (" + Mode(st) + ")";
@@ -230,10 +183,6 @@ namespace ClassSlideSync.Plugin.Core
             return st;
         }
 
-        /// <summary>
-        /// Try to jump the current EasiNote show. Returns "" on success, or a short Chinese
-        /// message suitable for the card's status line. Never throws.
-        /// </summary>
         public string GotoSlide(int index)
         {
             if (index <= 0) return "页码无效";
@@ -244,9 +193,6 @@ namespace ClassSlideSync.Plugin.Core
                 if (!EnsureSessionForCall()) return "希沃白板没有响应";
                 if (tools.Count == 0) LoadTools();
 
-                // 台账里只有「希沃:课件名」，没有 shellId；跳页前先读一次当前壳。
-                // 这里必须绕过 500ms 缓存：缓存里很可能正是“上一次没找到壳”的结论，
-                // 老师刚在希沃里点开课件，缓存就会让跳页继续报“没有绑定 shellId”。
                 if (lastShellId.Length == 0)
                 {
                     var cur = GetStateUncached();
@@ -254,14 +200,10 @@ namespace ClassSlideSync.Plugin.Core
                 }
                 if (lastShellId.Length == 0)
                 {
-                    // 希沃的跳页接口只能作用在“已经打开的课件”上（shellId 来自 en_find_shells），
-                    // 没有能力替用户启动一份云课件。与其把 MCP 的英文报错甩给老师，不如说清楚。
                     ledger.Log("seewo: goto ignored -- no shell open");
                     return "希沃里还没打开这份课件：先在希沃白板里打开它，再点跳转";
                 }
 
-                // 用户 2026-10-18：在希沃的编辑视图（还没进全屏授课）里点卡片跳转，
-                // 结果只切了页、人还留在编辑界面。先让希沃进授课视图，再跳页。
                 var before = GetState();
                 if (before.Found && before.Title.Length > 0 && !before.Showing
                     && tools.Exists(t => t.Name == "en_goto_app_ui"))
@@ -270,7 +212,7 @@ namespace ClassSlideSync.Plugin.Core
                     if (ui.Ok)
                     {
                         System.Threading.Thread.Sleep(400);
-                        cachedAt = DateTime.MinValue;   // 让下一次 GetState 读到真正的授课态
+                        cachedAt = DateTime.MinValue;
                         ledger.Log("seewo: enter display before jump");
                     }
                 }
@@ -294,8 +236,6 @@ namespace ClassSlideSync.Plugin.Core
                 return "希沃跳页出错：" + Short(ex.Message);
             }
         }
-
-        // ------------------------------------------------------------------ discovery
 
         bool EnsureEndpoint()
         {
@@ -358,10 +298,6 @@ namespace ClassSlideSync.Plugin.Core
             LogError("seewo: " + Short(why));
         }
 
-        /// <summary>
-        /// EasiNote's pid/url file. It is only a hint: the service may be starting or may
-        /// have crashed, so every URL from here is still handshaken before it is trusted.
-        /// </summary>
         static List<McpConfig> ReadConfigEndpoints()
         {
             var list = new List<McpConfig>();
@@ -388,8 +324,6 @@ namespace ClassSlideSync.Plugin.Core
             }
             catch
             {
-                // A half-written config while EasiNote starts up must be ignored, not logged
-                // every two seconds. The candidate ports still get probed.
             }
             return list;
         }
@@ -479,21 +413,11 @@ namespace ClassSlideSync.Plugin.Core
             catch { return url; }
         }
 
-        // ------------------------------------------------------------------ process check
-
         static readonly object RunGate = new object();
         static DateTime runCheckedAt = DateTime.MinValue;
         static bool runCached;
-        // Some hosts (and our own sandboxed test process) deny cross-process enumeration,
-        // even though Get-Process in a shell sees EasiNote. A recently successful MCP call
-        // is then the strongest available "it is running" signal; it self-expires, so a
-        // closed whiteboard still flips to false within a few seconds.
         static long lastMcpSeenTicks;
 
-        /// <summary>
-        /// Cheap, non-blocking "is EasiNote running" for the 2-second scheduler. Uses the
-        /// pid/processName from the config file when possible, then a small name list.
-        /// </summary>
         public static bool LooksRunning()
         {
             lock (RunGate)
@@ -573,8 +497,6 @@ namespace ClassSlideSync.Plugin.Core
             return IsSeewoKey(key) ? key.Substring(KeyPrefix.Length) : key;
         }
 
-        // ------------------------------------------------------------------ MCP transport
-
         bool EnsureSessionForCall()
         {
             if (disposedFlag) return false;
@@ -609,9 +531,6 @@ namespace ClassSlideSync.Plugin.Core
                     }
                 };
 
-                // baseUrl 可能刚被另一个线程的 DropEndpoint 清掉（引擎有多个地方并发来问希沃，
-                // 一个超时正在 DropEndpoint，另一个已经走到这里）。拿局部变量再判一次：
-                // 否则 Post("") 会抛 InvalidOperationException，日志里一串 fake 错误很误导。
                 var url = baseUrl;
                 if (url.Length == 0) return false;
                 var r = Post(url, JsonSerializer.Serialize(payload), false);
@@ -637,7 +556,6 @@ namespace ClassSlideSync.Plugin.Core
 
                 initialized = true;
 
-                // Notification: no id, server normally answers 202 with an empty body.
                 var note = new Dictionary<string, object>
                 {
                     ["jsonrpc"] = "2.0",
@@ -769,10 +687,6 @@ namespace ClassSlideSync.Plugin.Core
                 req.Content = new StringContent(payload, Encoding.UTF8, "application/json");
                 req.Headers.TryAddWithoutValidation("Accept", "application/json, text/event-stream");
                 req.Headers.TryAddWithoutValidation("User-Agent", "ClassSlideSync/1.0 SeewoMCP");
-                // 注意：不要在 initialize 上带 MCP-Protocol-Version。实测 EasiNote 5.2.4
-                // 会用它去校验协议版本并直接 400 "Unsupported protocol version"，
-                // 而它协商出来的版本（2025-11-25）又比我们请求的 2024-11-05 新。
-                // 会话建立后服务端也不要求这个头，带 Mcp-Session-Id 就够了。
                 if (withSession && sessionId.Length > 0)
                     req.Headers.TryAddWithoutValidation("Mcp-Session-Id", sessionId);
 
@@ -853,10 +767,6 @@ namespace ClassSlideSync.Plugin.Core
             }
         }
 
-        /// <summary>
-        /// Streamable HTTP servers answer either application/json or text/event-stream.
-        /// For SSE, concatenate each event's data: lines and return the first JSON object.
-        /// </summary>
         static string ExtractJson(string body, string mediaType)
         {
             if (string.IsNullOrEmpty(body)) return "";
@@ -892,7 +802,7 @@ namespace ClassSlideSync.Plugin.Core
                     || ev.StartsWith("[", StringComparison.Ordinal)) return ev;
             }
             if (events.Count > 0) return events[events.Count - 1].Trim();
-            return trimmed;   // server claimed SSE but sent plain JSON
+            return trimmed;
         }
 
         static bool LooksLikeSessionError(string body)
@@ -939,12 +849,8 @@ namespace ClassSlideSync.Plugin.Core
 
         int NextId() { return Interlocked.Increment(ref nextId); }
 
-        // ------------------------------------------------------------------ parsing
-
         static void ParseShells(JsonElement root, SeewoState st)
         {
-            // Measured shape: result.structuredContent.shells = [{id, coursewareName, workingMode}].
-            // Parse that first; the generic walk below is only a fallback for other builds.
             string pickId = "";
             string pickName = "";
             string pickMode = "";
@@ -990,7 +896,6 @@ namespace ClassSlideSync.Plugin.Core
                 }
             }
 
-            // Fallback: any coursewareName anywhere in the payload.
             string first = "";
             WalkFields(root, delegate (string name, JsonElement value)
             {
@@ -1008,7 +913,6 @@ namespace ClassSlideSync.Plugin.Core
 
         static void ParseCourseware(JsonElement root, SeewoState st)
         {
-            // shellContext carries the display flag and a second copy of the title/id.
             JsonElement sc;
             if (TryStructured(root, out sc))
             {
@@ -1066,7 +970,6 @@ namespace ClassSlideSync.Plugin.Core
             Normalize(st);
         }
 
-        /// <summary>result.structuredContent, when the server sent one.</summary>
         static bool TryStructured(JsonElement result, out JsonElement structured)
         {
             structured = default(JsonElement);
@@ -1126,7 +1029,7 @@ namespace ClassSlideSync.Plugin.Core
                 else if (n == "currentslide" || n == "currentpage" || n == "pagenumber" || n == "page")
                     st.Current = v;
                 else if (n == "slideindex")
-                    st.Current = v + 1;   // 0-based; many MCP servers expose this name
+                    st.Current = v + 1;
             }
             else if (value.ValueKind == JsonValueKind.True || value.ValueKind == JsonValueKind.False)
             {
@@ -1177,7 +1080,6 @@ namespace ClassSlideSync.Plugin.Core
 
                 if (st.Current <= 0)
                 {
-                    // 实测 get_slide_info 的关键行：`- 序号(1-base): 4`
                     var m = Regex.Match(line, @"序号\s*\(\s*1\s*-\s*base\s*\)\s*[:：]\s*(\d+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
                     if (!m.Success)
                         m = Regex.Match(line, @"(?:当前页码|当前页|页码|current\s*page|page\s*number|page)\s*[:：]?\s*(\d+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
@@ -1261,10 +1163,6 @@ namespace ClassSlideSync.Plugin.Core
             if (st.SlideCount < 0) st.SlideCount = 0;
             if (st.SlideCount > 0 && st.Current > st.SlideCount) st.Current = st.SlideCount;
 
-            // The known API puts the display flag in shellContext.workingMode ("Display").
-            // If it is absent, an explicit isShowing=true (handled in ApplyField) is the only
-            // evidence we accept; guessing from "a page number exists" would record edit-mode
-            // browsing as a lesson.
             if (ModeIsDisplay(st.WorkingMode)) st.Showing = true;
             if (string.IsNullOrEmpty(st.WorkingMode)) st.WorkingMode = st.Showing ? "Display" : "";
         }
@@ -1311,12 +1209,8 @@ namespace ClassSlideSync.Plugin.Core
             return s.Length > 300 ? s.Substring(0, 300) : s;
         }
 
-        // ------------------------------------------------------------------ jump tool lookup
-
         ToolDef FindJumpTool()
         {
-            // The measured build exposes goto_slide(shellId, slideNumber). Prefer it over
-            // goto_next_slide / goto_prev_slide, which have no page argument.
             for (int i = 0; i < tools.Count; i++)
             {
                 if (tools[i].Name.Equals("goto_slide", StringComparison.OrdinalIgnoreCase)) return tools[i];
@@ -1358,10 +1252,9 @@ namespace ClassSlideSync.Plugin.Core
                                 JsonElement ignored;
                                 if (props.TryGetProperty(candidates[i], out ignored)) { pageName = candidates[i]; break; }
                             }
-                            if (pageName.Length == 0) return null;   // schema exists but no page-like argument
+                            if (pageName.Length == 0) return null;
 
                             var args = new Dictionary<string, object> { [pageName] = index };
-                            // goto_slide in the measured build needs shellId as well.
                             JsonElement ignoredShell;
                             if (shellId.Length > 0 && props.TryGetProperty("shellId", out ignoredShell))
                                 args["shellId"] = shellId;
@@ -1376,8 +1269,6 @@ namespace ClassSlideSync.Plugin.Core
             if (shellId.Length > 0) fallback["shellId"] = shellId;
             return fallback;
         }
-
-        // ------------------------------------------------------------------ logging
 
         void Log(string msg)
         {
@@ -1399,13 +1290,11 @@ namespace ClassSlideSync.Plugin.Core
             Log(msg);
         }
 
-        // ------------------------------------------------------------------ plumbing
-
         static HttpClient CreateHttp()
         {
             var handler = new SocketsHttpHandler
             {
-                UseProxy = false,                       // loopback must never go through a proxy
+                UseProxy = false,
                 AllowAutoRedirect = false,
                 ConnectTimeout = TimeSpan.FromMilliseconds(500),
                 PooledConnectionLifetime = TimeSpan.FromMinutes(5),
