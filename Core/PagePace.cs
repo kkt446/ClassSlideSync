@@ -28,16 +28,67 @@ namespace ClassSlideSync.Plugin.Core
         public const int MaxRecordsPerDeck = 200;
 
         /// <summary>
-        /// 每页平均秒数：优先这份课件自己的记录，它没数据就退回全台账，再没有就用 60 秒，
-        /// 最后夹进 [8, 600] 秒。<paramref name="deck"/> 允许为 null 或空。
+        /// 「本次课实测速度」的最少样本（2026-10-25 功能2）：至少翻过 3 页、至少上了 60 秒，
+        /// 否则这一场还没资格代表老师在这份课件上的速度。
+        ///
+        /// 为什么是这两个数：刚开场 20 秒里翻两页，很可能是在找上次讲到哪儿，
+        /// 也可能是从第 3 页直接跳到第 30 页（一次翻 27 页），算出来的"每页 1 秒"
+        /// 会把「还剩 N 页 · 约 M 分钟」直接压成 1 分钟。宁可用历史均值，也不要这种噪音。
+        /// </summary>
+        public const int MinSessionPages = 3;
+        public const int MinSessionSeconds = 60;
+
+        /// <summary>
+        /// 每页平均秒数（老重载，只有历史记录）：优先这份课件自己的记录，它没数据就退回
+        /// 全台账，再没有就用 60 秒，最后夹进 [8, 600] 秒。<paramref name="deck"/> 允许为 null 或空。
         /// </summary>
         public static double SecondsPerPage(IList<SessionRecord> deck, IList<SessionRecord> all)
         {
-            double v = Average(deck);
+            return SecondsPerPage(deck, all, 0, 0);
+        }
+
+        /// <summary>
+        /// 每页平均秒数（2026-10-25 功能2 的回落链）：
+        ///   本次课实测速度（翻页数 ≥3 且已用时长 ≥60 秒）
+        ///   → 这份课件的台账均值
+        ///   → 全台账均值
+        ///   → 60 秒/页
+        /// 最后统一夹进 [8, 600] 秒。会话样本为 0/0 时行为和上一版完全一样。
+        /// </summary>
+        public static double SecondsPerPage(IList<SessionRecord> deck, IList<SessionRecord> all,
+                                           int sessionPages, double sessionSeconds)
+        {
+            double v = SessionSecondsPerPage(sessionPages, sessionSeconds);
+            if (v <= 0) v = Average(deck);
             if (v <= 0) v = Average(all);
             if (v <= 0) v = DefaultSecondsPerPage;
-            if (v < MinSecondsPerPage) v = MinSecondsPerPage;
-            if (v > MaxSecondsPerPage) v = MaxSecondsPerPage;
+            return ClampSecondsPerPage(v);
+        }
+
+        /// <summary>
+        /// 本次课已翻页数 ÷ 已用时长。样本不够（不足 3 页或不足 60 秒，或者时长不是
+        /// 有效正数）返回 -1，调用方据此回退历史均值 —— 用 -1 而不是 0 当哨兵值，
+        /// 是因为 0 秒/页在数学上像是个"有效答案"，容易被误用。
+        /// </summary>
+        public static double SessionSecondsPerPage(int pages, double seconds)
+        {
+            if (pages < MinSessionPages) return -1;
+            if (double.IsNaN(seconds) || double.IsInfinity(seconds)) return -1;
+            if (seconds < MinSessionSeconds) return -1;
+            double v = seconds / pages;
+            if (v <= 0) return -1;
+            return ClampSecondsPerPage(v);
+        }
+
+        /// <summary>
+        /// 把每页耗时夹进合理区间。非正数（含 NaN）返回 0 表示"没有可用值" —— 由调用方
+        /// 决定退回什么兜底值；已经合理的值原样返回。
+        /// </summary>
+        public static double ClampSecondsPerPage(double v)
+        {
+            if (double.IsNaN(v) || v <= 0) return 0;
+            if (v < MinSecondsPerPage) return MinSecondsPerPage;
+            if (v > MaxSecondsPerPage) return MaxSecondsPerPage;
             return v;
         }
 

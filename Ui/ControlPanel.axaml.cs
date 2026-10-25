@@ -1257,6 +1257,15 @@ namespace ClassSlideSync.Plugin.Ui
                     all.Add(name);
                 }
             }
+            // 2026-10-25 用户第 9 条：配色表里已经填过的科目也要进下拉，否则那一行显示成空行。
+            foreach (var color in settings.SubjectColors)
+            {
+                var name = color?.Subject;
+                if (!string.IsNullOrWhiteSpace(name) && !all.Contains(name))
+                {
+                    all.Add(name);
+                }
+            }
 
             bool useDropdown = loaded && fromProfile.Count > 0;
 
@@ -1286,6 +1295,13 @@ namespace ClassSlideSync.Plugin.Ui
                 if (folder == null) continue;
                 folder.Options = SubjectOptions;
                 folder.UseDropdown = useDropdown;
+            }
+            // 2026-10-25 用户第 9 条：科目配色表那一列同样挂共享的下拉选项。
+            foreach (var color in settings.SubjectColors)
+            {
+                if (color == null) continue;
+                color.Options = SubjectOptions;
+                color.UseDropdown = useDropdown;
             }
         }
 
@@ -1339,6 +1355,43 @@ namespace ClassSlideSync.Plugin.Ui
                 {
                     settings.SubjectFolders.Remove(folder);
                 }
+            }
+            catch { }
+        }
+
+        /// <summary>科目配色表：加一行（用户 2026-10-25 第 9 条）。</summary>
+        void OnAddSubjectColor(object? sender, RoutedEventArgs e)
+        {
+            try
+            {
+                settings.SubjectColors.Add(new SubjectColor());
+                // 顺手把课表里的科目再对一遍：新行的下拉不能是空的（理由同 OnAddSubjectFolder）。
+                RefreshSubjectsSafe();
+            }
+            catch { }
+        }
+
+        /// <summary>科目配色表：删掉这一行（按钮的 Tag 里带着那一行）。删掉的科目就用主题强调色。</summary>
+        void OnRemoveSubjectColor(object? sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (sender is Button b && b.Tag is SubjectColor color)
+                {
+                    settings.SubjectColors.Remove(color);
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>科目配色表：一键恢复内置预设色（清空后由 SyncSettings 重灌默认表）。</summary>
+        void OnResetSubjectColors(object? sender, RoutedEventArgs e)
+        {
+            try
+            {
+                settings.SubjectColors.Clear();
+                settings.SeedDefaultSubjectColors();
+                RefreshSubjectsSafe();
             }
             catch { }
         }

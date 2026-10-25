@@ -49,10 +49,13 @@ namespace ClassSlideSync.Plugin.Core
         int cardVerticalPercent = 50;
         int collapsedTabWidth = 32;
         // 2026-10-24：药丸默认拉长（原来固定 96×缩放），长度可调。
-        int collapsedTabLength = 200;
+        int collapsedTabLength = 140;
     // 2026-10-24：药丸里要放「已翻 N / 共 M」两行字，50% 透明时字几乎看不见，
     // 默认提到 80%；老师想要原来的观感可以自己调回 50。
     int collapsedTabOpacityPercent = 80;
+    // 2026-10-25 用户第 3 条：药丸里那两行「已翻 N / 共 M」竖排数字默认画；
+    // 关掉后药丸只剩箭头 + 进度条（药丸只有几十像素宽，老师嫌挤就会关）。
+    bool showPillPageNumbers = true;
         bool cardShowFileName = true;
         bool cardShowSlideCount = true;
         bool cardShowContext = true;
@@ -72,11 +75,17 @@ namespace ClassSlideSync.Plugin.Core
         bool autoOpenSubjectFolder = true;
         ObservableCollection<SubjectFolder> subjectFolders = new ObservableCollection<SubjectFolder>();
 
+        // ---- 每科的药丸进度条颜色（2026-10-25 用户第 9 条）----
+        ObservableCollection<SubjectColor> subjectColors = new ObservableCollection<SubjectColor>();
+
         public SyncSettings()
         {
             // 集合内部的增删、以及每一行自己改路径，都要让宿主知道"设置有变化"，
             // 否则 ConfigureFileHelper 不会保存：PropertyChanged 默认只在设置属性被赋值时触发。
             subjectFolders.CollectionChanged += OnFoldersChanged;
+            subjectColors.CollectionChanged += OnSubjectColorsChanged;
+            // 新装（或旧配置里没有这个字段）时先把预设色表灌进去，设置页里直接就能改颜色。
+            SeedDefaultSubjectColors();
         }
 
         /// <summary>Show the floating card as soon as a show is detected.</summary>
@@ -323,6 +332,17 @@ namespace ClassSlideSync.Plugin.Core
             set { Set(ref collapsedTabLength, Clamp(value, 96, 480)); }
         }
 
+        /// <summary>
+        /// 药丸里画不画「已翻 N / 共 M」两行竖排数字（默认画）。关掉后药丸只剩箭头 + 进度条，
+        /// 药丸宽度不变（免得一开关就重新排一次版），省出来的空间全给进度条。
+        /// 2026-10-25 用户第 3 条。
+        /// </summary>
+        public bool ShowPillPageNumbers
+        {
+            get { return showPillPageNumbers; }
+            set { Set(ref showPillPageNumbers, value); }
+        }
+
         /// <summary>控制面板的底色，默认不透明白（#AARRGGBB）。</summary>
         public string PanelBackgroundColor
         {
@@ -444,6 +464,27 @@ namespace ClassSlideSync.Plugin.Core
         }
 
         /// <summary>
+        /// 科目 → 药丸进度条颜色（2026-10-25 用户第 9 条："每科改颜色，设置可以调每科对应的颜色"）。
+        /// 集合为空时用内置的 <see cref="DefaultColorSubjects"/>/<see cref="DefaultColorHexes"/> 兜底，
+        /// 表里没有的科目回退成主题强调色（见 CardAppearance 里的配色查询）。
+        /// </summary>
+        public ObservableCollection<SubjectColor> SubjectColors
+        {
+            get { return subjectColors; }
+            set
+            {
+                if (value == null || ReferenceEquals(value, subjectColors)) return;
+                // 换集合时逐行解订阅，理由同 SubjectFolders：被换掉的行不能继续往新对象上抛事件。
+                subjectColors.CollectionChanged -= OnSubjectColorsChanged;
+                foreach (SubjectColor old in subjectColors) HookColor(old, false);
+                subjectColors = value;
+                subjectColors.CollectionChanged += OnSubjectColorsChanged;
+                foreach (SubjectColor c in subjectColors) HookColor(c, true);
+                Raise(nameof(SubjectColors));
+            }
+        }
+
+        /// <summary>
         /// 按科目名找课件文件夹；找不到返回空串。ClassIsland 的科目名可以是复合的
         /// （课表里写"劳动/英语"、简称"劳/英"），所以查询和配置条目**两侧都拆段**求交集。
         /// 2026-10-24 第二轮 F2：以前只拆查询侧，存"劳动/英语"时用"劳动"或"英语"查不到；
@@ -508,6 +549,110 @@ namespace ClassSlideSync.Plugin.Core
             return false;
         }
 
+        // ---- 药丸进度条配色（2026-10-25 用户第 9 条）------------------------------
+
+        /// <summary>
+        /// 两个科目名是否指同一科：先去空白精确比，再按课表分隔符两侧拆段求交集。
+        /// 给 <see cref="DefaultColorSubjects"/> 的兜底查询和 Appearance 侧的色表查询共用。
+        /// </summary>
+        internal static bool SubjectNamesOverlap(string a, string b)
+        {
+            if (string.IsNullOrWhiteSpace(a) || string.IsNullOrWhiteSpace(b)) return false;
+            if (string.Equals(a.Trim(), b.Trim(), StringComparison.OrdinalIgnoreCase)) return true;
+            return SegmentOverlap(SplitSubject(a), SplitSubject(b));
+        }
+
+        /// <summary>预设色表的科目名，顺序就是设置页里新装的显示顺序。</summary>
+        internal static readonly string[] DefaultColorSubjects = new string[]
+        {
+            "语文", "数学", "英语", "物理", "化学", "生物", "政治", "历史",
+            "地理", "科学", "信息", "音乐", "美术", "体育"
+        };
+
+        /// <summary>
+        /// 和 <see cref="DefaultColorSubjects"/> 一一对应的一组协调预设色：同一明度/饱和度区间
+        /// （Open Color 7 级），白底药丸上都能看清，彼此又不撞色。
+        /// </summary>
+        internal static readonly string[] DefaultColorHexes = new string[]
+        {
+            "#E03131", "#1971C2", "#7048E8", "#0CA678", "#F08C00", "#2F9E44", "#C2255C", "#8B5E34",
+            "#0B7285", "#5C7CFA", "#3B5BDB", "#AE3EC9", "#A61E4D", "#66A80F"
+        };
+
+        /// <summary>
+        /// 按科目名找药丸进度条的颜色（"#RRGGBB"）；找不到返回空串，调用方回退主题强调色。
+        /// 匹配规则和 <see cref="FindSubjectFolder"/> 一致：先精确命中，再两侧拆段求交集
+        /// （课表里"劳动/英语"这种复合科目名，配"劳动"或"英语"都能命中）。
+        /// 条目非空时**不再**回落到内置表：用户把某科从表里删掉，就是想让那科用强调色。
+        /// </summary>
+        public string FindSubjectColor(string subjectName)
+        {
+            if (string.IsNullOrWhiteSpace(subjectName)) return "";
+            string want = subjectName.Trim();
+
+            if (subjectColors != null && subjectColors.Count > 0)
+            {
+                string[] wantParts = SplitSubject(want);
+                string exact = "", loose = "";
+                foreach (SubjectColor c in subjectColors)
+                {
+                    if (c == null) continue;
+                    string name = c.Subject == null ? "" : c.Subject.Trim();
+                    string color = c.Color == null ? "" : c.Color.Trim();
+                    if (name.Length == 0 || color.Length == 0) continue;
+                    if (string.Equals(name, want, StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (exact.Length == 0) exact = color;
+                        continue;
+                    }
+                    if (loose.Length == 0 && SegmentOverlap(wantParts, SplitSubject(name))) loose = color;
+                }
+                if (exact.Length > 0) return exact;
+                return loose;
+            }
+
+            // 集合为空（用户全删了，或旧配置里根本没这个字段）：用内置预设色表兜底。
+            for (int i = 0; i < DefaultColorSubjects.Length; i++)
+                if (string.Equals(DefaultColorSubjects[i], want, StringComparison.OrdinalIgnoreCase))
+                    return DefaultColorHexes[i];
+            string[] parts = SplitSubject(want);
+            for (int i = 0; i < DefaultColorSubjects.Length; i++)
+                if (SegmentOverlap(parts, SplitSubject(DefaultColorSubjects[i])))
+                    return DefaultColorHexes[i];
+            return "";
+        }
+
+        /// <summary>
+        /// 把预设色表灌进集合，好让设置页一打开就有 14 行可改的颜色。
+        /// 只在集合为空时灌一次：用户自己把行删光是合法操作，查询侧还有内置表兜底。
+        /// </summary>
+        internal void SeedDefaultSubjectColors()
+        {
+            if (subjectColors == null || subjectColors.Count > 0) return;
+            for (int i = 0; i < DefaultColorSubjects.Length && i < DefaultColorHexes.Length; i++)
+                subjectColors.Add(new SubjectColor { Subject = DefaultColorSubjects[i], Color = DefaultColorHexes[i] });
+        }
+
+        void OnSubjectColorsChanged(object sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
+        {
+            if (e.NewItems != null) foreach (SubjectColor c in e.NewItems) HookColor(c, true);
+            if (e.OldItems != null) foreach (SubjectColor c in e.OldItems) HookColor(c, false);
+            Raise(nameof(SubjectColors));
+        }
+
+        void HookColor(SubjectColor c, bool on)
+        {
+            if (c == null) return;
+            if (on) c.PropertyChanged += OnColorChanged;
+            else c.PropertyChanged -= OnColorChanged;
+        }
+
+        void OnColorChanged(object sender, PropertyChangedEventArgs e)
+        {
+            // 某一行改了科目名或颜色：也算"设置变了"，宿主会重算外观（卡片当场换色）并落盘。
+            Raise(nameof(SubjectColors));
+        }
+
         void OnFoldersChanged(object sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
         {
             if (e.NewItems != null) foreach (SubjectFolder f in e.NewItems) Hook(f, true);
@@ -534,7 +679,7 @@ namespace ClassSlideSync.Plugin.Core
         /// #10203080 期望半透明，实际 alpha 被静默丢掉（TryParseColor 本身是认 8 位的）。
         /// 3 位按 CSS 简写规则展开（#FFF → #FFFFFF），不影响 6/8 位的原有行为。
         /// </summary>
-        static string Normalize(string value)
+        internal static string Normalize(string value)
         {
             if (string.IsNullOrWhiteSpace(value)) return "";
             string s = value.Trim();
@@ -643,6 +788,86 @@ namespace ClassSlideSync.Plugin.Core
                 h(this, new PropertyChangedEventArgs(nameof(UseTextBox)));
             }
         }
+
+        /// <summary>给 XAML 的 <c>IsVisible</c> 用，取反而已。</summary>
+        [JsonIgnore]
+        public bool UseTextBox { get { return !useDropdown; } }
+
+        public event PropertyChangedEventHandler PropertyChanged;
+
+        void Set(ref string field, string value, [CallerMemberName] string name = null)
+        {
+            if (string.Equals(field, value, StringComparison.Ordinal)) return;
+            field = value;
+            var h = PropertyChanged;
+            if (h != null) h(this, new PropertyChangedEventArgs(name));
+        }
+    }
+
+    /// <summary>
+    /// 一条「科目 → 药丸进度条颜色」映射（2026-10-25 用户第 9 条：每科颜色自己调）。
+    /// 匹配规则见 <see cref="SyncSettings.FindSubjectColor"/>。
+    /// </summary>
+    public sealed class SubjectColor : INotifyPropertyChanged
+    {
+        string subject = "";
+        string color = "#1971C2";
+
+        /// <summary>课表里的科目名，和 ClassIsland 科目列表里显示的一致（例：语文）。</summary>
+        public string Subject
+        {
+            get { return subject; }
+            set { Set(ref subject, value == null ? "" : value.Trim()); }
+        }
+
+        /// <summary>
+        /// 这个科目在药丸里那道竖进度条用的颜色，只存 #RRGGBB（药丸本身才透，颜色永不透）。
+        /// 非法串直接丢掉保留原值：ColorPicker 拖到一半偶尔回传空串，写进去等于把配置清空。
+        /// </summary>
+        public string Color
+        {
+            get { return color; }
+            set
+            {
+                string v = SyncSettings.Normalize(value);
+                if (v.Length == 0) return;
+                // 8 位的 alpha 一律丢掉（这条条永远不透明），但两个来源的字节序不同：
+                // ClassIsland 的配置串是 #RRGGBBAA（alpha 在尾），设置页 ColorPicker 的回传是
+                // #AARRGGBB（alpha 在首）。两头都认——带 FF 的那一端就是 alpha。
+                if (v.Length == 9)
+                {
+                    string hex = v.Substring(1);
+                    v = hex.EndsWith("FF", StringComparison.OrdinalIgnoreCase)
+                        ? "#" + hex.Substring(0, 6)
+                        : "#" + hex.Substring(2);
+                }
+                Set(ref color, v);
+            }
+        }
+
+        // ---- 下面两个是给设置页的行模板用的，只活在内存里，不参与 JSON 往返 ----
+        // （和 SubjectFolder 的理由一样：插件动态加载，模板里不能用 $parent[] 往上找页面。）
+
+        [JsonIgnore]
+        internal ObservableCollection<string> Options { get; set; }
+
+        /// <summary>true = 科目这一列显示下拉；false = 退回可编辑文本框（课表没读出来时）。</summary>
+        [JsonIgnore]
+        public bool UseDropdown
+        {
+            get { return useDropdown; }
+            set
+            {
+                if (useDropdown == value) return;
+                useDropdown = value;
+                var h = PropertyChanged;
+                if (h == null) return;
+                h(this, new PropertyChangedEventArgs(nameof(UseDropdown)));
+                h(this, new PropertyChangedEventArgs(nameof(UseTextBox)));
+            }
+        }
+
+        bool useDropdown = true;
 
         /// <summary>给 XAML 的 <c>IsVisible</c> 用，取反而已。</summary>
         [JsonIgnore]

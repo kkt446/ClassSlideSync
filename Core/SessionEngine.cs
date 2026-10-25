@@ -35,6 +35,12 @@ namespace ClassSlideSync.Plugin.Core
         public string Status = "";       // the last one-off message (e.g. jump result)
 
         /// <summary>
+        /// 任务 6：课件改过、页码和旧版对不齐时，这里放「已按内容对齐到第 N 页」或
+        /// 「课件改得太多，页码对不上了」这类说明；空串表示没有可说的，退回通用提示。
+        /// </summary>
+        public string RemapNote = "";
+
+        /// <summary>
         /// 「还剩 N 页 · 约 M 分钟」（2026-10-24 功能1）：0 表示这一段不该出现在卡片上。
         /// 只有放映中、总页数已知、当前页后面还有页时才有值 —— 算法和边界都在 <see cref="PagePace"/> 里，
         /// 这里只放算好的结果，卡片拿到什么画什么。
@@ -194,6 +200,28 @@ namespace ClassSlideSync.Plugin.Core
         /// 所以由引擎线程算好一个不可变快照放这里，其它线程只读快照。
         /// </summary>
         volatile PaceSnapshot pace = PaceSnapshot.Empty;
+
+        /// <summary>
+        /// 每页停留的落盘层（2026-10-25 功能1）。文件在插件配置目录里，和 ledger.json 同级
+        /// （data\Config\Plugins\ClassSlideSync.Plugin\dwell.json）；读盘/落盘失败都只在内部
+        /// 记 lastError、绝不抛，最坏情况只是少一份"每页停多久"的统计。
+        /// </summary>
+        readonly PageDwell dwell;
+
+        /// <summary>
+        /// 本场放映的每页停留累加器（2026-10-25 功能1）：BeginSession 起、Advance 里随翻页结算、
+        /// EndSession 结算最后一页并 flush。只有引擎线程碰它 —— 别的线程读的是下面那个快照。
+        /// </summary>
+        PageDwellTracker? tracker;
+
+        /// <summary>
+        /// 「本次课实测速度」的快照（2026-10-25 功能2）：已翻页数 ÷ 已用时长。和 <see cref="pace"/>
+        /// 一样是不可变快照 —— Push 会从 UI 线程（SetStatus）和服务线程（PushCheapState）来，
+        /// 让它们现场去读 tracker（普通可变对象，引擎线程正在改）会读到半截状态。
+        /// Sample &lt; 0 表示样本不足，回退链在 <see cref="PagePace.SecondsPerPage(IList{SessionRecord}, IList{SessionRecord}, int, double)"/>。
+        /// </summary>
+        volatile SessionSample sessionSample = SessionSample.Empty;
+
         DateTime startAt;
         SessionRecord current;
         string currentFp;
@@ -232,6 +260,10 @@ namespace ClassSlideSync.Plugin.Core
             this.ledger = ledger;
             this.settings = settings;
             this.seewo = new SeewoBridge(ledger);
+            // 2026-10-25 功能1：每页停留单独一个文件，构造时把已有数据读进来（坏文件在内部改名留档）。
+            // 用 ledger 的目录和日志出口，dwell.json 永远躺在 ledger.json 旁边（官方文档要求
+            // 插件数据放 PluginConfigFolder，不要放插件安装目录）。
+            this.dwell = PageDwell.Load(ledger.Root, ledger.Log);
         }
 
         /// <summary>Raised whenever the card's contents change. Fires off the UI thread.</summary>
@@ -274,6 +306,13 @@ namespace ClassSlideSync.Plugin.Core
         public string SuiteName = "";
 
         public Ledger Ledger { get { return ledger; } }
+
+        /// <summary>
+        /// 每页停留的内存视图（2026-10-25 功能1）。只读快照都走 <see cref="PageDwell.Decks"/> /
+        /// <see cref="PageDwell.Subjects"/>（返回深拷贝，随便改不影响下一次落盘），
+        /// 以后面板/卡片要显示「这一页平均停多久」直接从这里拿，不要自己解析 dwell.json。
+        /// </summary>
+        public PageDwell Dwell { get { return dwell; } }
         public PptSnapshot Last { get { return last; } }
         public bool IsShowing { get { return showing; } }
         public string LastFilePath { get { return lastFilePath; } }
@@ -764,6 +803,14 @@ namespace ClassSlideSync.Plugin.Core
             // Fingerprinting reads up to 128 KB; once per lesson, off the hot path.
             currentFp = Ledger.Fingerprint(filePath);
 
+            // 任务 6：课件一旦被编辑，旧版的每页文字就再也读不出来了，页码对齐只能靠历史记录猜。
+            // 所以每次开课都把这一版的分页文字留个底（按指纹存，见 DeckRemap.deckpages.json）。
+            if (currentFp.Length > 0)
+            {
+                try { DeckRemap.Remember(ledger.Root, filePath); }
+                catch (Exception ex) { ledger.Log("decksnapshot failed: " + ex.Message); }
+            }
+
             // 2026-10-24 第二轮 F3：课件改名/挪目录后键变了，但内容没变（指纹相同）。以前这里
             // 直接另起一条，同一份课件在台账里出现两条"各自为战"的记录，卡片也不再提示
             // "上次停在第 5 页"。当前键在台账里查不到时，先用内容指纹认领旧桶，把历史迁过来。
@@ -819,6 +866,30 @@ namespace ClassSlideSync.Plugin.Core
             }
 
             // 指纹在方法开头就算好了（认领改名旧记录要用），这里不再重复读文件。
+            // 2026-10-25 功能1/2：本场放映的每页停留从这里起算（起点就是台账的 startAt，
+            // 两份数据不用两套时钟）；实测速度的样本也一并清零，免得上一场的翻页数漏进来。
+            // subject 用刚记下的 current.Subject —— dwell.json 的科目聚合就取这个值。
+            if (tracker == null) tracker = new PageDwellTracker();
+            tracker.Begin(current.FilePath, current.Subject, startSlide, startAt);
+            sessionSample = SessionSample.Empty;
+
+            // 任务 10：课件被移动/改名/另存成新版后指纹变了，按指纹认领不上旧记录。
+            // 退一步按「内容像 + 名字像」去本课科目文件夹和这份课件的原目录里找，
+            // 找得到就把整桶历史迁到新路径（找不到就什么都不动，卡片照常显示"还没记录"）。
+            if (ledger.Last(filePath) == null)
+            {
+                try
+                {
+                    var moved = DeckRemap.Relink(ledger, filePath,
+                        new[] { settings.FindSubjectFolder(current.Subject) });
+                    if (moved.Found && !SameBucket(moved.Path, filePath))
+                    {
+                        ledger.Log("relinked deck: " + FileLabel(filePath) + " <- " + FileLabel(moved.Path));
+                    }
+                }
+                catch (Exception ex) { ledger.Log("relink failed: " + ex.Message); }
+            }
+
             ledger.Log("show started: file=" + filePath + " start=" + startSlide + "/" + snap.SlideCount
                 + (string.IsNullOrEmpty(current.Subject) ? "" : " subject=" + current.Subject)
                 + (current.Period > 0 ? " period=" + current.Period : ""));
@@ -844,14 +915,24 @@ namespace ClassSlideSync.Plugin.Core
             // 记“翻到过的最远页”，不是“关掉时停在哪一页”：老师上完课常把课件翻回第 1 页再关，
             // 那一页不是下次要接着讲的地方。EndSlide 的语义就是这份课件讲到哪儿了。
             if (snap.Current > 0) { lastSlide = snap.Current; current.EndSlide = highest; }
+
+            // 2026-10-25 功能1/2：同一拍里取一次时钟，页面停留和会话时长用同一个 now，
+            // 免得两份数据差出几毫秒（测试里更难对齐）。
+            var now = DateTime.Now;
+            // 功能1：页面真的换了才结算上一页。同一页的重复快照（每 250ms 一次）不算翻页、
+            // 也不重置计时 —— 否则老师停在一页上看十分钟会被记成 4 秒一次 × 150 次。
+            if (tracker != null && snap.Current > 0) tracker.Enter(snap.Current, now);
+            // 功能2：每翻一页刷新一次实测速度，卡片上的「约 M 分钟」下一拍就跟着变。
+            UpdateSessionSample(now);
+
             if (snap.SlideCount > 0)
             {
                 current.SlideCount = snap.SlideCount;
                 slideCount = snap.SlideCount;
             }
             // Keep the on-disk copy honest even if the plugin is killed mid-lesson.
-            current.EndedAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture);
-            current.Seconds = (int)(DateTime.Now - startAt).TotalSeconds;
+            current.EndedAt = now.ToString("yyyy-MM-dd HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture);
+            current.Seconds = (int)(now - startAt).TotalSeconds;
             // 指纹也要一起写：这条中途落盘的记录很可能就是这堂课的最后一条（课件关得太快、
             // 或者插件被强杀），少了指纹下次会判成"文件在那之后被改过"。
             current.Fingerprint = currentFp;
@@ -862,23 +943,37 @@ namespace ClassSlideSync.Plugin.Core
         {
             showing = false;
             if (current == null) return;
+            var now = DateTime.Now;
             if (endSlide <= 0) endSlide = lastSlide;
             if (endSlide <= 0) endSlide = current.StartSlide;   // 都拿不到时至少别写成 0（用户第 6 条）
             // EndSlide 一律取“翻到过的最远页”：关课件前翻回第 1 页不该把这堂课讲到哪儿抹掉。
             int end = Math.Max(highest, endSlide);
             current.EndSlide = end > 0 ? end : 1;
-            current.EndedAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture);
-            current.Seconds = (int)(DateTime.Now - startAt).TotalSeconds;
+            current.EndedAt = now.ToString("yyyy-MM-dd HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture);
+            current.Seconds = (int)(now - startAt).TotalSeconds;
             current.Fingerprint = currentFp;
             if (current.Seconds >= settings.MinSessionSeconds)
             {
-                if (settings.RecordLedger) Commit(current);
+                if (settings.RecordLedger)
+                {
+                    Commit(current);
+                    // 2026-10-25 功能1：这一场的「每页停留」跟着台账这条记录一起落盘。
+                    // 挂在 RecordLedger/最短时长这两个条件里面不是偷懒：台账都不记的会话
+                    // （打开一下就关、不到 MinSessionSeconds）写进去，只会把「这一页平均停
+                    // 多久」拉成一堆 3 秒的噪音，和台账"太短不算一节课"的规矩也自相矛盾。
+                    FlushDwell(current, now);
+                }
                 ledger.Log("session recorded: " + FileLabel(current.FilePath) +
                     " pages " + current.StartSlide + "->" + current.EndSlide +
                     " (max " + highest + ")" +
                     " for " + current.Seconds + "s");
             }
             else ledger.Log("session ignored (only " + current.Seconds + "s)");
+
+            // 2026-10-25 功能1/2：会话到这里就结束了。累加器收掉，实测速度的样本也清空 ——
+            // 那个数字只代表"这一场"，下一场从零攒起；卡片下一拍回退历史均值。
+            tracker = null;
+            sessionSample = SessionSample.Empty;
 
             // 记住“刚刚讲完的是哪一节”。希沃退出授课后课件常常立刻被关掉，而 WPS 那边
             // 可能还开着一份上次留下的旧课件；没有这条信息，卡片下一拍就会换成那份的记录，
@@ -928,6 +1023,58 @@ namespace ClassSlideSync.Plugin.Core
                 ledger.Add(r);
             }
             ledger.Save();
+        }
+
+        /// <summary>
+        /// 把这一场攒下的「每页停留」并进 dwell.json 并落盘（2026-10-25 功能1）。
+        ///
+        /// 最后一页的结算也在这里做（tracker.Settle）：老师停在第 12 页讲了 10 分钟然后关掉
+        /// 课件，EndSession 拿到的 endSlide 只是页码，停留时长只有累加器自己知道。
+        /// 整段包 try/catch：每页停留是锦上添花的数据，写坏了也只是少一份统计，
+        /// 绝不能影响台账落盘、更不能把引擎循环带崩。
+        /// </summary>
+        void FlushDwell(SessionRecord r, DateTime now)
+        {
+            var t = tracker;
+            if (t == null || r == null) return;
+            try
+            {
+                t.Settle(now);
+                var pages = t.Pages;
+                if (pages.Count == 0) return;   // 一页都没停住（例如全程只给第 0 页的脏快照），不写空壳
+                dwell.AddSession(r.FilePath, r.Subject, FileLabel(r.FilePath), pages, t.PageVisits, now);
+                dwell.Save();
+                if (dwell.LastError.Length > 0)
+                    ledger.Log("dwell save failed: " + dwell.LastError);
+                else
+                    ledger.Log("dwell recorded: " + FileLabel(r.FilePath) + " " + pages.Count + " pages "
+                        + t.TotalSeconds + "s");
+            }
+            catch (Exception ex)
+            {
+                ledger.Log("dwell flush failed: " + ex.GetType().Name + " " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 刷新「本次课实测速度」快照（2026-10-25 功能2）：已翻页数 ÷ 已用时长。
+        ///
+        /// 分子用 tracker.Turns（页面真的变了几次），不用页号差：老师从第 2 页直接跳到第 30 页
+        /// 只算翻了一次，用页号差会把每页耗时算成两秒，卡片立刻变成「约 1 分钟」。
+        /// 样本不足时 Sample 是 -1，SecondsPerPage 会回退历史均值 —— 回退的判断（&lt;3 页或
+        /// &lt;60 秒）收在 PagePace 里，这里只负责喂当前读数。
+        /// </summary>
+        void UpdateSessionSample(DateTime now)
+        {
+            double elapsed = (now - startAt).TotalSeconds;
+            if (elapsed < 0) elapsed = 0;   // 系统校时把时钟往回拨：不能给出负时长
+            int turns = tracker == null ? 0 : tracker.Turns;
+            sessionSample = new SessionSample
+            {
+                Turns = turns,
+                Seconds = elapsed,
+                Sample = PagePace.SessionSecondsPerPage(turns, elapsed)
+            };
         }
 
         // ------------------------------------------------------------------ actions
@@ -1232,6 +1379,20 @@ namespace ClassSlideSync.Plugin.Core
         }
 
         /// <summary>
+        /// 「本次课实测速度」的一次计算结果（2026-10-25 功能2）。整份不可变、换一个数就整份替换 ——
+        /// 卡片线程正在读它。Sample = 已翻页数 ÷ 已用时长；-1 表示样本还不够
+        /// （不足 3 页或不足 60 秒），回退链在 PagePace.SecondsPerPage 里。
+        /// Turns/Seconds 只用于诊断日志和以后面板上显示"本课已翻 N 页"。
+        /// </summary>
+        sealed class SessionSample
+        {
+            public static readonly SessionSample Empty = new SessionSample { Sample = -1 };
+            public int Turns;
+            public double Seconds;
+            public double Sample = -1;
+        }
+
+        /// <summary>
         /// 重算「每页耗时」快照。只在这一条引擎线程上调用（见 <see cref="pace"/> 的注释）。
         /// 用「键 + 记录数」判断要不要重算：台账只追加、旧记录不改，记录数没变就说明没有新数据，
         /// 每 250ms 重扫一遍 ΣSeconds 是白费力气。
@@ -1276,17 +1437,20 @@ namespace ClassSlideSync.Plugin.Core
         }
 
         /// <summary>
-        /// 眼前这份放映中的课件每页大概多少秒：优先它自己的历史，退回全台账，再退回 60 秒兜底。
+        /// 眼前这份放映中的课件每页大概多少秒：优先用「本次课实测速度」（已翻页数 ÷ 已用时长，
+        /// 2026-10-25 功能2），样本不足再退回它自己的历史，再退回全台账，最后 60 秒兜底。
         /// 键对不上（改名 / 按文件名或指纹认回来的旧桶）时用快照里 CurrentKey 那份的数 ——
         /// 那张屏幕上的课件才是要估的对象，换成别的课件的平均没有意义。
         /// </summary>
         double SecondsPerPage()
         {
             var p = pace;
-            double v = p.DeckSeconds;   // 快照里那份就是 CurrentKey 的课件，键对不上时也用它
+            var s = sessionSample;
+            double v = s.Sample;        // 这一场自己测出来的：最贴眼前这块屏幕
+            if (v <= 0) v = p.DeckSeconds;
             if (v <= 0) v = p.AllSeconds;
             if (v <= 0) v = PagePace.DefaultSecondsPerPage;
-            return v;
+            return PagePace.ClampSecondsPerPage(v);
         }
 
         void Push(bool isShowing, int currentSlide, int count)
@@ -1374,9 +1538,25 @@ namespace ClassSlideSync.Plugin.Core
                 {
                     st.FileName = FileLabel(r.FilePath);
                 }
+                // 任务 6：文件改过（指纹变了）时不再只说「可能偏移」——把旧版的每页文字和现在这版
+                // 对一遍，真能对上就给出对齐后的页码；对不上就明说改得太多、别乱跳。
+                if (!st.PreviousTrusted && st.Previous > 0)
+                {
+                    try
+                    {
+                        var remap = DeckRemap.RemapFor(ledger, r, histKey, st.Previous, ledger.Root);
+                        if (remap != null)
+                        {
+                            if (remap.Usable && remap.NewSlide > 0) st.Previous = remap.NewSlide;
+                            else if (remap.Kind == RemapKind.Replaced) st.Previous = 0;
+                            if (!string.IsNullOrEmpty(remap.Note)) st.RemapNote = remap.Note;
+                        }
+                    }
+                    catch (Exception ex) { ledger.Log("remap failed: " + ex.Message); }
+                }
                 st.Hint = st.PreviousTrusted
                     ? "记录于 " + ShortAge(st.PreviousAgeDays)
-                    : "文件在那之后被改过，页码可能已偏移";
+                    : (string.IsNullOrEmpty(st.RemapNote) ? "文件在那之后被改过，页码可能已偏移" : st.RemapNote);
                 if (finished) st.Hint = "上次已讲到最后一页";
                 // 刚讲完的这份：明说一句，免得老师把它当成“别的套件里那份课件”。
                 if (recent) st.Hint = "刚讲完 · " + (st.PreviousTrusted ? "点这里接着讲" : "文件改过，页码可能偏移");

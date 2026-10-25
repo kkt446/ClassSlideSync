@@ -1,4 +1,5 @@
-﻿using System;
+using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text.Json;
 
@@ -293,20 +294,67 @@ namespace ClassSlideSync.Plugin.Core
         public bool ShowJumpLine = true;
         public bool ClickToJump = true;
 
+        /// <summary>
+        /// 药丸里画不画「已翻 N / 共 M」两行竖排数字（2026-10-25 用户第 3 条）。
+        /// 关掉后药丸只剩箭头 + 进度条，宽度不变（避免一开关就重新排一次版）。
+        /// </summary>
+        public bool ShowPillPageNumbers = true;
+
+        /// <summary>
+        /// 科目 → 药丸进度条颜色（2026-10-25 用户第 9 条）。在 Resolve 里定格成 RGB 快照，
+        /// 绘制时按当前课件所属科目现查；空表 = 所有科目都用主题强调色。
+        /// </summary>
+        public List<SubjectColorPair> SubjectColors = new List<SubjectColorPair>();
+
         /// <summary>跟随主题还是自定义，写进日志用。</summary>
         public bool FollowsTheme = true;
+
+        /// <summary>一条已经解析成 RGB 的科目配色。Appearance 是绘制侧的类型，不引用 SyncSettings。</summary>
+        public sealed class SubjectColorPair
+        {
+            public string Subject = "";
+            public int R, G, B;
+        }
+
+        /// <summary>
+        /// 按科目名取药丸进度条的颜色；没配到返回 false（调用方用主题强调色）。
+        /// 规则和 <see cref="SyncSettings.FindSubjectColor"/> 一致：先精确命中，再拆段求交集。
+        /// </summary>
+        public bool PillAccentFor(string subject, out int r, out int g, out int b)
+        {
+            r = g = b = 0;
+            if (string.IsNullOrWhiteSpace(subject) || SubjectColors == null || SubjectColors.Count == 0) return false;
+            string want = subject.Trim();
+            SubjectColorPair exact = null, loose = null;
+            for (int i = 0; i < SubjectColors.Count; i++)
+            {
+                SubjectColorPair c = SubjectColors[i];
+                if (c == null || string.IsNullOrWhiteSpace(c.Subject)) continue;
+                if (string.Equals(c.Subject.Trim(), want, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (exact == null) exact = c;
+                    continue;
+                }
+                if (loose == null && SyncSettings.SubjectNamesOverlap(want, c.Subject)) loose = c;
+            }
+            SubjectColorPair hit = exact != null ? exact : loose;
+            if (hit == null) return false;
+            r = hit.R; g = hit.G; b = hit.B;
+            return true;
+        }
 
         public string Describe()
         {
             return string.Format(
                 "bg=#{0:X2}{1:X2}{2:X2} alpha={3} accent=#{4:X2}{5:X2}{6:X2} radius={7} scale={8:0.##} " +
-                "font={9}{10} side={11} v={12}% tab={13}x{20} lines={14}{15}{16}{17} click={18} follow={19}",
+                "font={9}{10} side={11} v={12}% tab={13}x{20} lines={14}{15}{16}{17} click={18} follow={19} " +
+                "pillpages={21} colors={22}",
                 BgR, BgG, BgB, BgAlpha, AccentR, AccentG, AccentB, Radius, CardScale,
                 FontFamily, FontFile.Length > 0 ? "(ttf)" : "", OnRight ? "right" : "left", VerticalPercent,
                 TabWidth,
                 ShowFileName ? "title," : "", ShowSlideCount ? "count," : "", ShowContext ? "context," : "",
                 ShowStatusLine ? "status," : "",
-                ClickToJump, FollowsTheme, TabLength);
+                ClickToJump, FollowsTheme, TabLength, ShowPillPageNumbers, SubjectColors == null ? 0 : SubjectColors.Count);
         }
 
         public static CardAppearance Resolve(SyncSettings s, ClassIslandTheme theme)
@@ -442,10 +490,48 @@ namespace ClassSlideSync.Plugin.Core
             a.ShowStatusLine = s.CardShowStatusLine;
             a.ShowJumpLine = s.CardShowJumpLine;
             a.ClickToJump = s.CardClickToJump;
+            // 2026-10-25 用户第 3 / 第 9 条：药丸里的页码开关 + 每科的进度条颜色。
+            a.ShowPillPageNumbers = s.ShowPillPageNumbers;
+            a.SubjectColors = ResolveSubjectColors(s);
 
             a.CardWidth = (int)Math.Round(236 * a.CardScale);
             a.CardHeight = (int)Math.Round(EstimatedHeight(a) * a.CardScale);
             return a;
+        }
+
+        /// <summary>
+        /// 把设置里的科目配色定格成 RGB 快照。解析失败的行直接丢掉（宁可这科用强调色，
+        /// 也不要在绘制线程里再解析一次字符串）。
+        /// 设置里的表非空就以它为唯一依据：用户把某科删掉，就是想让那科用强调色；
+        /// 表是空的（新装、旧配置、用户全删）则用内置预设色表兜底，"每科都有颜色"不落空。
+        /// </summary>
+        static List<SubjectColorPair> ResolveSubjectColors(SyncSettings s)
+        {
+            var list = new List<SubjectColorPair>();
+            int r, g, b, alpha;
+            try
+            {
+                if (s.SubjectColors != null && s.SubjectColors.Count > 0)
+                {
+                    foreach (SubjectColor c in s.SubjectColors)
+                    {
+                        if (c == null || string.IsNullOrWhiteSpace(c.Subject)) continue;
+                        if (!ClassIslandTheme.TryParseColor(c.Color, out r, out g, out b, out alpha)) continue;
+                        list.Add(new SubjectColorPair { Subject = c.Subject.Trim(), R = r, G = g, B = b });
+                    }
+                    return list;
+                }
+            }
+            catch { }
+            for (int i = 0; i < SyncSettings.DefaultColorSubjects.Length; i++)
+            {
+                if (!ClassIslandTheme.TryParseColor(SyncSettings.DefaultColorHexes[i], out r, out g, out b, out alpha)) continue;
+                list.Add(new SubjectColorPair
+                {
+                    Subject = SyncSettings.DefaultColorSubjects[i], R = r, G = g, B = b
+                });
+            }
+            return list;
         }
 
         /// <summary>

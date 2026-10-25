@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Security.Cryptography;
@@ -355,6 +355,29 @@ namespace ClassSlideSync.Plugin.Core
         }
 
         /// <summary>
+        /// 台账里所有记录的列表快照。列表本身是新的（记录对象仍是台账里那些），
+        /// 任务 10 要扫"路径已经失效"的记录，不能直接拿 <see cref="ByFile"/> 的字典去遍历 ——
+        /// 别的线程可能在同一个字典上换键。
+        /// </summary>
+        public List<SessionRecord> AllRecords()
+        {
+            var all = new List<SessionRecord>();
+            lock (Sync)
+            {
+                foreach (var kv in byFile)
+                {
+                    var list = kv.Value;
+                    if (list == null) continue;
+                    for (int i = 0; i < list.Count; i++)
+                    {
+                        if (list[i] != null) all.Add(list[i]);
+                    }
+                }
+            }
+            return all;
+        }
+
+        /// <summary>
         /// 按文件内容指纹找最近一条记录。课件被改名或挪了目录之后文件名对不上，
         /// 但内容没变 —— 页码仍然可信，历史也不该忽然消失。
         /// </summary>
@@ -483,6 +506,29 @@ namespace ClassSlideSync.Plugin.Core
                 next.Remove(oldKey);
                 byFile = next;
                 return true;
+            }
+        }
+
+        /// <summary>
+        /// 任务 10（2026-10-25）：课件被移动/改名后，把旧路径的整段历史接到新路径上。
+        /// 与 <see cref="Adopt"/> 的区别只在"多落一次盘、多记一行日志"，迁移语义完全一样：
+        /// 调用方（<c>DeckRemap.Relink</c>）必须已经确认新文件就是同一份课件。
+        /// 返回 true 表示台账里确实有这段历史并且已经迁过去了。
+        /// </summary>
+        public bool Relink(string oldPath, string newPath)
+        {
+            if (string.IsNullOrWhiteSpace(oldPath) || string.IsNullOrWhiteSpace(newPath)) return false;
+            try
+            {
+                if (!Adopt(oldPath, newPath)) return false;
+                Save();
+                Log("relink: history moved " + DisplayName(oldPath) + " -> " + DisplayName(newPath));
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log("relink failed: " + ex.Message);
+                return false;
             }
         }
 

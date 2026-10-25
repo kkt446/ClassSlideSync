@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using Avalonia.Controls;
 using ClassIsland.Core;
 using ClassIsland.Core.Abstractions.Services;
@@ -695,6 +695,17 @@ namespace ClassSlideSync.Plugin.Services
 
             var c = card;
             card = null;
+            // 2026-10-25 用户反馈「没课件时主界面组件还赖着」：引擎停掉后不会再有状态心跳，
+            // 订阅方（主界面组件、自动化触发器）手里就永远停着最后那一帧「正在放映 4 / 10」。
+            // 所以退出待命时主动发一条「什么都没开」的快照，让它们把界面收回去。
+            PublishProgress(new CardState
+            {
+                DeckOpen = false,
+                Showing = false,
+                Current = 0,
+                SlideCount = 0,
+            });
+
             if (c != null)
             {
                 try { c.JumpRequested -= OnJumpRequested; } catch { }
@@ -1012,6 +1023,10 @@ namespace ClassSlideSync.Plugin.Services
         {
             try
             {
+                // 触发器「课件讲到第 N 页」的数据源。放在最前面：卡片被收起/被抑制时
+                // （下面那句 return）引擎其实还在报页码，触发器照样该知道讲到哪一页。
+                PublishProgress(st);
+
                 var c = card;
                 if (c == null) return;
                 // 先记下“屏幕上现在是什么”，跳页时 (可能就在几毫秒后) 会用这一份。
@@ -1173,6 +1188,75 @@ namespace ClassSlideSync.Plugin.Services
 
         public void Dispose() { Stop(); }
 
+        // ───────────────────────── 触发器数据源（自动化「课件讲到第 N 页」） ─────────────────────────
+        // 触发器不去自己盯 PowerPoint/WPS：引擎已经在盯了，再盯一遍就是双份 COM 轮询，
+        // 还会出现"卡片显示第 5 页、触发器以为第 3 页"这种两份真相。这里只做一件事：
+        // 把引擎推来的状态抄成一份不分线程的只读快照，触发器订阅变化、只读快照。
+
+
+        // 还没跑过引擎时的空快照：Progress 永不返回 null，触发器不用每次判空。
+        static readonly SlideProgress EmptyProgress = new SlideProgress(false, false, "", "", 0, 0, "", "");
+
+        volatile SlideProgress progress;
+        string lastProgressSignature = "";
+
+        /// <summary>最近一次「讲到哪一页」的快照（任意线程可读，永远不会是 null）。</summary>
+        public SlideProgress Progress
+        {
+            get { return progress ?? EmptyProgress; }
+        }
+
+        /// <summary>
+        /// 页状态变化（在引擎线程上抛）。只在「换了课件 / 换了页 / 换了课次」时抛一次，
+        /// 同一页的重复心跳不抛。订阅方必须是快的、且自己吞异常——这是引擎线程。
+        /// </summary>
+        public event Action<SlideProgress>? SlideProgressChanged;
+
+        /// <summary>把引擎推来的状态抄成 <see cref="SlideProgress"/>，变了才通知订阅方。</summary>
+        void PublishProgress(CardState st)
+        {
+            try
+            {
+                var snap = engine == null ? null : engine.Last;
+                string path = snap == null ? "" : (snap.FilePath ?? "");
+                int current = st.Current > 0 ? st.Current : (snap == null ? 0 : snap.Current);
+                int count = st.SlideCount > 0 ? st.SlideCount : (snap == null ? 0 : snap.SlideCount);
+
+                var p = new SlideProgress(
+                    st.DeckOpen,
+                    st.Showing,
+                    path,
+                    st.FileName,
+                    current,
+                    count,
+                    LessonKeyOf(lessonTag),
+                    DateTime.Now.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture));
+                progress = p;
+
+                var handler = SlideProgressChanged;
+                if (handler == null) return;
+
+                string sig = p.Signature();
+                if (sig == lastProgressSignature) return;
+                lastProgressSignature = sig;
+                handler(p);
+            }
+            catch (Exception ex)
+            {
+                // 触发器出事不能把引擎线程带下去（下面还有卡片更新和台账要跑）。
+                try { ledger?.Log("progress publish failed: " + ex.Message); } catch { }
+            }
+        }
+
+        /// <summary>课次键：科目 + 节名 + 节号。课间/没有课表时返回空串（触发器退回按天去重）。</summary>
+        static string LessonKeyOf(LessonTag tag)
+        {
+            if (tag == null) return "";
+            if (tag.Subject.Length == 0 && tag.LessonName.Length == 0) return "";
+            return tag.Subject + "|" + tag.LessonName + "|"
+                + tag.Period.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+
         // ───────────────────────── 自动化接口（ClassIsland 行动调用） ─────────────────────────
         // 行动是插件之外的调用方。让它们直接摸 card / engine 字段，等于把窗口和引擎的生命周期
         // 复制到第二个地方；这里只做两件事：把调用切回 UI 线程，然后走既有的 Arm/Disarm。
@@ -1275,6 +1359,77 @@ namespace ClassSlideSync.Plugin.Services
             {
                 try { ledger?.Log("automation dispatch failed: " + ex.Message); } catch { }
             }
+        }
+    }
+
+    // 「讲到哪一页」的快照类型放在命名空间级（不是嵌套在服务里）：触发器、自测都直接用它，
+    // 写成 SlideSyncService.SlideProgress 只会让调用处变长。
+    /// <summary>
+    /// 「演示软件此刻讲到哪一页」的只读快照。
+    ///
+    /// 引擎线程每次状态心跳刷新它（见 <see cref="PublishProgress(CardState)"/>），
+    /// 自动化触发器只读。所有字段都是当时复制的值：拿到手之后引擎再翻页也不会改到它。
+    /// </summary>
+    public sealed class SlideProgress
+    {
+        public SlideProgress(
+            bool deckOpen,
+            bool showing,
+            string deckPath,
+            string deckName,
+            int current,
+            int slideCount,
+            string lessonKey,
+            string dayKey)
+        {
+            DeckOpen = deckOpen;
+            Showing = showing;
+            DeckPath = deckPath ?? "";
+            DeckName = deckName ?? "";
+            Current = current;
+            SlideCount = slideCount;
+            LessonKey = lessonKey ?? "";
+            DayKey = dayKey ?? "";
+        }
+
+        /// <summary>true = 演示软件此刻真的打开着某份课件（沿用 <see cref="CardState.DeckOpen"/> 的原义）。</summary>
+        public bool DeckOpen { get; }
+
+        /// <summary>true = 真的在放映（全屏放片）；false = 只是打开着。</summary>
+        public bool Showing { get; }
+
+        /// <summary>课件完整路径，用来认「同一份课件」；拿不到就是空串。</summary>
+        public string DeckPath { get; }
+
+        /// <summary>课件文件名，给人看的。</summary>
+        public string DeckName { get; }
+
+        /// <summary>当前页，1 起；0 = 这一拍没读到页码。</summary>
+        public int Current { get; }
+
+        /// <summary>总页数，0 = 未知。</summary>
+        public int SlideCount { get; }
+
+        /// <summary>课次（"科目|节名|节号"），没有课表读数是空串。触发器用它认「同一节课」。</summary>
+        public string LessonKey { get; }
+
+        /// <summary>当天日期 yyyy-MM-dd：课次拿不到时，触发器靠它把去重范围收敛到当天。</summary>
+        public string DayKey { get; }
+
+        /// <summary>变化指纹：拼起来一样就说明"还是同一份课件的同一页"，不用再通知订阅方。</summary>
+        public string Signature()
+        {
+            return (DeckOpen ? "1" : "0") + (Showing ? "1" : "0") + "|" + DeckPath + "|"
+                + Current + "|" + SlideCount + "|" + LessonKey;
+        }
+
+        /// <summary>日志里的一句话小结，例如「数学 · 第 3 节 / 课件.pptx 第 5 页（放映中）」。</summary>
+        public string Describe()
+        {
+            string who = LessonKey.Length > 0 ? LessonKey : "无课表";
+            string deck = DeckName.Length > 0 ? DeckName : "(课件名未知)";
+            string state = Showing ? "放映中" : (DeckOpen ? "打开着" : "没有课件");
+            return who + " / " + deck + " 第 " + Current + " 页（" + state + "）";
         }
     }
 }

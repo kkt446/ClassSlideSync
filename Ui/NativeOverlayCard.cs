@@ -469,6 +469,61 @@ namespace ClassSlideSync.Plugin.Ui
         }
 
         /// <summary>
+        /// 药丸里画不画那两行竖排数字（2026-10-25 用户第 3 条「设置里记得加悬浮窗缩成药丸时页码关闭」）。
+        /// textLines 是两行页码的字符总数：一页都没打开时当然也不画。
+        /// 单独抽成纯函数，好让离线 harness 直接断言"开关关掉就一个字都不画"。
+        /// </summary>
+        internal static bool PillPageTextEnabled(CardAppearance look, int textLines)
+        {
+            if (look == null || !look.ShowPillPageNumbers) return false;
+            return textLines > 0;
+        }
+
+        /// <summary>
+        /// 这一帧药丸进度条该用哪个颜色：返回 {r,g,b}；返回 null = 没有匹配到科目，
+        /// 调用方用主题强调色。2026-10-25 用户第 9 条「每科改颜色」。
+        /// </summary>
+        internal static int[] PillBarAccent(CardAppearance look, CardState st)
+        {
+            if (look == null || st == null) return null;
+            int r, g, b;
+            if (!look.PillAccentFor(PillSubject(st), out r, out g, out b)) return null;
+            return new int[] { r, g, b };
+        }
+
+        /// <summary>
+        /// 当前课件属于哪一科。不改 SessionEngine 的字段（别的改动正在动它），只用现成的两处信息：
+        /// 1) CardState.Files 里 IsCurrent 的那一项 —— Subject 是台账里可靠的科目名；
+        /// 2) 退一步用 CardState.Context —— LessonTag 拼的「科目 · 第 N 节」，取 " · " 之前那截。
+        /// 都拿不到就返回空串，调用方回退主题强调色（"未标注科目"也算拿不到）。
+        /// </summary>
+        internal static string PillSubject(CardState st)
+        {
+            if (st == null) return "";
+            var files = st.Files;
+            if (files != null)
+            {
+                for (int i = 0; i < files.Count; i++)
+                {
+                    CardFileItem f = files[i];
+                    if (f == null || !f.IsCurrent) continue;
+                    string subject = f.Subject == null ? "" : f.Subject.Trim();
+                    // "未标注科目"是 CardFileGroups 的占位名，不是一个真的科目，别拿它染色；
+                    // 但也别就此放弃 —— 往下走，Context 里可能还带着真正的科目名。
+                    if (string.Equals(subject, CardFileGroups.Unmarked, StringComparison.Ordinal)) break;
+                    if (subject.Length > 0) return subject;
+                }
+            }
+            string ctx = st.Context == null ? "" : st.Context.Trim();
+            int cut = ctx.IndexOf(" · ", StringComparison.Ordinal);
+            if (cut > 0) return ctx.Substring(0, cut).Trim();
+            // 课表没排到节次时 Context 就是光秃秃的科目名（LessonTag.Context 只有 Subject 时才非空），
+            // 这时整串就是科目；"第 3 节"这种时段名会被 LooksLikeSubject 挡掉。
+            if (ctx.Length > 0 && CardFileList.LooksLikeSubject(ctx)) return ctx;
+            return "";
+        }
+
+        /// <summary>
         /// 运行期换外观（老师在设置页里改了颜色、大小、位置）。真正的重排在浮层线程里做，
         /// 这里只把新值挂上去并叫醒消息循环——跨线程直接摆弄窗口属性是自找麻烦。
         /// </summary>
@@ -2200,45 +2255,22 @@ namespace ClassSlideSync.Plugin.Ui
                             int pillTotal = st == null ? 0 : st.SlideCount;
 
                             int padX = Scaled(6);
-                            // 行框高：默认 18（12pt 字高 16，行框给 18 刚好不裁字）。但设置页的字号可以调，
-                            // 字高一旦超过行框，DT_SINGLELINE 会把字的上下切掉，所以取「18 / 实际字高+2」
-                            // 里大的那个。默认字号下两者都是 18，观感和原来一致。
-                            int fontPx = -GdiCanvas.FontHeight(GdiCanvas.PillPointSize(look), dpi);
-                            int lineH = Math.Max(Scaled(PillLineStep96), fontPx + Scaled(2));
-                            int lineGap = Scaled(3);             // 两行之间 2–3 逻辑像素
                             int lineBottomPad = Scaled(6);        // 离药丸下沿
-                            // 竖排：蓝字「已翻的页码」逐位往下排，再接红字「总页数」逐位往下排。
-                            // 细长条只有 30 来个逻辑像素宽，横排放不下「已翻 12」，竖排一位一行刚好。
-                            string pageText = pillPage > 0 ? pillPage.ToString(CultureInfo.InvariantCulture) : "";
-                            string totalText = pillTotal > 0 ? pillTotal.ToString(CultureInfo.InvariantCulture) : "";
-                            var pageBlue = Color32.FromArgb(255, 0x1F, 0x6F, 0xEB);
-                            var pageRed = Color32.FromArgb(255, 214, 69, 69);
-                            int textLines = pageText.Length + totalText.Length;
+                            // 2026-10-25 用户反馈：药丸下面那两行数字不要了，药丸里只留箭头 + 进度条。
+                            int barBottom = pill.B - lineBottomPad;
                             int barTop = pill.T + Scaled(2) + capH + Scaled(2);
                             int bx = pill.L + padX, bxr = pill.R - padX;
-                            // 药丸太矮放不下时只留箭头 + 进度条（旧观感），绝不让字压到箭头上。
-                            bool showPages = textLines > 0
-                                && pill.B - lineBottomPad - textLines * lineH - Scaled(4) - barTop >= Scaled(10);
-                            int barBottom = showPages ? pill.B - lineBottomPad - textLines * lineH - Scaled(4) : pill.B - lineBottomPad;
-
-                            if (showPages)
+                            // 药丸进度条按科目着色（2026-10-25 用户第 9 条「每科改颜色」）：
+                            // 当前课件的科目在设置表里对得上就用那一科的颜色，对不上（或没配）还是主题强调色。
+                            var barColor = accent;
+                            int[] subjectAccent = PillBarAccent(look, st);
+                            if (subjectAccent != null)
                             {
-                                int ty = barBottom + Scaled(4);
-                                foreach (char ch in pageText)
-                                {
-                                    g.Text(ch.ToString(), g.FontTiny, pageBlue,
-                                           new Rect32(bx, ty, bxr, ty + lineH), Align.Center, true);
-                                    ty += lineH;
-                                }
-                                foreach (char ch in totalText)
-                                {
-                                    g.Text(ch.ToString(), g.FontTiny, pageRed,
-                                           new Rect32(bx, ty, bxr, ty + lineH), Align.Center, true);
-                                    ty += lineH;
-                                }
+                                barColor = Color32.FromArgb(255, (byte)subjectAccent[0],
+                                                            (byte)subjectAccent[1], (byte)subjectAccent[2]);
                             }
 
-                            // 药丸里的竖向进度条：轨道铺满箭头以下、文字以上的剩余高度，accent 从底往上填。
+                            // 药丸里的竖向进度条：轨道铺满箭头以下、文字以上的剩余高度，科目色从底往上填。
                             if (bxr - bx >= Scaled(4) && barBottom - barTop >= Scaled(8))
                             {
                                 int pillRange = barBottom - barTop;
@@ -2249,7 +2281,7 @@ namespace ClassSlideSync.Plugin.Ui
                                 int fh = PillFillHeight(pillRange, pillPage, pillTotal);
                                 if (fh > 0)
                                 {
-                                    g.FillRounded(accent, new Rect32(bx, barBottom - fh, bxr, barBottom),
+                                    g.FillRounded(barColor, new Rect32(bx, barBottom - fh, bxr, barBottom),
                                                   barRadius, true, true);
                                 }
                             }

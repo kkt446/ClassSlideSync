@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    课件续页 · 下课提醒横幅（toast）小工具。
+
+    为什么必须是独立项目、独立 TargetFramework：
+      插件本身锁死 net8.0-windows（ClassIsland 动态加载要求，见插件 csproj 的注释），
+      而 Windows.UI.Notifications 的 WinRT 投影只有 net8.0-windows10.0.19041.0 才有。
+      所以插件不引用这个项目，只在构建时调 MSBuild 把它编出来，再把它整个输出目录
+      拷进插件输出目录 ToastHelper\ 下，随 .cipx（build 输出目录打 zip）一起发布。
+
+    为什么运行时只需要用户态权限：
+      未打包的 Win32 程序要能弹 toast，Windows 要求两件事，都在 HKCU：
+        1) HKCU\Software\Classes\AppUserModelId\<AUMID> 下有 DisplayName（和可选的 IconUri）；
+        2) 开始菜单里有一个带 System.AppUserModel.ID 属性的快捷方式指向本 exe。
+      这两件事都不需要管理员，也不写插件目录（插件目录不保证可写）。
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>ToastHelper</AssemblyName>
+    <RootNamespace>ClassSlideSync.ToastHelper</RootNamespace>
+
+    <!-- 插件侧用 FileVersion 判断「这份 helper 登记过没有」，升版本才有意义，
+         但值本身不用跟插件版本同步；改注册逻辑（比如换 AUMID）时顺手改它。 -->
+    <Version>1.0.0</Version>
+    <FileVersion>1.0.0.0</FileVersion>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+
+    <!-- 插件包里不需要符号；cipx 是整目录打包，多一个 pdb 只是白占体积。 -->
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 通知里的应用小图标（AUMID 的 IconUri）和开始菜单快捷方式都用它。
+         从插件根目录拷一份到 helper 输出目录，helper 只读不写，插件目录可写与否都不影响。 -->
+    <None Include="..\..\icon.png" Link="icon.png" Visible="false" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

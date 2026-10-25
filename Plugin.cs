@@ -1,4 +1,4 @@
-using ClassIsland.Core;
+﻿using ClassIsland.Core;
 using ClassIsland.Core.Abstractions;
 using ClassIsland.Core.Attributes;
 using ClassIsland.Core.Extensions.Registry;
@@ -10,6 +10,7 @@ using ClassSlideSync.Plugin.Core;
 using ClassSlideSync.Plugin.Services;
 using ClassSlideSync.Plugin.Automation;
 using ClassSlideSync.Plugin.Views.SettingsPages;
+using ClassSlideSync.Plugin.Components;
 
 namespace ClassSlideSync.Plugin;
 
@@ -79,6 +80,17 @@ public class Plugin : PluginBase
             UnfinishedDeckRule.Name,
             UnfinishedDeckRule.Glyph,
             UnfinishedDeckRule.Handle);
+
+        // 2026-10-25 用户第 4 条需求：「自动化，当讲到 x 面时」——不是行动，是**触发条件**，
+        // 所以要注册成触发器而不是 AddAction。触发器与行动同构：AddTrigger<TTrigger, TSettingsControl>()
+        // 按 [TriggerInfo] 里的 Id 把触发器和它的设置控件各注册成一条 keyed transient；
+        // 只写 AddTrigger<TTrigger>() 就没有设置界面（页码没法填）。取证见 stability-report-trigger.txt。
+        services.AddTrigger<SlidePageReachedTrigger, SlidePageReachedSettingsControl>();
+
+        // 主界面组件「课件进度」：设置 → 主界面 → 编辑组件 里能把它拖进任何一行。
+        // 组件自己订阅 SlideSyncService.SlideProgressChanged；没课件放映时把自身 IsVisible 关掉，
+        // 不留占位（宿主对组件 IsVisible 的 setter 是 internal，插件不能代设）。
+        services.AddComponent<DeckProgressComponent>();
 
         // 新手引导：挂进 ClassIsland 自带的教程列表（教程中心里能看到「课件续页」这一组）。
         // 设置页上的「新手引导」按钮和它用的是同一份教程内容，见 Core/TutorialGuide.cs。

@@ -1,4 +1,4 @@
-<Window xmlns="https://github.com/avaloniaui"
+﻿<Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:controls="clr-namespace:FluentAvalonia.UI.Controls;assembly=FluentAvalonia"
         xmlns:core="clr-namespace:ClassSlideSync.Plugin.Core"
@@ -736,6 +736,49 @@
                                     VerticalAlignment="Center"
                                     Value="{Binding Settings.CollapsedTabOpacityPercent, Mode=TwoWay}" />
                         </controls:SettingsExpander.Footer>
+                    </controls:SettingsExpander>
+
+                    <!-- 2026-10-25 用户第 9 条：「药丸不是有个进度条吗，每科改颜色，设置可以调每科对应的颜色」。
+                         科目名照课表写法；表里没配到的科目用 ClassIsland 主题强调色。 -->
+                    <controls:SettingsExpander Header="各科目进度条颜色"
+                                               Description="药丸（收起态）里那道竖进度条按当前课件的科目上色。表里没配到的科目用主题强调色。"
+                                               IsExpanded="True">
+                        <StackPanel Spacing="8" Margin="0,4,0,0">
+                            <ItemsControl x:Name="SubjectColorList" ItemsSource="{Binding Settings.SubjectColors}">
+                                <ItemsControl.ItemTemplate>
+                                    <!-- 理由同上：Options 是 internal，只有编译期绑定看得到。 -->
+                                    <DataTemplate x:DataType="core:SubjectColor" x:CompileBindings="True">
+                                        <Grid ColumnDefinitions="150,Auto,Auto" Margin="0,0,0,6">
+                                            <ComboBox Grid.Column="0" Margin="0,0,8,0"
+                                                      IsVisible="{Binding UseDropdown}"
+                                                      ItemsSource="{Binding Options}"
+                                                      SelectedItem="{Binding Subject, Mode=TwoWay}"
+                                                      PlaceholderText="语文"
+                                                      HorizontalAlignment="Stretch" />
+                                            <TextBox Grid.Column="0" Margin="0,0,8,0"
+                                                     IsVisible="{Binding UseTextBox}"
+                                                     Watermark="语文"
+                                                     Text="{Binding Subject, Mode=TwoWay}" />
+                                            <ColorPicker Grid.Column="1" Width="120" Height="32"
+                                                         VerticalAlignment="Center"
+                                                         BorderBrush="#33000000" BorderThickness="1"
+                                                         IsAlphaVisible="False"
+                                                         Color="{Binding Color, Mode=TwoWay, Converter={StaticResource HexColor}}" />
+                                            <Button Grid.Column="2" Margin="8,0,0,0" Content="删除"
+                                                    Tag="{Binding}" Click="OnRemoveSubjectColor" />
+                                        </Grid>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                            <StackPanel Orientation="Horizontal" Spacing="10">
+                                <Button Content="添加一行" Click="OnAddSubjectColor" />
+                                <Button Content="恢复预设色" Click="OnResetSubjectColors" />
+                                <TextBlock VerticalAlignment="Center"
+                                           Text="表里没有的科目用主题强调色。"
+                                           FontSize="12"
+                                           Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                            </StackPanel>
+                        </StackPanel>
                     </controls:SettingsExpander>
 
                     <!-- 同一个要求的另一半：面板不要亚克力，直接上实色，颜色归老师管。
