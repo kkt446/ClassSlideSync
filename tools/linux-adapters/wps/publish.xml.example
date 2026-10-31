@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WPS Linux JS 加载项注册文件示例。
+  复制到 ~/.local/share/Kingsoft/wps/jsaddons/publish.xml，
+  并把 /home/teacher 改成实际家目录；路径含空格/中文时做 URL 编码。
+  说明见同目录 README.md。这条路径没有在 WPS Linux 上实测过。
+-->
+<jsplugins>
+  <jspluginonline enable="enable_dev"
+                  type="wpp"
+                  name="ClassSlideSync"
+                  url="file:///home/teacher/.local/share/Kingsoft/wps/jsaddons/ClassSlideSync/" />
+</jsplugins>

@@ -1,4 +1,4 @@
-﻿# 课件续页
+# 课件续页
 
 **记住每份课件讲到第几页。下次打开同一份课件，点一下就从那一页接着讲。**
 
@@ -6,7 +6,18 @@
 
 ▶ 点开上图看演示（B 站，28 秒）
 
-支持 PowerPoint、WPS 演示、希沃白板 ｜ 需要 ClassIsland 2.1.0.1 及以上、Windows 10 及以上 ｜ 只在本地记，不联网
+支持 PowerPoint、WPS 演示、希沃白板 ｜ 需要 ClassIsland 2.1.0.1 及以上 ｜ Windows 10 及以上 / Linux x64 ｜ 只在本地记，不联网
+
+## 下载 ClassIsland
+
+本插件需要先装 ClassIsland。请从官方 Release 下载对应平台的**最新版 2.x**：
+
+| 平台 | 下载 |
+| --- | --- |
+| Windows（2.x 最新） | [ClassIsland Releases · latest](https://github.com/ClassIsland/ClassIsland/releases/latest) —— 选 `ClassIsland_app_windows_x64_full_folder.zip`（或 `selfContained` 版） |
+| Linux 通用版（2.x 最新） | [ClassIsland Releases · latest](https://github.com/ClassIsland/ClassIsland/releases/latest) —— 选 `ClassIsland_app_linux_x64_selfContained_folder.zip`，或直接装 `ClassIsland_app_linux_x64_selfContained_deb.deb` |
+
+> Linux 上插件用文件桥接读页码（`~/.local/share/classslidesync/current.json`），随包提供 LibreOffice Impress 与 WPS 两个适配器，见 `tools/linux-adapters/`。WPS Linux 的加载项目前只在 WPS 12.1.2 上验证到「被登记但不执行」，属实验性。
 
 ## 安装
 
@@ -80,6 +91,14 @@ ClassIsland 数据目录下：
 - 仅 Windows（ClassIsland 2.1.0.1 上开发测试）。
 
 ## 更新日志
+
+### 1.2.4.0（2026-10-31）
+
+- 新增 Linux 支持：ClassIsland 在 Linux 上现在会显示浮层卡片（Avalonia 绘制，版式与 Windows 一致），页码通过文件桥 `~/.local/share/classslidesync/current.json` 获取
+- 新增 LibreOffice Impress 适配器（UNO）：随包 `tools/linux-adapters/libreoffice/`，`slidesync_lo.py` 每轮把「第几页 / 共几页 / 是否放映」写进桥文件
+- Linux 上点卡片按钮会真的翻页：插件写 `command.json`，适配器执行 `gotoSlide`，实测放映第 7 页 → 点击 → 落到第 3 页
+- 新增 WPS Linux 加载项（实验性）：随包 `tools/linux-adapters/wps/`，WPS 12.1.2 能登记该加载项但不执行脚本，暂不可用
+- 修复若干 bug
 
 ### 1.2.3.0（2026-10-31）
 

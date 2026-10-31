@@ -28,7 +28,11 @@ namespace ClassSlideSync.Plugin.Services
         readonly string pluginConfigFolder;
         Ledger ledger;
         SessionEngine engine;
-        NativeOverlayCard card;
+        // 卡片只通过 ICardSink 跟服务说话：Windows 上实现是 NativeOverlayCard（Win32+GDI），
+        // Linux 上实现是 LinuxCardWindow（Avalonia）。服务本身不认识这两个具体类型。
+        ICardSink card;
+        // Linux 卡片要单独留一个强类型引用（ApplyExternal / 推页码走它），Disarm 时成对释放。
+        LinuxCardWindow? linuxCard;
         // 控制面板是单实例：卡片上的齿轮再点一次只 Activate()，不开第二个窗口。
         // 窗口只在 Avalonia UI 线程上构造/显示（见 OnPanelRequested）。
         ControlPanel panel;
@@ -48,6 +52,16 @@ namespace ClassSlideSync.Plugin.Services
         volatile bool armed;      // 引擎与卡片存在
         System.Threading.Timer scheduler;
         System.Threading.Timer watchdog;
+        // Linux 页码源：只读 current.json 的 500ms 定时器。和 scheduler 完全分开 ——
+        // 它不读课表、不枚举进程、不建窗口，所以即使课表服务在 Linux 上不可用也不会互相拖累。
+        System.Threading.Timer? linuxTimer;
+        // Linux 定时器的重入闸：读文件偶尔会卡在 NFS/杀毒软件上，超过 500ms 时下一拍
+        // 会在另一条线程池线程叠进来。丢掉重叠的那一拍即可（500ms 后还有下一拍）。
+        int linuxTickBusy;
+        // 最近一次成功读到的页码快照；没数据时是 Ok=false 的空快照。任意线程可读。
+        volatile LinuxSlideRead linuxPage = LinuxSlideRead.Empty;
+        // 上一次通知/记日志的「文件|页|总数|放映态」，只在变化时抛事件，避免每 500ms 刷一次。
+        string lastLinuxKey = "";
         // 主题订阅要留得住句柄：用匿名 lambda 订阅、又不在 Stop() 里退订的话，
         // 插件被停用后 IThemeService 还攥着这个回调（服务对象活着、每次换主题还往
         // 已停止的插件里跑一趟），再 Start 一次就会挂上第二个。
@@ -103,13 +117,31 @@ namespace ClassSlideSync.Plugin.Services
 
         public SessionEngine Engine { get { return engine; } }
         public Ledger Ledger { get { return ledger; } }
-        public NativeOverlayCard Card { get { return card; } }
+        public ICardSink Card { get { return card; } }
 
         /// <summary>true = 引擎与卡片正在运行（上课前 1 分钟到下课后那段时间）。</summary>
         public bool Armed { get { return armed; } }
 
         /// <summary>最近一次进入待命的原因，设置页/日志用它解释"插件现在为什么开着"。</summary>
         public string ArmReason { get; private set; }
+
+        // ---- Linux 页码源（非 Windows）------------------------------------------
+        // Windows 上这些成员永远是空快照 / 不触发；Linux 上它们就是卡片的数据来源。
+
+        /// <summary>
+        /// 最近一次成功读到的 Linux 页码快照（任意线程可读，永不为 null）。
+        /// 适配器断开/数据过期后回到 Ok=false 的空快照，卡片应据此收起页码。
+        /// </summary>
+        public LinuxSlideRead LinuxPage { get { return linuxPage; } }
+
+        /// <summary>
+        /// 页码变化（在定时器线程上抛）。只在「换文件 / 换页 / 放映态变化 / 数据中断」时抛一次，
+        /// 同一页的 500ms 重复读不抛。订阅方必须自己吞异常 —— 这是线程池线程。
+        ///
+        /// 除了抛事件，<see cref="PublishLinuxPage"/> 还会在 Linux 上直接把快照推给
+        /// LinuxCardWindow.ApplyExternal（见 ArmLinux/PushLinuxPage）；事件留给设置页/测试订阅。
+        /// </summary>
+        public event Action<LinuxSlideRead>? LinuxPageChanged;
 
         // 卡片最后一次拿到的状态 = 老师此刻屏幕上看到的东西。
         // 点跳页时用它取“那一页”，而不是让引擎再去查一遍台账（见 OnJumpRequested）。
@@ -140,6 +172,14 @@ namespace ClassSlideSync.Plugin.Services
             if (started) return;
             started = true;
 
+            // Linux：只启动「读 current.json」的 500ms 定时器。不加载主题（会碰 Avalonia UI），
+            // 不读课表，不枚举进程，不建卡片/引擎 —— 那些在 Linux 上要么不存在，要么没有意义。
+            if (!PlatformGuard.IsWindows)
+            {
+                StartLinux();
+                return;
+            }
+
             // 台账与主题是常驻的：即使不待命，设置页也要能读到历史、看到主题。
             ledger = Ledger.Load(settings.DataFolder);
             ledger.Log("=== plugin start, data folder: " + ledger.Root);
@@ -161,6 +201,98 @@ namespace ClassSlideSync.Plugin.Services
             // 2 秒一次：老师刚打开 PPT/WPS，卡片要在两三秒内就冒出来（原来是 5 秒，显得像坏了）。
             // 这一跳只读课表 + 枚举进程名，不碰 COM、不建窗口。
             scheduler = new System.Threading.Timer(ScheduleTick, null, 300, 2000);
+        }
+
+        /// <summary>
+        /// Linux 启动路径：只做「台账 + 日志出口 + 500ms 读 current.json」。
+        /// 刻意不碰 Theme / ClassIslandTheme（Avalonia）、LessonClock、进程枚举、COM、窗口。
+        /// </summary>
+        void StartLinux()
+        {
+            ledger = Ledger.Load(settings.DataFolder);
+            ledger.Log("=== plugin start (linux), data folder: " + ledger.Root);
+            settings.LogSink = m => { try { ledger.Log(m); } catch { } };
+            // 页码源的日志（过期、坏 JSON、适配器没跑）都写进同一个 app.log，老师发日志时只看一份。
+            LinuxSlideSource.LogSink = m => { try { ledger.Log(m); } catch { } };
+
+            // 幂等：Plugin.Initialize 已经调过一次，这里兜住「有人直接 new 服务再 Start」的场景。
+            LinuxSlideSource.Maintain();
+            ledger.Log("linux source: watching " + LinuxSlideSource.CurrentJsonPath
+                + " every 500ms (stale after " + LinuxSlideSource.StaleSeconds + "s)");
+
+            // 立即读一次（0ms），老师打开插件就能看到当前页，不用等半秒。
+            linuxTimer = new System.Threading.Timer(LinuxTick, null, 0, 500);
+        }
+
+        /// <summary>
+        /// 500ms 一拍：读文件 → 变了才记日志/抛事件。整拍包在 try/catch 里，
+        /// 线程池上的未处理异常会杀进程，页码源绝不能有这个能力。
+        /// </summary>
+        void LinuxTick(object state)
+        {
+            if (Interlocked.Exchange(ref linuxTickBusy, 1) == 1) return;
+            try
+            {
+                if (!started) return;
+
+                LinuxSlideRead read;
+                if (!LinuxSlideSource.TryReadDetailed(out read))
+                {
+                    // 从「有数据」掉到「没数据」只通知一次，避免每 500ms 抛一条空快照。
+                    if (linuxPage.Ok)
+                    {
+                        linuxPage = LinuxSlideRead.Empty;
+                        lastLinuxKey = "";
+                        try { ledger?.Log("linux source: 数据中断（文件不存在/过期/坏 JSON），卡片回到「无页码」"); }
+                        catch { }
+                        PublishLinuxPage(LinuxSlideRead.Empty);
+                    }
+                    return;
+                }
+
+                linuxPage = read;
+                string key = read.File + "|" + read.Page + "|" + read.Total + "|" + (read.Showing ? "1" : "0");
+                if (key == lastLinuxKey) return;
+                lastLinuxKey = key;
+
+                try { ledger?.Log("linux source: " + read.Describe()); } catch { }
+                PublishLinuxPage(read);
+            }
+            catch (Exception ex)
+            {
+                try { ledger?.Log("linux source tick failed: " + ex.GetType().Name + " " + ex.Message); } catch { }
+            }
+            finally
+            {
+                Interlocked.Exchange(ref linuxTickBusy, 0);
+            }
+        }
+
+        void PublishLinuxPage(LinuxSlideRead read)
+        {
+            var handler = LinuxPageChanged;
+            if (handler != null)
+            {
+                try { handler(read); }
+                catch (Exception ex)
+                {
+                    // 订阅方（卡片）出错不能把定时器带下去。
+                    try { ledger?.Log("linux source event failed: " + ex.Message); } catch { }
+                }
+            }
+
+            // Linux 卡片的数据只从这条线来：读到页码就 Arm（建 Avalonia 卡片），
+            // 数据中断就推一帧空快照（卡片回到「无页码」，但窗口留着等下一次放映）。
+            if (PlatformGuard.IsWindows) return;
+            try
+            {
+                if (read.Ok && started && !armed) Arm("Linux 页码源：检测到放映");
+                PushLinuxPage(read);
+            }
+            catch (Exception ex)
+            {
+                try { ledger?.Log("linux card push failed: " + ex.Message); } catch { }
+            }
         }
 
         // 调度器重入闸：Timer 是周期性的（2 s 一次），某一跳超过 2 s 时下一个回调会
@@ -691,7 +823,9 @@ namespace ClassSlideSync.Plugin.Services
             // 正常路径上 Plugin.cs 的平台闸门会让服务根本不注册，这里兜的是「有人绕过闸门
             // 直接调 Arm」—— 记一行日志就返回，绝不 new NativeOverlayCard / SessionEngine。
             // Windows 上这个分支恒不成立，下面每一行都和改动前一样。
-            if (!PlatformGuard.IsWindows) { PlatformGuard.Announce("slide-sync:arm", ledger.Log); return; }
+            // 平台分支（要求 4）：Linux 上没有 Win32 卡片窗口、没有 COM 引擎，但有一张 Avalonia
+            // 卡片要建（数据来自 Core/LinuxSlideSource.cs 的 current.json）。Windows 分支原样保留。
+            if (!PlatformGuard.IsWindows) { ArmLinux(reason); return; }
             // Stop() 之后任何一拍都不许再建窗口：调度器可能正跑到一半（Stop 不会等它），
             // 建出来的卡片没人收，宿主退出时就会留一个孤儿窗口。
             if (!started) return;
@@ -787,12 +921,234 @@ namespace ClassSlideSync.Plugin.Services
             return c;
         }
 
+        // ---- Linux 待命 ----------------------------------------------------------
+        // Linux 上没有 COM、没有演示软件检测、没有 SessionEngine（另一位同事在做页码来源）。
+        // 这里的「待命」只做一件事：把 Avalonia 卡片建出来，之后每 500ms 由 PublishLinuxPage
+        // 把 current.json 里的页码推进去。Windows 的 Arm 一行没动。
+
+        /// <summary>Linux 待命：只建 Avalonia 卡片，不建引擎/看门狗/调度器。</summary>
+        void ArmLinux(string reason)
+        {
+            if (armed) return;
+            if (!started) return;
+            armed = true;
+            ArmReason = reason;
+            try { ledger?.Log("arm: " + reason); } catch { }
+
+            LinuxCardWindow c;
+            try
+            {
+                c = BuildLinuxCard();
+            }
+            catch (Exception ex)
+            {
+                // 与 Windows 同样：建卡片失败绝不能留下 armed=true，否则这一轮永远不会再 Arm。
+                armed = false;
+                try { ledger?.Log("arm failed: 建 Linux 卡片失败：" + ex.GetType().Name + " " + ex.Message); } catch { }
+                return;
+            }
+
+            card = c;
+            linuxCard = c;
+            LinuxPageChanged += OnLinuxPageChanged;
+
+            // 可能已经有页码了（Arm 就是被 PublishLinuxPage 触发的），立刻补一帧。
+            PushLinuxPage(linuxPage);
+            try { ledger?.Log("linux card: armed, waiting for " + LinuxSlideSource.CurrentJsonPath); } catch { }
+
+            System.Threading.Tasks.Task.Run(async () =>
+            {
+                await System.Threading.Tasks.Task.Delay(1500);
+                try { ledger?.Log("overlay: " + c.Diag()); } catch { }
+            });
+        }
+
+        LinuxCardWindow BuildLinuxCard()
+        {
+            var look = Appearance;
+            if (look == null) look = CardAppearance.Resolve(settings, null);
+            Appearance = look;
+
+            var c = new LinuxCardWindow();
+            c.Configure(look, settings.AutoShowOverlay, settings.AutoHide, settings.AutoHideSeconds, settings.EnableControlPanel);
+            c.JumpRequested += OnLinuxJumpRequested;      // 兜底：还没读到页码时按钮仍给一句提示
+            c.JumpRequestedPage += OnLinuxJumpPageRequested; // 主路径：带页码 → 写 command.json
+            c.PositionChanged += OnPositionChanged;    // 拖完记住位置，和 Windows 共用同一条设置回写
+            c.PanelRequested += OnPanelRequested;      // 右上角齿轮 → 控制面板（只读台账）
+            c.Log = m => { try { ledger?.Log("card: " + m); } catch { } };
+            c.Start();
+            return c;
+        }
+
+        /// <summary>把一份页码快照推给 Linux 卡片（空快照 = 回到「无页码」）。</summary>
+        void PushLinuxPage(LinuxSlideRead read)
+        {
+            var c = linuxCard;
+            if (c == null) return;
+            if (read == null || !read.Ok)
+            {
+                c.ApplyExternal("", 0, 0, false);
+                return;
+            }
+
+            string name = "";
+            try { name = System.IO.Path.GetFileNameWithoutExtension(read.File ?? ""); } catch { }
+            if (string.IsNullOrEmpty(name)) name = read.File ?? "";
+            c.ApplyExternal(name, read.Page, read.Total, read.Showing);
+        }
+
+        void OnLinuxPageChanged(LinuxSlideRead read)
+        {
+            try { PushLinuxPage(read); }
+            catch (Exception ex) { try { ledger?.Log("linux card push failed: " + ex.Message); } catch { } }
+        }
+
+        /// <summary>
+        /// Linux 跳页的统一入口。不管请求来自卡片按钮、历史面板，还是主界面上的
+        /// 「立即跳转」，都只做一件事：把目标页写进同目录的 command.json，交给
+        /// 适配器去调用演示软件自己的跳页 API（LibreOffice 走 UNO ctrl.gotoSlide，
+        /// WPS 走 View.GotoSlide）。
+        ///
+        /// 插件不直接连 UNO，也不写 current.json —— 那个文件归适配器，两条通道
+        /// 各自只写一头，读的一头永远读别人写的文件。
+        /// </summary>
+        /// <param name="page">目标页，从 1 起；&lt;=0 表示「就跳现在这页」（面板「继续」）。</param>
+        /// <param name="filePath">调用方指定的课件路径；Linux 上只允许跳正在放映的那份。</param>
+        void LinuxJump(int page, string filePath, bool fromPanel)
+        {
+            var c = linuxCard;
+            var p = panel;
+            try
+            {
+                var read = linuxPage;
+                if (read == null || !read.Ok)
+                {
+                    try { c?.ShowStatus("还没读到页码"); } catch { }
+                    try { if (fromPanel) p?.ShowStatus("还没读到页码：先让放映软件跑起来"); } catch { }
+                    try
+                    {
+                        ledger?.Log("linux jump: 还没读到页码，忽略"
+                            + (page > 0 ? ("（请求第 " + page + " 页）") : ""));
+                    }
+                    catch { }
+                    return;
+                }
+
+                if (page <= 0) page = read.Page;
+                if (page <= 0)
+                {
+                    try { c?.ShowStatus("还没读到页码"); } catch { }
+                    return;
+                }
+                // 越界不放大：适配器那边也会检查 1..total，这里先夹一下，
+                // 免得写一条注定被拒的命令、老师却看到「正在跳…」。
+                if (read.Total > 0 && page > read.Total) page = read.Total;
+
+                if (!string.IsNullOrEmpty(filePath))
+                {
+                    // Linux 的适配器只认「当前窗口里那份演示文稿」，换课件得老师自己打开；
+                    // 硬点另一份的历史只会给出一句看不懂的失败，所以这里明确拒绝。
+                    string want = "";
+                    string have = "";
+                    try { want = System.IO.Path.GetFileName(filePath ?? "") ?? ""; } catch { }
+                    try { have = System.IO.Path.GetFileName(read.File ?? "") ?? ""; } catch { }
+                    if (want.Length > 0 && have.Length > 0
+                        && !string.Equals(want, have, StringComparison.OrdinalIgnoreCase))
+                    {
+                        try { c?.ShowStatus("Linux 上只能跳当前放映的课件"); } catch { }
+                        try { if (fromPanel) p?.ShowStatus("Linux 上只能跳当前放映的课件（" + have + "）"); } catch { }
+                        try { ledger?.Log("linux jump: 拒绝跨课件跳页 " + want + " -> " + have); } catch { }
+                        return;
+                    }
+                }
+
+                string error;
+                bool ok = LinuxSlideSource.TryWriteCommand(page, out error);
+                if (ok)
+                {
+                    try { c?.ShowStatus("正在跳到第 " + page + " 页…"); } catch { }
+                    try { ledger?.Log("linux jump: 已下发第 " + page + " 页"); } catch { }
+                }
+                else
+                {
+                    // 写不进去（目录不可写、磁盘满）：状态行保留原因，日志也留一份，
+                    // 老师看到的是「下发失败：…」，不是静默无反应。
+                    try { c?.ShowStatus("下发失败：" + error); } catch { }
+                    try { if (fromPanel) p?.ShowStatus("下发失败：" + error); } catch { }
+                    try { ledger?.Log("linux jump: 下发失败（" + error + "）"); } catch { }
+                }
+            }
+            catch (Exception ex)
+            {
+                try { ledger?.Log("linux jump failed: " + ex.Message); } catch { }
+            }
+        }
+
+        /// <summary>参数less 的接口事件：只在卡片还没读到页码时才会走到（卡片自己兜底）。</summary>
+        void OnLinuxJumpRequested()
+        {
+            var read = linuxPage;
+            LinuxJump(read != null && read.Ok ? read.Page : 0, null, false);
+        }
+
+        /// <summary>卡片按钮带页码的请求：这是 Linux 跳页的主路径。</summary>
+        void OnLinuxJumpPageRequested(int page)
+        {
+            LinuxJump(page, null, false);
+        }
+
+        /// <summary>Linux 退待命：与 Disarm 对称，只拆 Avalonia 卡片（没有引擎/看门狗）。</summary>
+        void DisarmLinux(string reason)
+        {
+            if (!armed) return;
+            armed = false;
+            try { ledger?.Log("disarm: " + reason); } catch { }
+
+            try { LinuxPageChanged -= OnLinuxPageChanged; } catch { }
+
+            var c = linuxCard;
+            linuxCard = null;
+            card = null!;
+            engine = null;
+
+            // 与 Windows 一样主动发一条空快照：主界面组件/触发器不该停在最后一帧。
+            PublishProgress(new CardState
+            {
+                DeckOpen = false,
+                Showing = false,
+                Current = 0,
+                SlideCount = 0,
+            });
+
+            if (c != null)
+            {
+                try { c.JumpRequested -= OnLinuxJumpRequested; } catch { }
+                try { c.JumpRequestedPage -= OnLinuxJumpPageRequested; } catch { }
+                try { c.PositionChanged -= OnPositionChanged; } catch { }
+                try { c.PanelRequested -= OnPanelRequested; } catch { }
+                try { c.Dispose(); } catch { }
+            }
+
+            var p = panel;
+            panel = null;
+            if (p != null)
+            {
+                try { p.JumpRequested -= OnPanelJumpRequested; } catch { }
+                try { Avalonia.Threading.Dispatcher.UIThread.Post(() => { try { p.Close(); } catch { } }); } catch { }
+            }
+
+            lastStatus = "";
+            try { ledger?.Log("disarmed -- Linux 卡片已释放"); } catch { }
+        }
+
         void Disarm(string reason)
         {
             if (!armed) return;
             // 平台护栏（要求 4）：与 Arm 同一道闸门。Linux 上 armed 永远不会是 true，
             // 这里只是「万一」的兜底：同样不进 NativeOverlayCard / 引擎的销毁路径。
-            if (!PlatformGuard.IsWindows) { PlatformGuard.Announce("slide-sync:disarm", ledger.Log); armed = false; engine = null; card = null!; return; }
+            // 平台分支（要求 4）：与 Arm 对称。Linux 上 armed 可能为 true（Avalonia 卡片活着），
+            // 走 DisarmLinux 释放卡片；Windows 分支原样保留。
+            if (!PlatformGuard.IsWindows) { DisarmLinux(reason); return; }
             armed = false;
             ledger.Log("disarm: " + reason);
 
@@ -1138,6 +1494,15 @@ namespace ClassSlideSync.Plugin.Services
         {
             try
             {
+                // 平台分支：Linux 上根本没有 engine（SessionEngine 是 Windows/COM 那条路），
+                // 所以必须放在 e == null 判断之前，否则永远只回「没在上课」。
+                // 目标页写进 command.json，适配器下一轮轮询就去调演示软件跳页。
+                if (!PlatformGuard.IsWindows)
+                {
+                    LinuxJump(slide, filePath, fromPanel);
+                    return;
+                }
+
                 var e = engine;
                 if (e == null)
                 {
@@ -1357,6 +1722,22 @@ namespace ClassSlideSync.Plugin.Services
         public void Stop()
         {
             started = false;
+
+            // Linux：只停读文件定时器、摘日志出口。没有主题订阅、没有 scheduler、没有卡片/引擎
+            // 需要销毁（StartLinux 从未创建它们）。
+            if (!PlatformGuard.IsWindows)
+            {
+                // 卡片可能还活着（ArmLinux 建过）——先和 Disarm 对称地释放，再停读文件定时器。
+                try { DisarmLinux("插件停止 / ClassIsland 退出"); } catch { }
+                try { linuxTimer?.Dispose(); } catch { }
+                linuxTimer = null;
+                linuxPage = LinuxSlideRead.Empty;
+                lastLinuxKey = "";
+                try { settings.LogSink = null!; } catch { }
+                try { LinuxSlideSource.LogSink = null; } catch { }
+                return;
+            }
+
             try { scheduler?.Dispose(); } catch { }
             scheduler = null;
 
@@ -1497,7 +1878,7 @@ namespace ClassSlideSync.Plugin.Services
                     if (!armed) return;
                     var c = card;
                     if (c == null || !c.IsCreated) return;
-                    c.HideForAutomation();
+                    c.Hide();
                     try { ledger?.Log("automation hide card: " + AutomationReason(reason, "自动化：隐藏悬浮卡片")); } catch { }
                 }
                 catch (Exception ex)

@@ -26,7 +26,7 @@ namespace ClassSlideSync.Plugin.Ui
     /// 2. A WS_EX_NOACTIVATE window never receives WM_TIMER. The auto-hide countdown therefore
     ///    runs on a background thread and wakes this window with PostMessage(WM_APP_HIDE).
     /// </summary>
-    public sealed class NativeOverlayCard : IDisposable
+    public sealed class NativeOverlayCard : IDisposable, ICardSink
     {
         const int WS_EX_NOACTIVATE = 0x08000000;
         const int WS_EX_TOOLWINDOW = 0x00000080;
@@ -285,33 +285,33 @@ namespace ClassSlideSync.Plugin.Ui
         }
 
         /// <summary>Raised on the overlay thread when the teacher clicks the page number.</summary>
-        public event Action JumpRequested;
+        public event Action? JumpRequested;
 
         /// <summary>
         /// 历史面板里点了一条记录（浮层线程）。参数是「哪份文件 + 要跳到的页码」；真正的
         /// COM / MCP 调用由服务转给引擎的工作线程，浮层线程不碰。
         /// 文件夹面板可以跨文件翻历史，所以文件必须跟着页码一起走。
         /// </summary>
-        public event Action<string, int> HistoryJumpRequested;
+        public event Action<string, int>? HistoryJumpRequested;
 
         /// <summary>
         /// 老师把卡片拖到新位置并松手时触发（浮层线程）：参数是"贴不贴右边"和竖直百分比。
         /// 宿主把这两个值写进设置，下次启动就从这个位置显示。
         /// </summary>
-        public event Action<bool, int> PositionChanged;
+        public event Action<bool, int>? PositionChanged;
 
         /// <summary>
         /// 点了右上角的齿轮（浮层线程）。服务收到后切到 Avalonia UI 线程打开控制面板：
         /// 卡片跑在自己的 Win32 线程上，不能在这里直接 new Window（会抛 Call from invalid thread）。
         /// </summary>
-        public event Action PanelRequested;
+        public event Action? PanelRequested;
 
         /// <summary>
         /// 课前预备态里点了「打开并接着讲」（或者整张预备态卡片）：参数是课件真实路径与上次停下
         /// 的页码（浮层线程）。打开文件交给服务走系统文件关联（Process.Start + UseShellExecute）——
         /// 那是外部课件，不是插件宿主导航，卡片线程不碰进程。
         /// </summary>
-        public event Action<string, int> OpenDeckRequested;
+        public event Action<string, int>? OpenDeckRequested;
 
         public void Start()
         {
@@ -584,6 +584,20 @@ namespace ClassSlideSync.Plugin.Ui
         public bool IsHidden
         {
             get { lock (gate) { return suppressShow; } }
+        }
+
+        // ---- ICardSink 的语义化别名 -------------------------------------------
+        // 服务只跟 ICardSink 说话；Windows 这边的 Show/Hide 就落在上面两个既有方法上，
+        // 绘制、消息循环、自动隐藏计时一行没动（Linux 卡片见 Ui/LinuxCardWindow.cs）。
+
+        void ICardSink.Show() { Expand(); }
+
+        void ICardSink.Hide() { HideForAutomation(); }
+
+        Action<string>? ICardSink.Log
+        {
+            get { return Log; }
+            set { Log = value ?? (_ => { }); }
         }
 
         void Wake(int msg)

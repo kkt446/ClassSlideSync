@@ -35,24 +35,59 @@ public class Plugin : PluginBase
     {
         // ===== 平台闸门（必须留在 Initialize 的第一行）=====
         // 主工程 TFM 是 net8.0，同一个 dll 在 Windows 和 Linux 上都会被 ClassIsland 原样加载
-        // （宿主不按 TFM/OS 过滤插件）。但本插件的功能全部长在 Windows 上：分层窗口
+        // （宿主不按 TFM/OS 过滤插件）。Windows 专属的部分仍然全部留在这个分支后面：分层窗口
         // （user32/gdi32）、COM（PowerPoint/WPS 的 ROT 与 IMessageFilter）、托盘气泡
         // （Shell_NotifyIconW）、操作中心横幅（Tools\ToastHelper 是 net8.0-windows10.0.19041.0
-        // 的 WinRT exe）。所以非 Windows 只做两件事：记一行日志、注册一个只读说明页，然后 return。
+        // 的 WinRT exe）。
         //
-        // 关键点：return 之前绝不注册卡片/组件/行动/规则/触发器/教程，也绝不 new
-        // SlideSyncService —— 于是 NativeOverlayCard / PptBridge / TrayNotifier 在 Linux 上
-        // 连构造都不会发生（这几类各自另有运行时护栏，见 stability-report-linux.txt）。
+        // 非 Windows 做三件事：记一行日志、注册一个只读说明页、启动 Linux 页码源
+        // （Core/LinuxSlideSource.cs，读适配器写的 ~/.local/share/classslidesync/current.json）。
+        // 仍然绝不注册卡片/组件/行动/规则/触发器/教程；SlideSyncService.Start() 在非 Windows 上
+        // 只起一个 500ms 的读文件定时器就 return，不建 NativeOverlayCard、不碰 COM/主题/调度器
+        // （见 StartLinux）。于是 PptBridge / TrayNotifier 在 Linux 上连构造都不会发生
+        //（这几类各自另有运行时护栏，见 stability-report-linux.txt / stability-report-linux-source.txt）。
         // Windows 上这个分支恒不成立，下面每一行都和改动前完全一样。
         if (!OperatingSystem.IsWindows())
         {
             // Ledger.Log 内部 CreateDirectory + try/catch，写不进去也不会抛。
             // 注意这里不调 PlatformGuard.Announce：闸门不是在「跳过」，而是 Linux 上唯一会走的路，
-            // 所以文案要说清楚「只注册了只读设置页」。
+            // 所以文案要说清楚「注册了只读设置页 + Linux 页码源」。
             new Ledger(PluginConfigFolder).Log(
-                "platform: non-windows — only the read-only settings page is registered; " +
-                "cards / components / automations / triggers / tutorial are skipped");
+                "platform: non-windows — read-only settings page + Linux page source (file bridge) " +
+                "are registered; cards / components / automations / triggers / tutorial are skipped");
             services.AddSettingsPage<PlatformUnavailablePage>();
+
+            // Linux 页码源：服务只读 current.json，不产生窗口。包在 try/catch 里 ——
+            // 配置读不出来不能让插件加载失败（否则连只读设置页都没了）。
+            try
+            {
+                DataFolder = PluginConfigFolder;
+                Settings = ConfigureFileHelper.LoadConfig<SyncSettings>(
+                    Path.Combine(PluginConfigFolder, "SyncSettings.json"));
+                Settings.DataFolder = DataFolder;
+                Service = new SlideSyncService(Settings, PluginConfigFolder);
+                services.AddSingleton(Settings);
+                services.AddSingleton(Service);
+
+                // 目录 + 中文协议说明：幂等，适配器安装时也会调，插件启动再兜一次。
+                LinuxSlideSource.Maintain();
+
+                // 与 Windows 分支同一个启动时机（宿主 AppStarted），而不是 Initialize 里 ——
+                // 那时 ClassIsland 的 IO/日志目录还没完全就绪。
+                AppBase.Current.AppStarted += (_, _) =>
+                {
+                    try { Service.Start(); }
+                    catch (Exception ex)
+                    {
+                        try { Service?.Ledger?.Log("linux source start failed: " + ex); } catch { }
+                    }
+                };
+            }
+            catch (Exception ex)
+            {
+                new Ledger(PluginConfigFolder).Log(
+                    "platform: linux page source wiring failed: " + ex.GetType().Name + " " + ex.Message);
+            }
             return;
         }
 

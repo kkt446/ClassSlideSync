@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WPS Linux 演示（WPP）功能区定义。
+  加载项目录里与 main.js 放在一起即可；WPS 会自动把本文件渲染成「课件页码」选项卡。
+  注意：这条路径没有在 WPS Linux 上实测过（见 README.md 的说明）。
+-->
+<customUI xmlns="http://schemas.microsoft.com/office/2006/01/customui" onLoad="ClassSlideSyncOnLoad">
+  <ribbon>
+    <tabs>
+      <tab id="ClassSlideSyncTab" label="课件页码">
+        <group id="ClassSlideSyncGroup" label="页码桥接">
+          <button id="ClassSlideSyncStartButton"
+                  label="开始同步"
+                  size="large"
+                  onAction="ClassSlideSyncStart"
+                  screentip="开始同步页码"
+                  supertip="每秒把当前演示文稿、第几页、共几页写入 ~/.local/share/classslidesync/current.json。" />
+          <button id="ClassSlideSyncStopButton"
+                  label="停止同步"
+                  size="large"
+                  onAction="ClassSlideSyncStop"
+                  screentip="停止同步页码"
+                  supertip="停止后 current.json 不再刷新，插件约 10 秒后判定过期并收起页码。" />
+          <button id="ClassSlideSyncOnceButton"
+                  label="立即写一次"
+                  size="large"
+                  onAction="ClassSlideSyncOnce"
+                  screentip="立即写一次"
+                  supertip="排障用：不必等定时器，马上刷新一次 current.json。" />
+        </group>
+      </tab>
+    </tabs>
+  </ribbon>
+</customUI>
