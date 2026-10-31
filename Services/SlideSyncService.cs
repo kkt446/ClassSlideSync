@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using Avalonia.Controls;
 using ClassIsland.Core;
 using ClassIsland.Core.Abstractions.Services;
@@ -61,6 +61,9 @@ namespace ClassSlideSync.Plugin.Services
         // 上一次替它开过课件文件夹的那节课（用户 2026-10-16 第 1 条）：同一节课只开一次，
         // 下课清零，下一节课再开。值就是课表读数（"第3节 09:40-10:20"）。
         string lastLessonKey = "";
+        // 2026-10-31 用户要求「打开时机可配置」：上课前 N 分钟 / 下课后 N 分钟两档的去重键
+        // （日期|档位|第几节|起止时间，见 SubjectFolderTiming.Evaluate）。键里带日期，第二天照开。
+        string subjectFolderMomentKey = "";
         // 2026-10-24 功能4：记住"刚才这一节是哪一科"，下课铃响时主讲科目可能已经变成下一节（或空）。
         bool wasInClass;
         string lastClassSubject = "";
@@ -71,6 +74,9 @@ namespace ClassSlideSync.Plugin.Services
         // 演示实例，第二个还会把第一个的放映顶掉。
         string lastOpenDeckPath = "";
         DateTime lastOpenDeckAt = DateTime.MinValue;
+        // 2026-10-31：面板「立即跳转」发出请求的时间。引擎在工作线程上验证完才给最终结果，
+        // 面板底部要跟着说一句（面板可能盖住卡片）；20 秒后自动作废，免得很久以后的状态误回填。
+        DateTime panelJumpAt = DateTime.MinValue;
         bool clockLogged;
         DateTime lastPrune = DateTime.MinValue;
         // 课表说了算、且现在不在正课时间里 → 卡片整体藏起来（下课就消失，用户 2026-10-13 要求）。
@@ -212,10 +218,18 @@ namespace ClassSlideSync.Plugin.Services
 
                 // 用户 2026-10-16 第 1 条：正课一开始就把这一科的课件文件夹打开（同一节课只开一次）。
                 // 值取课表读数（含节次与时间），下课铃一响 lessonKey 变空，下一节课重新开。
-                if (inClass && lessonKey.Length > 0 && lessonKey != lastLessonKey)
+                // 2026-10-31 用户要求「打开时机可配置」：默认档原样保留，另外两档走 TickSubjectFolderMoment。
+                if (settings.SubjectFolderMoment == SubjectFolderMoment.LessonStart)
                 {
-                    lastLessonKey = lessonKey;
-                    TryOpenSubjectFolder();
+                    if (inClass && lessonKey.Length > 0 && lessonKey != lastLessonKey)
+                    {
+                        lastLessonKey = lessonKey;
+                        TryOpenSubjectFolder();
+                    }
+                }
+                else
+                {
+                    TickSubjectFolderMoment();
                 }
 
                 // 2026-10-24 功能4：上课期间一直记住这一科，下课铃响的那一刻用它去台账里找这一节的记录。
@@ -515,14 +529,18 @@ namespace ClassSlideSync.Plugin.Services
             return best ?? bestAny;
         }
 
-        void TryOpenSubjectFolder()
+        /// <param name="subjectOverride">
+        /// 课前/课后两档自己算出来的科目名（课间里 <see cref="CurrentSubjectName"/> 是"课间"，不能用）。
+        /// 为空时还是老行为：问课表的当前科目。
+        /// </param>
+        void TryOpenSubjectFolder(string subjectOverride = null)
         {
             string subject = "";
             string folder = "";
             try
             {
                 if (!settings.AutoOpenSubjectFolder) return;
-                subject = CurrentSubjectName();
+                subject = string.IsNullOrWhiteSpace(subjectOverride) ? CurrentSubjectName() : subjectOverride.Trim();
                 if (subject.Length == 0) { ledger.Log("subject folder: 课表没给出科目名，跳过"); return; }
                 folder = settings.FindSubjectFolder(subject);
                 if (folder.Length == 0) { ledger.Log("subject folder: " + subject + " 没有配文件夹"); return; }
@@ -560,6 +578,94 @@ namespace ClassSlideSync.Plugin.Services
             }
         }
 
+        /// <summary>
+        /// 「上课前 N 分钟」/「下课后 N 分钟」两档的判定（2026-10-31 用户要求）。
+        /// 跟着 ScheduleTick 走（Start 里的 scheduler 现在是每 2 秒一拍，任务书里写的 50ms 与仓库实际不符），
+        /// 只算时间、不读窗口、不碰 COM，所以再密也不会拖慢别的。
+        /// 同一节课只开一次：<see cref="subjectFolderMomentKey"/> 记住上次开过的键，键里带日期（第二天照开）。
+        /// </summary>
+        void TickSubjectFolderMoment()
+        {
+            try
+            {
+                if (!settings.AutoOpenSubjectFolder) return;
+                var periods = ReadLessonPeriods();
+                if (periods.Count == 0) return;
+
+                var hit = SubjectFolderTiming.Evaluate(settings.SubjectFolderMoment, DateTime.Now, periods,
+                    settings.BeforeClassOpenMinutes, settings.AfterClassOpenMinutes);
+                if (!SubjectFolderTiming.ShouldFire(subjectFolderMomentKey, hit)) return;
+
+                // 先记账再开门：打开失败也只算这一节处理过，免得每 2 秒重试一次把日志刷满。
+                subjectFolderMomentKey = hit.Key;
+
+                // 课间里 CurrentSubject 是"课间"/空：课后用上课时记下的 lastClassSubject，
+                // 课前用课表里的下一节（NextClassSubject）。
+                string subject = hit.Moment == SubjectFolderMoment.AfterClass ? lastClassSubject : NextSubjectName();
+                if (subject == null) subject = "";
+
+                ledger?.Log("subject folder timing: " + hit.Reason
+                    + (subject.Length > 0 ? " · " + subject : " · 科目名未知"));
+                TryOpenSubjectFolder(subject);
+            }
+            catch (Exception ex)
+            {
+                try { ledger?.Log("subject folder timing failed: " + ex.Message); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// 把今天的课表读成「第几节 + 起止时间」，交给 <see cref="SubjectFolderTiming"/> 判时机。
+        /// 只收 TimeType == 0（上课）的项，和 <see cref="LessonClock"/> 的取法保持一致。
+        /// </summary>
+        List<LessonPeriod> ReadLessonPeriods()
+        {
+            var list = new List<LessonPeriod>();
+            try
+            {
+                var lessons = IAppHost.TryGetService<ILessonsService>();
+                if (lessons == null) return list;
+                Guid? guid;
+                var plan = lessons.GetClassPlanByDate(DateTime.Now, out guid);
+                if (plan == null) return list;
+                var items = plan.ValidTimeLayoutItems;
+                if (items == null || items.Count == 0) return list;
+
+                int index = 0;
+                foreach (var item in items)
+                {
+                    if (item == null) continue;
+                    // TimeLayoutItem.TimeType：0 = 上课，1 = 课间，2 = 分割线，3 = 行动。
+                    if (item.TimeType != 0) continue;
+                    index++;
+                    list.Add(new LessonPeriod(index, item.StartTime, item.EndTime));
+                }
+            }
+            catch (Exception ex)
+            {
+                try { ledger?.Log("subject folder timing: 课表读取失败 " + ex.Message); } catch { }
+            }
+            return list;
+        }
+
+        /// <summary>下一节是哪一科（「上课前 N 分钟」用；课间里问不了 CurrentSubject）。</summary>
+        string NextSubjectName()
+        {
+            try
+            {
+                var lessons = IAppHost.TryGetService<ILessonsService>();
+                var next = lessons == null ? null : lessons.NextClassSubject;
+                if (next == null) return "";
+                string name = next.Name;
+                return string.IsNullOrWhiteSpace(name) ? "" : name.Trim();
+            }
+            catch (Exception ex)
+            {
+                try { ledger?.Log("next subject read failed: " + ex.Message); } catch { }
+                return "";
+            }
+        }
+
         /// <summary>当前科目名（ClassIsland 课表里的"科目"，课间/没有课表时是空串）。</summary>
         string CurrentSubjectName()
         {
@@ -581,6 +687,11 @@ namespace ClassSlideSync.Plugin.Services
         void Arm(string reason)
         {
             if (armed) return;
+            // 平台护栏（要求 4）：非 Windows 上没有 Win32 卡片窗口、没有 COM 引擎。
+            // 正常路径上 Plugin.cs 的平台闸门会让服务根本不注册，这里兜的是「有人绕过闸门
+            // 直接调 Arm」—— 记一行日志就返回，绝不 new NativeOverlayCard / SessionEngine。
+            // Windows 上这个分支恒不成立，下面每一行都和改动前一样。
+            if (!PlatformGuard.IsWindows) { PlatformGuard.Announce("slide-sync:arm", ledger.Log); return; }
             // Stop() 之后任何一拍都不许再建窗口：调度器可能正跑到一半（Stop 不会等它），
             // 建出来的卡片没人收，宿主退出时就会留一个孤儿窗口。
             if (!started) return;
@@ -679,6 +790,9 @@ namespace ClassSlideSync.Plugin.Services
         void Disarm(string reason)
         {
             if (!armed) return;
+            // 平台护栏（要求 4）：与 Arm 同一道闸门。Linux 上 armed 永远不会是 true，
+            // 这里只是「万一」的兜底：同样不进 NativeOverlayCard / 引擎的销毁路径。
+            if (!PlatformGuard.IsWindows) { PlatformGuard.Announce("slide-sync:disarm", ledger.Log); armed = false; engine = null; card = null!; return; }
             armed = false;
             ledger.Log("disarm: " + reason);
 
@@ -946,7 +1060,8 @@ namespace ClassSlideSync.Plugin.Services
         void OnPanelJumpRequested(string filePath, int slide)
         {
             // 面板的“立即跳转”和卡片走同一条链：engine.RequestJumpTo(文件, 页码)。
-            RequestJump(filePath, slide);
+            // fromPanel=true 只控制“结果写回面板”和日志，不另开跳页通道。
+            RequestJump(filePath, slide, true);
         }
 
         /// <summary>
@@ -955,7 +1070,18 @@ namespace ClassSlideSync.Plugin.Services
         /// </summary>
         void OpenPanelFolder(string folder)
         {
-            if (string.IsNullOrWhiteSpace(folder)) return;
+            var p = panel;
+            if (string.IsNullOrWhiteSpace(folder))
+            {
+                if (p != null) p.ShowStatus("没有可打开的文件夹");
+                return;
+            }
+            if (!Directory.Exists(folder))
+            {
+                ledger?.Log("panel folder: missing " + folder);
+                if (p != null) p.ShowStatus("找不到这个文件夹，可能已被移动：" + folder);
+                return;
+            }
             try
             {
                 bool handed = false;
@@ -980,10 +1106,12 @@ namespace ClassSlideSync.Plugin.Services
                         new System.Diagnostics.ProcessStartInfo(folder) { UseShellExecute = true });
                 }
                 ledger?.Log("panel folder: opened " + folder);
+                if (p != null) p.ShowStatus("已打开文件夹：" + folder);
             }
             catch (Exception ex)
             {
                 try { ledger?.Log("panel folder failed: " + folder + " : " + ex.Message); } catch { }
+                if (p != null) p.ShowStatus("打开文件夹失败：" + ex.Message);
             }
         }
 
@@ -998,24 +1126,69 @@ namespace ClassSlideSync.Plugin.Services
 
         void RequestJump(string filePath, int slide)
         {
+            RequestJump(filePath, slide, false);
+        }
+
+        /// <summary>
+        /// 跳页的唯一出口。fromPanel=true 时把结果同步写回控制面板底部：
+        /// 未上课（engine == null）不再静默 return —— 2026-10-31 真机上老师点「立即跳转」
+        /// 什么反应都没有，根因就是这一句 `if (e == null) return;`。
+        /// </summary>
+        void RequestJump(string filePath, int slide, bool fromPanel)
+        {
             try
             {
                 var e = engine;
-                if (e == null) return;
+                if (e == null)
+                {
+                    string what = string.IsNullOrWhiteSpace(filePath) ? "(当前放映课件)" : filePath;
+                    if (fromPanel)
+                    {
+                        ledger?.Log("panel: jump -> " + what + " 第 " + slide
+                                    + " 页（未上课，引擎未启动）");
+                        var p0 = panel;
+                        if (p0 != null) p0.ShowStatus("现在没在上课，课件还没打开；开始上课后再点「立即跳转」");
+                    }
+                    var c0 = card;
+                    if (c0 != null) c0.ShowStatus("没在上课，先开始上课");
+                    return;
+                }
                 // slide > 0 = 历史面板选中的具体页；0 = 沿用原来的“上次停的那一页”。
-                if (slide > 0) e.RequestJumpTo(filePath, slide);
-                else e.RequestJump();
+                if (slide > 0)
+                {
+                    if (fromPanel)
+                    {
+                        panelJumpAt = DateTime.UtcNow;
+                        ledger?.Log("panel: jump -> " + (filePath ?? "") + " 第 "
+                                    + slide + " 页");
+                    }
+                    e.RequestJumpTo(filePath, slide);
+                }
+                else
+                {
+                    e.RequestJump();
+                }
                 // 这里不能报“已跳到第 N 页”：RequestJump 只是把请求丢给工作线程（见 SessionEngine），
                 // 此时 engine.Last 还是跳之前的页码，会印出“已跳转到第 1 页”这种假消息。真正的结果由
-                // 工作线程 SetStatus 推回来。
+                // 工作线程 SetStatus 推回来（面板由 OnStateChanged 里的 panelJumpAt 转发）。
                 var c = card;
                 if (c != null) c.ShowStatus("正在跳转…");
+                if (fromPanel)
+                {
+                    var p = panel;
+                    if (p != null) p.ShowStatus("正在跳转…");
+                }
             }
             catch (Exception ex)
             {
                 ledger?.Log("jump failed: " + ex.Message);
                 var c = card;
                 if (c != null) c.ShowStatus("跳转失败：" + ex.Message);
+                if (fromPanel)
+                {
+                    var p = panel;
+                    if (p != null) p.ShowStatus("跳转失败：" + ex.Message);
+                }
             }
         }
 
@@ -1026,6 +1199,24 @@ namespace ClassSlideSync.Plugin.Services
                 // 触发器「课件讲到第 N 页」的数据源。放在最前面：卡片被收起/被抑制时
                 // （下面那句 return）引擎其实还在报页码，触发器照样该知道讲到哪一页。
                 PublishProgress(st);
+
+                // 面板发起的跳页：引擎在工作线程上验证完才给最终结果（已跳到第 N 页 /
+                // 已从第 N 页开始放映 / 打不开 PowerPoint / 希沃那边的错误）。老师可能正看着
+                // 面板（面板会盖住卡片），底部状态条也要收到，否则还是“点了没反应”。
+                if (panelJumpAt != DateTime.MinValue)
+                {
+                    if ((DateTime.UtcNow - panelJumpAt).TotalSeconds > 20)
+                    {
+                        panelJumpAt = DateTime.MinValue;   // 过期作废，别把无关状态回填到面板
+                    }
+                    else if (!string.IsNullOrEmpty(st.Status) && st.Status != "正在跳转…")
+                    {
+                        panelJumpAt = DateTime.MinValue;
+                        var pj = panel;
+                        if (pj != null) pj.ShowStatus(st.Status);
+                        try { ledger?.Log("panel: jump result -> " + st.Status); } catch { }
+                    }
+                }
 
                 var c = card;
                 if (c == null) return;

@@ -336,3 +336,29 @@ public sealed class HexColorConverter : Avalonia.Data.Converters.IValueConverter
         return value as string ?? "#FFFFFFFF";
     }
 }
+
+/// <summary>
+/// 滑条上「出厂默认值」那根短线的定位（2026-10-31 任务B）。
+/// 用法：<c>Margin="{Binding Bounds.Width, ElementName=某滑条, Converter={StaticResource DefaultMark}, ConverterParameter='最小,最大,默认值'}"</c>。
+/// 绑定源是滑条自己的实际宽度 —— 窗口一拉宽，短线跟着换算，不是写死像素。
+/// 公式在 <see cref="DefaultMarkGeometry"/>（纯函数，离屏测试直接断言）。
+/// </summary>
+public sealed class DefaultMarkConverter : Avalonia.Data.Converters.IValueConverter
+{
+    public object? Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
+    {
+        double width = value is double d ? d : (value is float f ? f : double.NaN);
+        double min, max, fallback;
+        if (!DefaultMarkGeometry.TryParseParameter(parameter as string, out min, out max, out fallback))
+        {
+            return new Avalonia.Thickness(0);
+        }
+        return new Avalonia.Thickness(DefaultMarkGeometry.Offset(width, min, max, fallback), 0, 0, 0);
+    }
+
+    public object? ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture)
+    {
+        // 刻度线是只读装饰，没有谁往回写。
+        throw new NotSupportedException();
+    }
+}

@@ -302,7 +302,7 @@ namespace ClassSlideSync.Plugin.Ui
             DetailPage.Text = PanelData.PageText(selectedPage);
             DetailTotal.Text = PanelData.TotalText(PanelData.TotalSlides(ledger, item));
             DetailLast.Text = PanelData.LastText(selectedPage);
-            JumpButton.IsEnabled = selectedPage > 0;
+            JumpButton.IsEnabled = true;   // 选中即允许点，页码缺失由 RequestJump 给提示，不靠置灰装死
 
             var old = HistoryList.ItemsSource as List<PanelHistoryRow>;
             bool same = old != null && old.Count == history.Count;
@@ -470,8 +470,11 @@ namespace ClassSlideSync.Plugin.Ui
             DetailLast.Text = PanelData.LastText(selectedPage);
             HistoryList.ItemsSource = history;
             HistoryEmpty.IsVisible = history.Count == 0;
-            JumpButton.IsEnabled = selectedPage > 0;
-            OpenFolderButton.IsEnabled = !string.IsNullOrEmpty(item.Folder);
+            // 两个按钮一律可点：能不能跳、文件夹在不在，由点击后的提示说清楚。
+            // 以前这里按 selectedPage / item.Folder 置灰，老师点到灰按钮什么反应都没有，
+            // 和“按钮坏了”一模一样（2026-10-31 真机反馈）。
+            JumpButton.IsEnabled = true;
+            OpenFolderButton.IsEnabled = true;
             DetailPanel.IsVisible = true;
             EmptyPanel.IsVisible = false;
         }
@@ -669,6 +672,20 @@ namespace ClassSlideSync.Plugin.Ui
             hintShown = false;
             HintText.Text = text ?? "";
             HintText.IsVisible = !string.IsNullOrEmpty(HintText.Text);
+        }
+
+        /// <summary>
+        /// 服务把跳页/开文件夹的最终结果写回面板底部（引擎在工作线程上报“已跳到第 N 页”
+        /// 或“打不开 PowerPoint”）。可能从非 UI 线程调用，所以自己 Post 回 UI 线程。
+        /// </summary>
+        public void ShowStatus(string? text)
+        {
+            if (Dispatcher.UIThread.CheckAccess())
+            {
+                ShowHint(text);
+                return;
+            }
+            Dispatcher.UIThread.Post(() => ShowHint(text));
         }
 
         /// <summary>关于页：版本号读插件目录里的 manifest.yml，读不到就写“未知”。</summary>
@@ -924,7 +941,7 @@ namespace ClassSlideSync.Plugin.Ui
         int page = row.Slide;
         DetailPage.Text = PanelData.PageText(page);
         DetailLast.Text = PanelData.LastText(page);
-        JumpButton.IsEnabled = page > 0;
+        JumpButton.IsEnabled = true;   // 页码无效时由 RequestJump 给提示，不靠置灰装死
         RequestJump(row.FilePath, row.FilePath, page);
     }
 
@@ -945,17 +962,41 @@ namespace ClassSlideSync.Plugin.Ui
 
         void OnOpenFolderClick(object? sender, RoutedEventArgs e)
         {
-            var folder = selectedRow?.Item.Folder;
-            if (string.IsNullOrEmpty(folder)) return;
+            if (selectedRow == null)
+            {
+                ShowHint("先在左边选一份课件");
+                return;
+            }
+            string path = selectedRow.Item.FilePath ?? "";
+            string name = selectedRow.Name;
+            // Item.Folder 是左栏给老师看的省略路径（"…\高一\课件"），不能当真实目录用：
+            // Directory.Exists 永远 false，点「打开文件夹」只会得到一句“文件夹不在了”。
+            string folder = RealFolderOf(path);
+            if (folder.Length == 0)
+            {
+                ShowHint(SeewoBridge.IsSeewoKey(path)
+                    ? "希沃课件没有本机文件夹，台账里只有课件名"
+                    : "这份课件没有可打开的文件夹：" + name);
+                return;
+            }
             if (!Directory.Exists(folder))
             {
-                // 台账记着的是一个早就被移走的目录：打开它只会弹系统错误框。
-                ShowHint("文件夹不在了，可能已被移动或删除：" + folder);
+                Log("open folder missing: " + folder);
+                ShowHint("找不到这份课件的文件夹，可能已被移动：" + folder);
+                return;
+            }
+            var handler = openFolder;
+            if (handler == null)
+            {
+                ShowHint("打开文件夹的通道没接上（插件服务还没就绪），关掉面板重开试试");
                 return;
             }
             try
             {
-                if (openFolder != null) openFolder(folder!);
+                // 真机上 app.log 就靠这一行定位：panel: open folder <目录>
+                Log("open folder " + folder);
+                ShowHint("正在打开文件夹…");
+                handler(folder);
             }
             catch (Exception ex)
             {
@@ -964,9 +1005,24 @@ namespace ClassSlideSync.Plugin.Ui
             }
         }
 
+        /// <summary>课件文件真正所在的目录；希沃伪键/只有文件名的旧记录没有目录，返回空串。</summary>
+        static string RealFolderOf(string? filePath)
+        {
+            if (string.IsNullOrWhiteSpace(filePath)) return "";
+            if (SeewoBridge.IsSeewoKey(filePath)) return "";
+            try
+            {
+                string? dir = Path.GetDirectoryName(filePath);
+                if (string.IsNullOrWhiteSpace(dir)) return "";
+                return Path.GetFullPath(dir);
+            }
+            catch { return ""; }
+        }
+
         /// <summary>
         /// 跳页的统一入口：右栏「立即跳转」和历史行点击都走这里，校验与提示只写一份。
         /// page &lt;= 0 表示这一条记录没记下停在哪一页，只提示不跳。
+        /// 希沃伪键不在面板拦下：交给引擎按 SeewoBridge.GotoSlide 走（见 SessionEngine.DoJump）。
         /// </summary>
         void RequestJump(string path, string name, int page)
         {
@@ -975,60 +1031,32 @@ namespace ClassSlideSync.Plugin.Ui
                 ShowHint("这条记录没记下停在哪一页，只能点「打开文件夹」自己找");
                 return;
             }
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                ShowHint("这条记录没留下课件路径：" + name);
+                return;
+            }
             var handler = JumpRequested;
-            if (handler == null) return;
-
-            if (path.StartsWith(SeewoBridge.KeyPrefix, StringComparison.Ordinal))
+            if (handler == null)
             {
-                ShowHint("这份是希沃白板课件，台账里只有课件名，没法自动跳页");
+                // 离线/服务还没起来时必须说话：以前这里直接 return，点了等于没点。
+                ShowHint("没接上跳页链路（插件服务还没就绪），关掉面板重开试试");
                 return;
             }
-            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
-            {
-                ShowHint("找不到课件文件了，可能已被移动或删除：" + name);
-                return;
-            }
-            try
-            {
-                handler(path, page);
-                ShowHint("已请求跳到第 " + page.ToString(CultureInfo.InvariantCulture) + " 页");
-                Log("jump requested: " + name + " -> " + page);
-            }
-            catch (Exception ex)
-            {
-                Log("jump failed: " + ex.Message);
-                ShowHint("跳页失败：" + ex.Message);
-            }
-        }
-
-        void OnJumpClick(object? sender, RoutedEventArgs e)
-        {
-            if (selectedRow == null || selectedPage <= 0) return;
-            var handler = JumpRequested;
-            if (handler == null) return;   // 离线验收/没接服务时没有可跳的链路
-
-            string path = selectedRow.Item.FilePath ?? "";
-            string name = selectedRow.Name;
-
-            // 希沃台账的键是「希沃:课件名」：没有磁盘文件、也没有 shellId。交给引擎只会在卡片上
-            // 挂一句“正在跳转…”然后什么都不会发生，面板不如直说。
-            if (path.StartsWith(SeewoBridge.KeyPrefix, StringComparison.Ordinal))
-            {
-                ShowHint("这份是希沃白板课件，台账里只有课件名，没法自动跳页");
-                return;
-            }
-            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+            if (!SeewoBridge.IsSeewoKey(path) && !File.Exists(path))
             {
                 // 课件被移走/删掉了：引擎拿到一个不存在的路径只会静默失败，老师会以为是面板坏了。
-                ShowHint("找不到课件文件了，可能已被移动或删除：" + name);
+                ShowHint("找不到这份课件的文件（" + name + "），可能已被移动");
                 return;
             }
-
             try
             {
-                handler(path, selectedPage);
-                ShowHint("已请求跳到第 " + selectedPage.ToString(CultureInfo.InvariantCulture) + " 页");
-                Log("jump requested: " + name + " -> " + selectedPage);
+                // 真机上 app.log 就靠这一行定位：panel: jump -> <文件> 第 N 页
+                Log("jump -> " + path + " 第 " + page.ToString(CultureInfo.InvariantCulture) + " 页");
+                // 别说“已请求”：服务/引擎答不答应由它们回报（ControlPanel.ShowStatus），
+                // 未上课时引擎不存在，先报成功等于骗老师（2026-10-31 真机反馈）。
+                ShowHint("正在跳转…");
+                handler(path, page);
             }
             catch (Exception ex)
             {
@@ -1036,6 +1064,16 @@ namespace ClassSlideSync.Plugin.Ui
                 Log("jump failed: " + ex.Message);
                 ShowHint("跳页失败：" + ex.Message);
             }
+        }
+
+        void OnJumpClick(object? sender, RoutedEventArgs e)
+        {
+            if (selectedRow == null)
+            {
+                ShowHint("先在左边选一份课件");
+                return;
+            }
+            RequestJump(selectedRow.Item.FilePath ?? "", selectedRow.Name, selectedPage);
         }
 
         void OnWindowKeyDown(object? sender, KeyEventArgs e)

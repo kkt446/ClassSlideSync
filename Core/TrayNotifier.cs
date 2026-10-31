@@ -108,6 +108,10 @@ namespace ClassSlideSync.Plugin.Core
         /// </summary>
         internal static bool Show(string title, string text, int durationSeconds = 15)
         {
+            // 平台护栏（要求 4）：Shell_NotifyIconW / LoadIconW / CreateWindowExW 全是
+            // user32/shell32，非 Windows 上没有托盘，直接 false —— 调用方
+            // （SlideSyncService.MaybeNotifyClassEnd）拿到 false 后只记一行「系统不让弹」，不会抛。
+            if (!PlatformGuard.IsWindows) { PlatformGuard.Announce("tray-notifier:show"); return false; }
             if (string.IsNullOrWhiteSpace(text)) return false;
             int seconds = Math.Clamp(durationSeconds, 3, 120);
             int timeoutMs = seconds * 1000;

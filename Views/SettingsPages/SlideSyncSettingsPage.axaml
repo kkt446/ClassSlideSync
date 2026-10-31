@@ -1,4 +1,4 @@
-﻿<ci:SettingsPageBase x:Class="ClassSlideSync.Plugin.Views.SettingsPages.SlideSyncSettingsPage"
+<ci:SettingsPageBase x:Class="ClassSlideSync.Plugin.Views.SettingsPages.SlideSyncSettingsPage"
       xmlns="https://github.com/avaloniaui"
       xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
       xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
@@ -17,6 +17,7 @@
              转换器见同目录 SlideSyncSettingsPage.xaml.cs 里的 HexColorConverter
              （控制面板的设置页签也用它，同一份实现）。 -->
         <local:HexColorConverter x:Key="HexColor" />
+  <local:DefaultMarkConverter x:Key="DefaultMark" />
     </ci:SettingsPageBase.Resources>
 
     <!--
@@ -53,10 +54,17 @@
                                        Description="停手一段时间后卡片缩成屏幕边缘的一条标签，不挡课件。">
                 <controls:SettingsExpander.Footer>
                     <StackPanel Orientation="Horizontal" Spacing="10">
-                        <Slider Width="170" Minimum="5" Maximum="120" TickFrequency="5" IsSnapToTickEnabled="True"
-                                Classes="auto-tooltip" ci:SliderDragTooltipAssist.StringFormat="F0"
-                                VerticalAlignment="Center"
-                                Value="{Binding Settings.AutoHideSeconds, Mode=TwoWay}"/>
+                        <!-- 2026-10-31 任务B：滑条上叠一条 2px 短线标出「出厂默认值」（Avalonia 的 Slider 没有原生标记）。
+                             短线左边距绑的是滑条自己的 Bounds.Width，跟着窗口宽度和范围换算，不是写死像素。 -->
+                        <Grid VerticalAlignment="Center">
+                            <Slider x:Name="AutoHideSecondsSlider" Width="170" Minimum="5" Maximum="120" TickFrequency="5" IsSnapToTickEnabled="True"
+                                    Classes="auto-tooltip" ci:SliderDragTooltipAssist.StringFormat="F0"
+                                    VerticalAlignment="Center"
+                                    Value="{Binding Settings.AutoHideSeconds, Mode=TwoWay}"/>
+                            <Border Width="2" Height="10" HorizontalAlignment="Left" VerticalAlignment="Center" IsHitTestVisible="False"
+                                    Background="{DynamicResource AccentTextFillColorPrimaryBrush}"
+                                    Margin="{Binding Bounds.Width, ElementName=AutoHideSecondsSlider, Converter={StaticResource DefaultMark}, ConverterParameter='5,120,15'}"/>
+                        </Grid>
                         <ToggleSwitch VerticalAlignment="Center"
                                       IsChecked="{Binding Settings.AutoHide, Mode=TwoWay}"/>
                     </StackPanel>
@@ -199,6 +207,67 @@
                 </controls:SettingsExpander.Footer>
             </controls:SettingsExpander>
 
+            <!-- 2026-10-31 任务A：打开时机可配置。三档：上课开始时（默认）/上课前 N 分钟/下课后 N 分钟。
+                 下拉的选项来自 Settings.SubjectFolderMomentOptions（顺序 = 枚举值，所以 SelectedIndex 能直接双向绑）；
+                 默认那一项文字后面补一个强调色「（推荐）」，数据本身不改，见下面的 ItemTemplate。
+                 「上课前/下课后」两行只在对应档位出现，由 Settings.ShowBeforeClassOpenMinutes / ShowAfterClassOpenMinutes 控制。 -->
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE823;}"
+                                       Header="什么时候打开"
+                                       Description="「上课开始时」是出厂默认（推荐）——正课一打铃就打开。另外两档按当前时间与课表判定，同一节课只打开一次。"
+                                       IsVisible="{Binding Settings.AutoOpenSubjectFolder}">
+                <controls:SettingsExpander.Footer>
+                    <ComboBox x:Name="SubjectFolderMomentCombo"
+                              MinWidth="190"
+                              VerticalAlignment="Center"
+                              HorizontalContentAlignment="Left"
+                              ItemsSource="{Binding Settings.SubjectFolderMomentOptions}"
+                              SelectedIndex="{Binding Settings.SubjectFolderMomentIndex, Mode=TwoWay}">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="core:ChoiceOption">
+                                <StackPanel Orientation="Horizontal" Spacing="2">
+                                    <TextBlock Text="{Binding Label}" VerticalAlignment="Center"/>
+                                    <!-- 「（推荐）」用主题强调色（浅色主题下是蓝），只在默认项上出现。 -->
+                                    <TextBlock Text="（推荐）"
+                                               VerticalAlignment="Center"
+                                               IsVisible="{Binding IsDefault}"
+                                               Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}"/>
+                                </StackPanel>
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE823;}"
+                                       Header="上课前多少分钟"
+                                       Description="打铃前 N 分钟打开这一科的文件夹（0–30 分钟，默认 2）。到点只开一次。"
+                                       IsVisible="{Binding Settings.ShowBeforeClassOpenMinutes}">
+                <controls:SettingsExpander.Footer>
+                    <NumericUpDown Width="140"
+                                   VerticalAlignment="Center"
+                                   Minimum="0"
+                                   Maximum="30"
+                                   Increment="1"
+                                   FormatString="F0"
+                                   Value="{Binding Settings.BeforeClassOpenMinutes, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE823;}"
+                                       Header="下课后多少分钟"
+                                       Description="下课铃后 N 分钟打开这一节的文件夹（0–30 分钟，默认 2）。到点只开一次。"
+                                       IsVisible="{Binding Settings.ShowAfterClassOpenMinutes}">
+                <controls:SettingsExpander.Footer>
+                    <NumericUpDown Width="140"
+                                   VerticalAlignment="Center"
+                                   Minimum="0"
+                                   Maximum="30"
+                                   Increment="1"
+                                   FormatString="F0"
+                                   Value="{Binding Settings.AfterClassOpenMinutes, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
             <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE8B7;}"
                                        Header="各科目的文件夹"
                                        Description="科目名照 ClassIsland 课表里的写法（语文、数学、英语……）。遇到「劳动/英语」这种合写科目，斜杠两边任一匹配都算。"
@@ -281,10 +350,16 @@
                                        Header="不透明度"
                                        Description="100% = 与 ClassIsland 主界面一样透（跟随主题时）；太高挡课件，太低看不清字。">
                 <controls:SettingsExpander.Footer>
-                    <Slider Width="180" Minimum="20" Maximum="100" TickFrequency="5" IsSnapToTickEnabled="True"
-                            Classes="auto-tooltip" ci:SliderDragTooltipAssist.StringFormat="F0"
-                            VerticalAlignment="Center"
-                            Value="{Binding Settings.CardOpacityPercent, Mode=TwoWay}"/>
+                    <Grid VerticalAlignment="Center">
+                        <Slider x:Name="CardOpacitySlider" Width="180" Minimum="20" Maximum="100" TickFrequency="5" IsSnapToTickEnabled="True"
+                                Classes="auto-tooltip" ci:SliderDragTooltipAssist.StringFormat="F0"
+                                VerticalAlignment="Center"
+                                Value="{Binding Settings.CardOpacityPercent, Mode=TwoWay}"/>
+                        <!-- 默认 90%：Core\SyncSettings.cs 的 cardOpacityPercent -->
+                        <Border Width="2" Height="10" HorizontalAlignment="Left" VerticalAlignment="Center" IsHitTestVisible="False"
+                                Background="{DynamicResource AccentTextFillColorPrimaryBrush}"
+                                Margin="{Binding Bounds.Width, ElementName=CardOpacitySlider, Converter={StaticResource DefaultMark}, ConverterParameter='20,100,90'}"/>
+                    </Grid>
                 </controls:SettingsExpander.Footer>
             </controls:SettingsExpander>
 
@@ -293,10 +368,16 @@
                                        Description="0 = 直角，24 = 很圆；跟随主题时用 ClassIsland 的圆角设置。">
                 <controls:SettingsExpander.Footer>
                     <StackPanel Orientation="Horizontal" Spacing="10">
-                        <Slider Width="170" Minimum="0" Maximum="24" TickFrequency="1" IsSnapToTickEnabled="True"
-                                Classes="auto-tooltip" ci:SliderDragTooltipAssist.StringFormat="F0"
-                                VerticalAlignment="Center"
-                                Value="{Binding Appearance.CornerRadius, Mode=TwoWay}"/>
+                        <Grid VerticalAlignment="Center">
+                            <Slider x:Name="CornerRadiusSlider" Width="170" Minimum="0" Maximum="24" TickFrequency="1" IsSnapToTickEnabled="True"
+                                    Classes="auto-tooltip" ci:SliderDragTooltipAssist.StringFormat="F0"
+                                    VerticalAlignment="Center"
+                                    Value="{Binding Appearance.CornerRadius, Mode=TwoWay}"/>
+                            <!-- 默认 10：Core\Appearance.cs 的 a.Radius（CardCornerRadius < 0 时的实际生效值） -->
+                            <Border Width="2" Height="10" HorizontalAlignment="Left" VerticalAlignment="Center" IsHitTestVisible="False"
+                                    Background="{DynamicResource AccentTextFillColorPrimaryBrush}"
+                                    Margin="{Binding Bounds.Width, ElementName=CornerRadiusSlider, Converter={StaticResource DefaultMark}, ConverterParameter='0,24,10'}"/>
+                        </Grid>
                         <ToggleSwitch VerticalAlignment="Center" OnContent="自定义" OffContent="跟随"
                                       IsChecked="{Binding Appearance.CustomRadius, Mode=TwoWay}"/>
                     </StackPanel>
@@ -307,10 +388,16 @@
                                        Header="大小"
                                        Description="整张卡片的缩放倍数。">
                 <controls:SettingsExpander.Footer>
-                    <Slider Width="180" Minimum="0.6" Maximum="2" TickFrequency="0.05" IsSnapToTickEnabled="True"
-                            Classes="auto-tooltip" ci:SliderDragTooltipAssist.StringFormat="F2"
-                            VerticalAlignment="Center"
-                            Value="{Binding Settings.CardScale, Mode=TwoWay}"/>
+                    <Grid VerticalAlignment="Center">
+                        <Slider x:Name="CardScaleSlider" Width="180" Minimum="0.6" Maximum="2" TickFrequency="0.05" IsSnapToTickEnabled="True"
+                                Classes="auto-tooltip" ci:SliderDragTooltipAssist.StringFormat="F2"
+                                VerticalAlignment="Center"
+                                Value="{Binding Settings.CardScale, Mode=TwoWay}"/>
+                        <!-- 默认 1.00：Core\SyncSettings.cs 的 cardScale -->
+                        <Border Width="2" Height="10" HorizontalAlignment="Left" VerticalAlignment="Center" IsHitTestVisible="False"
+                                Background="{DynamicResource AccentTextFillColorPrimaryBrush}"
+                                Margin="{Binding Bounds.Width, ElementName=CardScaleSlider, Converter={StaticResource DefaultMark}, ConverterParameter='0.6,2,1'}"/>
+                    </Grid>
                 </controls:SettingsExpander.Footer>
             </controls:SettingsExpander>
 
@@ -318,10 +405,16 @@
                                        Header="字号微调"
                                        Description="在 ClassIsland 的字号基础上加减。">
                 <controls:SettingsExpander.Footer>
-                    <Slider Width="180" Minimum="-4" Maximum="12" TickFrequency="1" IsSnapToTickEnabled="True"
-                            Classes="auto-tooltip" ci:SliderDragTooltipAssist.StringFormat="F0"
-                            VerticalAlignment="Center"
-                            Value="{Binding Settings.CardFontSizeDelta, Mode=TwoWay}"/>
+                    <Grid VerticalAlignment="Center">
+                        <Slider x:Name="CardFontSizeSlider" Width="180" Minimum="-4" Maximum="12" TickFrequency="1" IsSnapToTickEnabled="True"
+                                Classes="auto-tooltip" ci:SliderDragTooltipAssist.StringFormat="F0"
+                                VerticalAlignment="Center"
+                                Value="{Binding Settings.CardFontSizeDelta, Mode=TwoWay}"/>
+                        <!-- 默认 0：Core\SyncSettings.cs 的 cardFontSizeDelta -->
+                        <Border Width="2" Height="10" HorizontalAlignment="Left" VerticalAlignment="Center" IsHitTestVisible="False"
+                                Background="{DynamicResource AccentTextFillColorPrimaryBrush}"
+                                Margin="{Binding Bounds.Width, ElementName=CardFontSizeSlider, Converter={StaticResource DefaultMark}, ConverterParameter='-4,12,0'}"/>
+                    </Grid>
                 </controls:SettingsExpander.Footer>
             </controls:SettingsExpander>
 
@@ -329,9 +422,22 @@
                                        Header="贴哪一边"
                                        Description="默认右边，和 ClassIsland 主界面同侧。">
                 <controls:SettingsExpander.Footer>
-                    <ComboBox SelectedIndex="{Binding Appearance.SideIndex, Mode=TwoWay}" HorizontalContentAlignment="Left">
-                        <ciControls:IconText Glyph="&#xE7C3;" Text="右边" />
-                        <ciControls:IconText Glyph="&#xE7C3;" Text="左边" />
+                    <!-- 2026-10-31 任务B：选项改为数据驱动（Settings.CardSideOptions），
+                         默认那一项（右边）后面补一个强调色「（推荐）」，数据本身不动。 -->
+                    <ComboBox MinWidth="120" HorizontalContentAlignment="Left"
+                              ItemsSource="{Binding Settings.CardSideOptions}"
+                              SelectedIndex="{Binding Appearance.SideIndex, Mode=TwoWay}">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="core:ChoiceOption">
+                                <StackPanel Orientation="Horizontal" Spacing="2">
+                                    <TextBlock Text="{Binding Label}" VerticalAlignment="Center"/>
+                                    <TextBlock Text="（推荐）"
+                                               VerticalAlignment="Center"
+                                               IsVisible="{Binding IsDefault}"
+                                               Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}"/>
+                                </StackPanel>
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
                     </ComboBox>
                 </controls:SettingsExpander.Footer>
             </controls:SettingsExpander>
@@ -340,10 +446,16 @@
                                        Header="垂直位置"
                                        Description="0 = 贴屏幕顶部，50 = 居中，100 = 贴底部。">
                 <controls:SettingsExpander.Footer>
-                    <Slider Width="180" Minimum="0" Maximum="100" TickFrequency="5" IsSnapToTickEnabled="True"
-                            Classes="auto-tooltip" ci:SliderDragTooltipAssist.StringFormat="F0"
-                            VerticalAlignment="Center"
-                            Value="{Binding Settings.CardVerticalPercent, Mode=TwoWay}"/>
+                    <Grid VerticalAlignment="Center">
+                        <Slider x:Name="CardVerticalSlider" Width="180" Minimum="0" Maximum="100" TickFrequency="5" IsSnapToTickEnabled="True"
+                                Classes="auto-tooltip" ci:SliderDragTooltipAssist.StringFormat="F0"
+                                VerticalAlignment="Center"
+                                Value="{Binding Settings.CardVerticalPercent, Mode=TwoWay}"/>
+                        <!-- 默认 50（居中）：Core\SyncSettings.cs 的 cardVerticalPercent -->
+                        <Border Width="2" Height="10" HorizontalAlignment="Left" VerticalAlignment="Center" IsHitTestVisible="False"
+                                Background="{DynamicResource AccentTextFillColorPrimaryBrush}"
+                                Margin="{Binding Bounds.Width, ElementName=CardVerticalSlider, Converter={StaticResource DefaultMark}, ConverterParameter='0,100,50'}"/>
+                    </Grid>
                 </controls:SettingsExpander.Footer>
             </controls:SettingsExpander>
 
@@ -351,10 +463,16 @@
                                        Header="收起标签宽度"
                                        Description="缩起来之后露在屏幕边缘的那一条有多宽（像素）。">
                 <controls:SettingsExpander.Footer>
-                    <Slider Width="180" Minimum="16" Maximum="96" TickFrequency="2" IsSnapToTickEnabled="True"
-                            Classes="auto-tooltip" ci:SliderDragTooltipAssist.StringFormat="F0"
-                            VerticalAlignment="Center"
-                            Value="{Binding Settings.CollapsedTabWidth, Mode=TwoWay}"/>
+                    <Grid VerticalAlignment="Center">
+                        <Slider x:Name="CollapsedTabWidthSlider" Width="180" Minimum="16" Maximum="96" TickFrequency="2" IsSnapToTickEnabled="True"
+                                Classes="auto-tooltip" ci:SliderDragTooltipAssist.StringFormat="F0"
+                                VerticalAlignment="Center"
+                                Value="{Binding Settings.CollapsedTabWidth, Mode=TwoWay}"/>
+                        <!-- 默认 32：Core\SyncSettings.cs 的 collapsedTabWidth -->
+                        <Border Width="2" Height="10" HorizontalAlignment="Left" VerticalAlignment="Center" IsHitTestVisible="False"
+                                Background="{DynamicResource AccentTextFillColorPrimaryBrush}"
+                                Margin="{Binding Bounds.Width, ElementName=CollapsedTabWidthSlider, Converter={StaticResource DefaultMark}, ConverterParameter='16,96,32'}"/>
+                    </Grid>
                 </controls:SettingsExpander.Footer>
             </controls:SettingsExpander>
 
@@ -375,9 +493,15 @@
                                        Header="收起药丸的透明度"
                                        Description="缩成药丸后这一条的透明程度（100% 完全不透明）。里面有两行页码，太透会看不清。">
                 <controls:SettingsExpander.Footer>
-                    <Slider Width="220" Minimum="30" Maximum="100" TickFrequency="5" IsSnapToTickEnabled="True"
-                            VerticalAlignment="Center"
-                            Value="{Binding Settings.CollapsedTabOpacityPercent, Mode=TwoWay}"/>
+                    <Grid VerticalAlignment="Center">
+                        <Slider x:Name="CollapsedTabOpacitySlider" Width="220" Minimum="30" Maximum="100" TickFrequency="5" IsSnapToTickEnabled="True"
+                                VerticalAlignment="Center"
+                                Value="{Binding Settings.CollapsedTabOpacityPercent, Mode=TwoWay}"/>
+                        <!-- 默认 80%：Core\SyncSettings.cs 的 collapsedTabOpacityPercent -->
+                        <Border Width="2" Height="10" HorizontalAlignment="Left" VerticalAlignment="Center" IsHitTestVisible="False"
+                                Background="{DynamicResource AccentTextFillColorPrimaryBrush}"
+                                Margin="{Binding Bounds.Width, ElementName=CollapsedTabOpacitySlider, Converter={StaticResource DefaultMark}, ConverterParameter='30,100,80'}"/>
+                    </Grid>
                 </controls:SettingsExpander.Footer>
             </controls:SettingsExpander>
 

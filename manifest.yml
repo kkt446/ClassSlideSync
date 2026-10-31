@@ -7,7 +7,7 @@ name: 课件续页
 description: 记录每份课件的讲授进度：下次打开同一份课件时，在屏幕边上显示"上次停在第几页"，点一下就从那一页接着放映。支持 PowerPoint 与 WPS 演示。
 entranceAssembly: "ClassSlideSync.Plugin.dll"
 url: https://github.com/KKT446/ClassSlideSync
-version: 1.2.2.0
+version: 1.2.3.0
 apiVersion: 2.0.0.0
 author: kkt446
 

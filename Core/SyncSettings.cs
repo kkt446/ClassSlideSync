@@ -1,7 +1,8 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Globalization;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Text.Json.Serialization;
@@ -74,6 +75,13 @@ namespace ClassSlideSync.Plugin.Core
         // ---- 学科课件文件夹（2026-10-16 用户第 1 条）----
         bool autoOpenSubjectFolder = true;
         ObservableCollection<SubjectFolder> subjectFolders = new ObservableCollection<SubjectFolder>();
+
+        // ---- 打开学科文件夹的时机（2026-10-31 用户要求可配置：原先只有"上课一开始"这一种）----
+        // 这三个字段的初始值就是界面上「（推荐）」标记和滑条默认刻度的唯一依据，
+        // 别在设置页/面板里再写一遍默认值，否则迟早对不上。
+        SubjectFolderMoment subjectFolderMoment = SubjectFolderMoment.LessonStart;
+        int beforeClassOpenMinutes = 2;
+        int afterClassOpenMinutes = 2;
 
         // ---- 每科的药丸进度条颜色（2026-10-25 用户第 9 条）----
         ObservableCollection<SubjectColor> subjectColors = new ObservableCollection<SubjectColor>();
@@ -412,8 +420,113 @@ namespace ClassSlideSync.Plugin.Core
         public bool AutoOpenSubjectFolder
         {
             get { return autoOpenSubjectFolder; }
-            set { Set(ref autoOpenSubjectFolder, value); }
+            set
+            {
+                Set(ref autoOpenSubjectFolder, value);
+                // 两行「N 分钟」数字框的可见性也跟着总开关走，换开关要通知一次。
+                Raise(nameof(ShowBeforeClassOpenMinutes));
+                Raise(nameof(ShowAfterClassOpenMinutes));
+            }
         }
+
+        /// <summary>
+        /// 什么时候打开学科课件文件夹（2026-10-31 用户要求可配置）。默认仍是
+        /// <see cref="SubjectFolderMoment.LessonStart"/>，也就是 1.2.2 之前「正课一开始打开」的老行为。
+        /// </summary>
+        public SubjectFolderMoment SubjectFolderMoment
+        {
+            get { return subjectFolderMoment; }
+            set
+            {
+                // 配置文件里可能有旧版本没见过的值：落回默认档，别让界面选中一个不存在的项。
+                if (!Enum.IsDefined(typeof(SubjectFolderMoment), value)) value = SubjectFolderMoment.LessonStart;
+                Set(ref subjectFolderMoment, value);
+                // 下拉框的 SelectedIndex、两行分钟数的可见性都挂在它身上，一次通知到位。
+                Raise(nameof(SubjectFolderMomentIndex));
+                Raise(nameof(ShowBeforeClassOpenMinutes));
+                Raise(nameof(ShowAfterClassOpenMinutes));
+            }
+        }
+
+        /// <summary>
+        /// 给 ComboBox 的 SelectedIndex 用。选项顺序与枚举值一一对应
+        /// （见 <see cref="SubjectFolderMomentOptions"/>），所以这里可以直接转 int。
+        /// </summary>
+        [JsonIgnore]
+        public int SubjectFolderMomentIndex
+        {
+            get { return (int)subjectFolderMoment; }
+            set
+            {
+                // ComboBox 在 ItemsSource 还没就位时会把选中项清成 -1 再回来；
+                // 这种"临时没选中"不该把用户选的档位冲掉，所以负数直接忽略。
+                if (value < 0) return;
+                SubjectFolderMoment = (SubjectFolderMoment)value;
+            }
+        }
+
+        /// <summary>「上课前 N 分钟」里的 N：0–30，默认 2。</summary>
+        public int BeforeClassOpenMinutes
+        {
+            get { return beforeClassOpenMinutes; }
+            set { Set(ref beforeClassOpenMinutes, Clamp(value, 0, SubjectFolderTiming.MaxOpenMinutes)); }
+        }
+
+        /// <summary>「下课后 N 分钟」里的 N：0–30，默认 2。</summary>
+        public int AfterClassOpenMinutes
+        {
+            get { return afterClassOpenMinutes; }
+            set { Set(ref afterClassOpenMinutes, Clamp(value, 0, SubjectFolderTiming.MaxOpenMinutes)); }
+        }
+
+        /// <summary>「上课前 N 分钟」那行数字框：只在对应档位、且总开关打开时出现。</summary>
+        [JsonIgnore]
+        public bool ShowBeforeClassOpenMinutes
+        {
+            get { return autoOpenSubjectFolder && subjectFolderMoment == SubjectFolderMoment.BeforeClass; }
+        }
+
+        /// <summary>「下课后 N 分钟」那行数字框的可见性，规则同上。</summary>
+        [JsonIgnore]
+        public bool ShowAfterClassOpenMinutes
+        {
+            get { return autoOpenSubjectFolder && subjectFolderMoment == SubjectFolderMoment.AfterClass; }
+        }
+
+        /// <summary>
+        /// 「什么时候打开」下拉的选项。顺序必须和 <see cref="SubjectFolderMoment"/> 一致
+        /// （SelectedIndex 直接当枚举值用）。默认项带 IsDefault，界面上补一个强调色「（推荐）」，
+        /// 数据本身不动 —— 只是显示层的一层包装，见两个设置界面的 ItemTemplate。
+        /// </summary>
+        [JsonIgnore]
+        public IReadOnlyList<ChoiceOption> SubjectFolderMomentOptions
+        {
+            get { return SubjectFolderMomentChoices; }
+        }
+
+        /// <summary>
+        /// 选项表本身是常量，所以缓存成静态的：ComboBox 每次读 ItemsSource 都拿到同一个实例，
+        /// 免得「换成新数组」把已经选中的那一项顶掉。
+        /// </summary>
+        static readonly ChoiceOption[] SubjectFolderMomentChoices =
+        {
+            new ChoiceOption("上课开始时", true),
+            new ChoiceOption("上课前 N 分钟", false),
+            new ChoiceOption("下课后 N 分钟", false),
+        };
+
+        /// <summary>「贴哪一边」下拉的选项：0 = 右边（出厂默认），1 = 左边。</summary>
+        [JsonIgnore]
+        public IReadOnlyList<ChoiceOption> CardSideOptions
+        {
+            get { return CardSideChoices; }
+        }
+
+        static readonly ChoiceOption[] CardSideChoices =
+        {
+            new ChoiceOption("右边", true),
+            new ChoiceOption("左边", false),
+        };
 
         /// <summary>科目 → 课件文件夹。设置页里可以直接增删改。</summary>
         // ---- 控制面板窗口几何（2026-10-24 老师要求"跟正常软件一样"）----
@@ -881,6 +994,250 @@ namespace ClassSlideSync.Plugin.Core
             field = value;
             var h = PropertyChanged;
             if (h != null) h(this, new PropertyChangedEventArgs(name));
+        }
+    }
+
+    /// <summary>
+    /// 打开学科课件文件夹的时机（2026-10-31 用户要求可配置）。
+    /// 值就是下拉框的顺序，别调：<see cref="SyncSettings.SubjectFolderMomentIndex"/> 直接拿它当 SelectedIndex。
+    /// </summary>
+    public enum SubjectFolderMoment
+    {
+        /// <summary>上课开始时：正课一开始就打开（默认，保持 1.2.2 之前的行为）。</summary>
+        LessonStart = 0,
+        /// <summary>上课前 N 分钟：打铃之前 N 分钟打开，同一节课只开一次。</summary>
+        BeforeClass = 1,
+        /// <summary>下课后 N 分钟：下课铃之后 N 分钟打开，同一节课只开一次。</summary>
+        AfterClass = 2,
+    }
+
+    /// <summary>
+    /// 下拉框里的一项：只负责显示（文字 + 是不是出厂默认）。默认值仍然由
+    /// <see cref="SyncSettings"/> 的字段初始值决定，这里不另存一份。
+    /// </summary>
+    public sealed class ChoiceOption
+    {
+        public ChoiceOption() { }
+
+        public ChoiceOption(string label, bool isDefault)
+        {
+            Label = label;
+            IsDefault = isDefault;
+        }
+
+        /// <summary>选项文字，例："上课开始时"。</summary>
+        public string Label { get; set; } = "";
+
+        /// <summary>true = 这一项是出厂默认值，界面上会在文字后面补一个强调色「（推荐）」。</summary>
+        public bool IsDefault { get; set; }
+    }
+
+    /// <summary>课表里的一节课：第几节（1 起）+ 起止时间。只给 <see cref="SubjectFolderTiming"/> 用。</summary>
+    public sealed class LessonPeriod
+    {
+        public LessonPeriod() { }
+
+        public LessonPeriod(int period, TimeSpan start, TimeSpan end)
+        {
+            Period = period;
+            Start = start;
+            End = end;
+        }
+
+        /// <summary>第几节，1 起（和课表读出顺序一致）。</summary>
+        public int Period { get; set; }
+
+        public TimeSpan Start { get; set; }
+
+        public TimeSpan End { get; set; }
+    }
+
+    /// <summary>一次「该不该打开文件夹」判定的结果。</summary>
+    public sealed class FolderMomentHit
+    {
+        /// <summary>true = 这一刻正好落在打开窗口里。</summary>
+        public bool Hit { get; set; }
+
+        /// <summary>命中的是哪一档。</summary>
+        public SubjectFolderMoment Moment { get; set; }
+
+        /// <summary>命中的是第几节（1 起）；没命中是 0。</summary>
+        public int Period { get; set; }
+
+        /// <summary>
+        /// 去重键：日期 + 档位 + 第几节 + 起止时间。同一节课同一个键，
+        /// 所以「同一节课只开一次」；键里带日期，第二天同一节课照样能开。
+        /// </summary>
+        public string Key { get; set; } = "";
+
+        /// <summary>写进 app.log 的中文说明，例："上课前 2 分钟 · 第3节 09:40 开始"。</summary>
+        public string Reason { get; set; } = "";
+    }
+
+    /// <summary>
+    /// 「什么时候打开学科课件文件夹」的时间判定（2026-10-31）。
+    /// 纯计算：不碰 ClassIsland、不自己读系统时间（<c>now</c> 由调用方给），
+    /// 所以离屏测试能把一天里的任意时刻直接喂进来。
+    /// </summary>
+    public static class SubjectFolderTiming
+    {
+        /// <summary>分钟数的上限，设置页 NumericUpDown 的 Maximum 也用这个（30）。</summary>
+        public const int MaxOpenMinutes = 30;
+
+        /// <summary>N = 0 时用的窗口长度：退化成"打铃那一刻之后的一分钟"，否则窗口是空的、永远不触发。</summary>
+        static readonly TimeSpan ZeroMinuteWindow = TimeSpan.FromMinutes(1);
+
+        /// <summary>
+        /// 判定 <paramref name="now"/> 这一刻该不该打开文件夹。
+        /// <list type="bullet">
+        /// <item>上课开始时：[start, end]（和原来"正课一开始"完全一致）。</item>
+        /// <item>上课前 N 分钟：N &gt; 0 时取 [start - N 分钟, start)，N = 0 时取 [start, start + 1 分钟)。</item>
+        /// <item>下课后 N 分钟：N &gt; 0 时取 (end, end + N 分钟]，N = 0 时取 (end, end + 1 分钟]。</item>
+        /// </list>
+        /// 窗口左闭右开/左开右闭是为了让相邻两节的窗口不重叠（上一节的下课窗口 vs 下一节的上课窗口）。
+        /// </summary>
+        public static FolderMomentHit Evaluate(SubjectFolderMoment moment, DateTime now,
+            IList<LessonPeriod> periods, int beforeMinutes, int afterMinutes)
+        {
+            var hit = new FolderMomentHit { Moment = moment };
+            if (periods == null || periods.Count == 0) return hit;
+
+            TimeSpan t = now.TimeOfDay;
+            string day = now.ToString("yyyy-MM-dd");
+            int n = moment == SubjectFolderMoment.BeforeClass ? beforeMinutes : afterMinutes;
+            if (n < 0) n = 0;
+            if (n > MaxOpenMinutes) n = MaxOpenMinutes;
+            TimeSpan window = TimeSpan.FromMinutes(n);
+
+            for (int i = 0; i < periods.Count; i++)
+            {
+                var p = periods[i];
+                if (p == null) continue;
+                switch (moment)
+                {
+                    case SubjectFolderMoment.LessonStart:
+                        if (t >= p.Start && t <= p.End)
+                        {
+                            return Make(hit, p, day, "start",
+                                "上课开始 · 第" + p.Period + "节 "
+                                + LessonWindow.Fmt(p.Start) + "-" + LessonWindow.Fmt(p.End));
+                        }
+                        break;
+
+                    case SubjectFolderMoment.BeforeClass:
+                    {
+                        TimeSpan lo = n == 0 ? p.Start : p.Start - window;
+                        TimeSpan hi = n == 0 ? p.Start + ZeroMinuteWindow : p.Start;
+                        if (t >= lo && t < hi)
+                        {
+                            return Make(hit, p, day, "before",
+                                (n == 0 ? "上课前 0 分钟（打铃那一刻）" : "上课前 " + n + " 分钟")
+                                + " · 第" + p.Period + "节 " + LessonWindow.Fmt(p.Start) + " 开始");
+                        }
+                        break;
+                    }
+
+                    case SubjectFolderMoment.AfterClass:
+                    {
+                        TimeSpan hi = n == 0 ? p.End + ZeroMinuteWindow : p.End + window;
+                        if (t > p.End && t <= hi)
+                        {
+                            return Make(hit, p, day, "after",
+                                (n == 0 ? "下课后 0 分钟（打铃那一刻）" : "下课后 " + n + " 分钟")
+                                + " · 第" + p.Period + "节 " + LessonWindow.Fmt(p.End) + " 下课");
+                        }
+                        break;
+                    }
+                }
+            }
+
+            return hit;
+        }
+
+        static FolderMomentHit Make(FolderMomentHit hit, LessonPeriod p, string day, string kind, string reason)
+        {
+            hit.Hit = true;
+            hit.Period = p.Period;
+            hit.Key = day + "|" + kind + "|" + p.Period + "|"
+                      + LessonWindow.Fmt(p.Start) + "-" + LessonWindow.Fmt(p.End);
+            hit.Reason = reason;
+            return hit;
+        }
+
+        /// <summary>
+        /// 「同一节课只打开一次」：键和上一次开过的键一样就不再触发。
+        /// 判定放在这里、而不是写在服务里，是为了离屏测试能直接断言（服务那边只是记一记 <c>lastKey</c>）。
+        /// </summary>
+        public static bool ShouldFire(string lastKey, FolderMomentHit hit)
+        {
+            return hit != null && hit.Hit && !string.IsNullOrEmpty(hit.Key) && !string.Equals(hit.Key, lastKey, StringComparison.Ordinal);
+        }
+    }
+
+    /// <summary>
+    /// 滑条上「出厂默认值在哪」那根短线的位置换算（2026-10-31 任务B）。
+    /// 纯数学、不碰 Avalonia：界面把滑条的实际宽度喂进来，得到短线的左边距。
+    /// 为什么要它：Avalonia 11 的 Slider 没有原生默认值标记，只能在同一个 Grid 里叠一条 2px 的 Border，
+    /// 而它落在哪儿必须同时跟着「滑条长度」「最小值/最大值」「当前宽度」换算 —— 换个窗口宽度还写死像素就偏了。
+    /// </summary>
+    public static class DefaultMarkGeometry
+    {
+        /// <summary>刻度线宽度（与两个界面里 Border 的 Width="2" 一致）。</summary>
+        public const double MarkWidth = 2;
+
+        /// <summary>滑块半径（Fluent 的拇指约 20px 宽），拇指中心走不到滑条两头，所以两端各留这么多。</summary>
+        public const double ThumbRadius = 10;
+
+        /// <summary>
+        /// 算出刻度线左边距：<c>inset + 百分比 * (宽度 - 2*inset) - 线宽/2</c>，
+        /// 再夹到 <c>[0, 宽度-线宽]</c>（宽度未知/太窄/范围非法时返回 0，不让界面炸）。
+        /// </summary>
+        public static double Offset(double width, double min, double max, double value)
+        {
+            if (double.IsNaN(width) || double.IsInfinity(width) || width <= 0) return 0;
+            if (double.IsNaN(min) || double.IsNaN(max) || double.IsInfinity(min) || double.IsInfinity(max)) return 0;
+            if (max <= min) return 0;
+            if (double.IsNaN(value)) value = min;
+
+            double fraction = (value - min) / (max - min);
+            if (fraction < 0) fraction = 0;
+            if (fraction > 1) fraction = 1;
+
+            double travel = width - 2 * ThumbRadius;
+            if (travel < 0) travel = 0;
+            double left = ThumbRadius + fraction * travel - MarkWidth / 2;
+
+            double maxLeft = width - MarkWidth;
+            if (maxLeft < 0) maxLeft = 0;
+            if (left < 0) left = 0;
+            if (left > maxLeft) left = maxLeft;
+            return left;
+        }
+
+        /// <summary>默认值在整条滑条上的百分比（0–100），写日志和报告时好读。</summary>
+        public static double Percent(double min, double max, double value)
+        {
+            if (max <= min) return 0;
+            double f = (value - min) / (max - min);
+            if (f < 0) f = 0;
+            if (f > 1) f = 1;
+            return f * 100;
+        }
+
+        /// <summary>把 "最小,最大,默认值" 这样的 ConverterParameter 拆成三个数；拆不动返回 false。</summary>
+        public static bool TryParseParameter(string? parameter, out double min, out double max, out double value)
+        {
+            min = 0;
+            max = 0;
+            value = 0;
+            if (string.IsNullOrWhiteSpace(parameter)) return false;
+            var parts = parameter!.Split(',');
+            if (parts.Length < 3) return false;
+            // 界面上的小数点可能是逗号（某些区域设置），这里只认点号，和 XAML 里写的保持一样。
+            if (!double.TryParse(parts[0].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out min)) return false;
+            if (!double.TryParse(parts[1].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out max)) return false;
+            if (!double.TryParse(parts[2].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out value)) return false;
+            return true;
         }
     }
 }

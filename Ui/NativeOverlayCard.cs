@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -278,7 +278,10 @@ namespace ClassSlideSync.Plugin.Ui
         {
             proc = WindowProc;
             thread = new Thread(Run) { IsBackground = true, Name = "ClassSlideSync-overlay" };
-            thread.SetApartmentState(ApartmentState.STA);
+            // 平台护栏：SetApartmentState 在非 Windows 上抛 PlatformNotSupportedException ——
+            // 也就是说 Linux 上「构造这张卡片」本身就会炸。这里只在 Windows 上设 STA；
+            // 真正的窗口创建由 Start() 拦住（非 Windows 不会走进那个线程）。
+            if (PlatformGuard.IsWindows) thread.SetApartmentState(ApartmentState.STA);
         }
 
         /// <summary>Raised on the overlay thread when the teacher clicks the page number.</summary>
@@ -310,7 +313,19 @@ namespace ClassSlideSync.Plugin.Ui
         /// </summary>
         public event Action<string, int> OpenDeckRequested;
 
-        public void Start() { thread.Start(); }
+        public void Start()
+        {
+            // 平台护栏（要求 4 的「NativeOverlayCard 的窗口创建」）：窗口、消息循环、
+            // GDI 绘制全部是 user32/gdi32。非 Windows 上一行都不做，只留一行日志 ——
+            // 卡片线程不启动，IsCreated 保持 false，Dispose 也就没有窗口可 Post。
+            if (!PlatformGuard.IsWindows)
+            {
+                lastError = "platform: skipped (non-windows) overlay-card";
+                PlatformGuard.Announce("overlay-card:start", m => Log?.Invoke(m));
+                return;
+            }
+            thread.Start();
+        }
 
         volatile string lastError = "";
 

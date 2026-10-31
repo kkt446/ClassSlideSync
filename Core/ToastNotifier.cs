@@ -63,6 +63,10 @@ namespace ClassSlideSync.Plugin.Core
         /// </summary>
         internal static void InstallOnce(string configFolder)
         {
+            // 平台护栏：横幅 helper 是 net8.0-windows10.0.19041.0 的 WinRT exe（Tools\ToastHelper），
+            // 非 Windows 上既编不出来也没有要登记的东西（HKCU AppUserModelId + 开始菜单快捷方式）。
+            // 直接跳过、一行日志，绝不启动任何进程；下课提醒退回托盘气泡/静默。
+            if (!PlatformGuard.IsWindows) { PlatformGuard.Announce("toast-helper:install", QuietLog); return; }
             try
             {
                 ResolvePaths(configFolder);
@@ -114,6 +118,8 @@ namespace ClassSlideSync.Plugin.Core
         /// </summary>
         internal static bool Show(string title, string body)
         {
+            // 平台护栏：跑的是 Windows 专属 exe，非 Windows 上直接 false（调用方退托盘气泡）。
+            if (!PlatformGuard.IsWindows) { PlatformGuard.Announce("toast-helper:show", QuietLog); return false; }
             if (string.IsNullOrWhiteSpace(body)) return false;
             if (!IsReady) return false;
             if (Volatile.Read(ref _failures) >= GiveUpAfterFailures) return false;

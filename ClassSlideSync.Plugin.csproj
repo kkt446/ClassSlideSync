@@ -1,7 +1,11 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
-        <TargetFramework>net8.0-windows</TargetFramework>
+        <!-- net8.0, NOT net8.0-windows：同一个 dll 要在 Windows 与 Linux 两端都能被 ClassIsland
+             加载（宿主不按 TFM/OS 过滤插件）。所有 Windows 专属能力都靠运行时
+             OperatingSystem.IsWindows() 判断，绝不用 #if WINDOWS 编译期裁剪，否则两端就不是同一份
+             二进制了。Windows 上的行为一行不变：宿主本身是 net8.0-windows，加载 net8.0 程序集完全合法。 -->
+        <TargetFramework>net8.0</TargetFramework>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
         <!-- Required for a plugin loaded into a host process: this is what emits the
@@ -72,9 +76,12 @@
         <ToastHelperSource Include="$(MSBuildProjectDirectory)\Tools\ToastHelper\*.cs;$(ToastHelperProject)" />
     </ItemGroup>
 
+    <!-- 只在 Windows 上构建/拷贝 helper：helper 是 net8.0-windows10.0.19041.0 的 WinRT exe，
+         Linux 的 dotnet 编不出来。Linux 上这两个 target 整体跳过，输出目录里就没有 ToastHelper\，
+         Core\ToastNotifier.cs 找不到 helper 会自己退回托盘气泡/静默，Pack-Cipx 也照常能打包。 -->
     <Target Name="BuildToastHelper"
             BeforeTargets="Build"
-            Condition="Exists('$(ToastHelperProject)')"
+            Condition="'$(OS)' == 'Windows_NT' And Exists('$(ToastHelperProject)')"
             Inputs="@(ToastHelperSource)"
             Outputs="$(OutDir)ToastHelper\ToastHelper.exe">
         <!-- 用 Exec 起一个子 dotnet，而不是 MSBuild 任务：MSBuild 任务会把主工程的全局属性
@@ -90,7 +97,7 @@
     <Target Name="CopyToastHelper"
             AfterTargets="Build"
             BeforeTargets="CreateCipx"
-            Condition="Exists('$(ToastHelperOut)\ToastHelper.exe')">
+            Condition="'$(OS)' == 'Windows_NT' And Exists('$(ToastHelperOut)\ToastHelper.exe')">
         <ItemGroup>
             <_ToastHelperFile Include="$(ToastHelperOut)\**\*" />
         </ItemGroup>
@@ -114,6 +121,7 @@
         <EmbeddedResource Remove="tools\**\*" />
         <None Remove="tools\**\obj\**" />
         <None Remove="tools\**\bin\**" />
+
     </ItemGroup>
 
 </Project>

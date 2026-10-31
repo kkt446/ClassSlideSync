@@ -375,6 +375,9 @@ namespace ClassSlideSync.Plugin.Core
         public void Start()
         {
             if (thread != null) return;
+            // 平台护栏（要求 4）：这个引擎线程干的全是 COM（PptBridge）和 Win32 窗口轮询。
+            // 非 Windows 上不起线程 —— Step() 里的 PptBridge.Connect 因此一次都不会被调用。
+            if (!PlatformGuard.IsWindows) { PlatformGuard.Announce("session-engine:start", ledger.Log); return; }
             LastStepUtc = DateTime.UtcNow;
             thread = new Thread(Loop) { IsBackground = true, Name = "ClassSlideSync-com" };
             thread.Start();
@@ -402,6 +405,10 @@ namespace ClassSlideSync.Plugin.Core
 
         void Step()
         {
+            // 平台护栏（要求 4 的「SessionEngine 的桥创建」）：Step 的每一步都在碰 COM 和
+            // 桌面窗口。非 Windows 上整个跳过 —— 桥永远不会被创建，PptBridge 一次都不会被调用。
+            // 正常路径上 Start() 已经拦住了线程，这里是双保险（就算有人直接调 Step 也不炸）。
+            if (!PlatformGuard.IsWindows) { PlatformGuard.Announce("session-engine:step", ledger.Log); return; }
             // 跳页请求必须最先处理。2026-10-13 实测的坑：老师点“从第 N 页开始放映”时 PowerPoint
             // 往往根本没开，而下面 bridge == null 的分支会直接 return，请求就永远轮不到执行——
             // 卡片停在“正在跳转…”，什么也不发生。DoJump 里会按需把 PowerPoint 拉起来。

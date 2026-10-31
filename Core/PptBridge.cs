@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -99,7 +99,7 @@ namespace ClassSlideSync.Plugin.Core
             void Reduce(object pmkToLeft, object pmkToRight, object pbc, int dwReduceHowFar, ref object ppmkToLeft, out IMoniker ppmkReduced);
             void ComposeWith(IMoniker pmkRight, bool fOnlyIfNotGeneric, out IMoniker ppmkComposite);
             void Enum(bool fForward, out IEnumMoniker ppenumMoniker);
-            void IsEqual(IMoniker pmkOtherMoniker);
+            void IsEqual(IMoniker pmkOtherMoniker);
             void IsRunning(object pbc, object pmkToLeft, object pmkNewlyRunning);
             void GetTimeOfLastChange(object pbc, object pmkToLeft, out System.Runtime.InteropServices.ComTypes.FILETIME pFileTime);
             void Inverse(out IMoniker ppmk);
@@ -195,6 +195,11 @@ namespace ClassSlideSync.Plugin.Core
 
         public static PptBridge Connect()
         {
+            // 平台护栏（纵深防御）：非 Windows 上根本没有 COM，Type.GetTypeFromProgID /
+            // GetActiveObject 都会抛。正常路径上 Plugin/SessionEngine 的闸门已经拦过了，
+            // 这一层保证的是「就算有人绕过闸门直接调 Connect，也只拿到 null、不抛」。
+            if (!PlatformGuard.IsWindows) { PlatformGuard.Announce("ppt-bridge:connect"); return null!; }
+
             if (TestOverride != null) return TestOverride;
             // 1) Preferred: walk the ROT and, if that fails, ask GetActiveObject for every ProgID.
             //    It finds Office and WPS without being told which is installed, and it never starts
@@ -376,6 +381,11 @@ namespace ClassSlideSync.Plugin.Core
         /// </summary>
         public static PptBridge Launch(string filePath)
         {
+            // 平台护栏：Launch 会 Type.GetTypeFromProgID + Activator.CreateInstance（COM），
+            // 非 Windows 上直接放弃 —— 返回 null，调用方（SessionEngine.DoJump）本来就有
+            // 「打不开 PowerPoint」的分支，不会抛。
+            if (!PlatformGuard.IsWindows) { PlatformGuard.Announce("ppt-bridge:launch"); return null!; }
+
             if (TestOverride != null) return TestOverride;
 
             // 也许只是刚启动、还没来得及进 ROT，先按常规路子找一遍。
@@ -581,6 +591,8 @@ namespace ClassSlideSync.Plugin.Core
         static bool TryFindBestInstance(out object com, out string moniker, out string progId, out bool fromRot)
         {
             com = null; moniker = null; progId = null; fromRot = false;
+            // 平台护栏：ROT（GetRunningObjectTable / moniker）是 Windows COM 的东西。
+            if (!PlatformGuard.IsWindows) { PlatformGuard.Announce("ppt-bridge:find-instance"); return false; }
             int best = 0;
 
             if (RotWalkEnabled)
@@ -684,6 +696,8 @@ namespace ClassSlideSync.Plugin.Core
         /// </summary>
         public static string DumpRot()
         {
+            // 平台护栏：纯诊断输出，非 Windows 直接给一句说明，不去碰 ROT。
+            if (!PlatformGuard.IsWindows) { PlatformGuard.Announce("ppt-bridge:dump-rot"); return "platform: skipped (non-windows) ppt-bridge:dump-rot"; }
             // ROT 遍历已关（见 RotWalkEnabled 的注释），这里只报状态，不再碰 moniker。
             if (!RotWalkEnabled) return "ROT walk disabled: moniker.GetDisplayName AVs on this machine (2026-10-24)";
             var sb = new StringBuilder();
@@ -1188,6 +1202,9 @@ namespace ClassSlideSync.Plugin.Core
 
         public void Dispose()
         {
+            // 平台护栏：FinalReleaseComObject 在非 Windows 上会抛（甚至 DllNotFound）。
+            // 这个桥在 Linux 上根本不该存在，这里只保证「就算存在，Dispose 也不炸」。
+            if (!PlatformGuard.IsWindows) { PlatformGuard.Announce("ppt-bridge:dispose"); return; }
             // 2026-10-16 用户第 5 条（上完课关 WPS 时直接卡死）：这里原来只释放了 Com。
             // keepAlive / keepAliveShow 这两个"防止 Office 顺手关掉自动化文档"的引用一直挂着，
             // 每丢一次桥就漏一组 RCW；而 WPS 退出时要等所有外部客户端放手，于是它自己关不掉。
@@ -1225,12 +1242,16 @@ namespace ClassSlideSync.Plugin.Core
 
         static void DropCandidate(object? o, object? keep)
         {
+            // 平台护栏：ReleaseComObject 只在 Windows 上有意义。
+            if (!PlatformGuard.IsWindows) { PlatformGuard.Announce("ppt-bridge:drop-candidate"); return; }
             if (o == null || ReferenceEquals(o, keep)) return;
             try { if (Marshal.IsComObject(o)) Marshal.ReleaseComObject(o); } catch { }
         }
 
         static void Release(ref object o)
         {
+            // 平台护栏：非 Windows 上不存在 RCW，直接摘掉引用即可（不给 marshaler 机会抛）。
+            if (!PlatformGuard.IsWindows) { PlatformGuard.Announce("ppt-bridge:release"); o = null!; return; }
             if (o == null) return;
             try { if (Marshal.IsComObject(o)) Marshal.FinalReleaseComObject(o); } catch { }
             o = null;
