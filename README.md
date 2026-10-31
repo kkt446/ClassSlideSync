@@ -1,4 +1,4 @@
-# 课件续页
+﻿# 课件续页
 
 **记住每份课件讲到第几页。下次打开同一份课件，点一下就从那一页接着讲。**
 
@@ -8,16 +8,16 @@
 
 支持 PowerPoint、WPS 演示、希沃白板 ｜ 需要 ClassIsland 2.1.0.1 及以上 ｜ Windows 10 及以上 / Linux x64 ｜ 只在本地记，不联网
 
-## 下载 ClassIsland
+## 下载插件
 
-本插件需要先装 ClassIsland。请从官方 Release 下载对应平台的**最新版 2.x**：
+直接下我们插件的安装包。Windows 和 Linux 用的是**同一个** `.cipx`，装好后导入 ClassIsland 即可：
 
 | 平台 | 下载 |
 | --- | --- |
-| Windows（2.x 最新） | [ClassIsland Releases · latest](https://github.com/ClassIsland/ClassIsland/releases/latest) —— 选 `ClassIsland_app_windows_x64_full_folder.zip`（或 `selfContained` 版） |
-| Linux 通用版（2.x 最新） | [ClassIsland Releases · latest](https://github.com/ClassIsland/ClassIsland/releases/latest) —— 选 `ClassIsland_app_linux_x64_selfContained_folder.zip`，或直接装 `ClassIsland_app_linux_x64_selfContained_deb.deb` |
+| Windows（ClassIsland 2.x） | [ClassSlideSync.Plugin.cipx · 最新版](https://github.com/KKT446/ClassSlideSync/releases/latest/download/ClassSlideSync.Plugin.cipx) |
+| Linux 通用版（ClassIsland 2.x） | [ClassSlideSync.Plugin.cipx · 最新版](https://github.com/KKT446/ClassSlideSync/releases/latest/download/ClassSlideSync.Plugin.cipx)（同一个包；Linux 上还要按 `tools/linux-adapters/` 装一个页码适配器） |
 
-> Linux 上插件用文件桥接读页码（`~/.local/share/classslidesync/current.json`），随包提供 LibreOffice Impress 与 WPS 两个适配器，见 `tools/linux-adapters/`。WPS Linux 的加载项目前只在 WPS 12.1.2 上验证到「被登记但不执行」，属实验性。
+> 还没装 ClassIsland 的话：去 [ClassIsland Releases · latest](https://github.com/ClassIsland/ClassIsland/releases/latest) 下 Windows 的 `ClassIsland_app_windows_x64_full_folder.zip`，或 Linux 的 `ClassIsland_app_linux_x64_selfContained_folder.zip`（也可以直接装 `ClassIsland_app_linux_x64_selfContained_deb.deb`）。
 
 ## 安装
 
@@ -88,7 +88,7 @@ ClassIsland 数据目录下：
 
 - 刚打开课件的一两秒里，WPS 的自动化接口还没就绪：卡片会先靠窗口标题认出课件、直接显示「上次停在第 N 页」，但**实时页码**要等接口就绪后才跟上。接口超过 4 秒不回话时，插件会暂停 6 秒再试（`app.log` 里记 `slow COM: …`），这段时间卡片不卡、只是页码不刷新。
 - 只跟踪 PowerPoint 和 WPS 演示，其他演示软件不支持。
-- 仅 Windows（ClassIsland 2.1.0.1 上开发测试）。
+- Linux 上页码要靠随包适配器（`tools/linux-adapters/`）：LibreOffice Impress 已实测可用，WPS Linux 只在 12.1.2 上验证到「加载项被登记但不执行」，属实验性。
 
 ## 更新日志
 
