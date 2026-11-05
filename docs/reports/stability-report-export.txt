@@ -1,0 +1,208 @@
+课件续页 · 控制面板「导出记录」稳定性报告
+日期：2026-10-24
+范围：只改 Ui\ControlPanel.axaml、Ui\ControlPanel.axaml.cs，新增 Core\LedgerCsv.cs。
+其余文件（Ui\NativeOverlayCard.cs、Core\SessionEngine.cs、Services\SlideSyncService.cs 等）未动，未加 NuGet，未启动 ClassIsland/WPS/PowerPoint/希沃，未部署，未碰 git。
+
+一、改动清单（文件 · 行号 · 内容）
+
+1. 新增 Core\LedgerCsv.cs（204 行，纯函数，不依赖 Avalonia，便于单测）
+   L16  public static class LedgerCsv
+   L19  Header 常量：
+        "日期,周几,第几节,科目,课件名,起始页,结束页,总页数,时长(分),文件路径"
+   L29  Collect(Ledger?)：遍历 ledger.ByFile 汇总全部 SessionRecord；按 StartedAt
+        倒序（新的在前），解析不了时间的排最后；用 OrderByDescending 的稳定排序，
+        同一时间保持原顺序 —— 老师想先看到最近那节课，且重复导出顺序固定。
+   L58  ToCsv(IEnumerable<SessionRecord>?)：表头 + 每条一行，行尾 CRLF（CSV 标准，
+        Excel/WPS 都认）；日期列也走 Escape，避免将来格式改动漏转义。
+   L88  ToBytes(...)：new UTF8Encoding(true).GetPreamble() 拼正文，产出真正的
+        EF BB BF 头 —— Excel 靠 BOM 判 UTF-8，否则中文列名和课件名乱码。
+   L101 StatusText(int count, string? path)："已导出 N 条到 路径"，状态条文案统一由
+        纯函数生成，测试不用拼字符串。
+   L107 SuggestedFileName(DateTime now)："课件续页-记录-yyyyMMdd.csv"，
+        InvariantCulture 格式化 —— 台账踩过 ar-SA 文化把日期写成 Hijri 的坑。
+   L116 Escape(string?)：含逗号、双引号、CR、LF 时整体加双引号，内部双引号翻倍；
+        null/空串写空字段。
+   L133 DateText(string?)：DateTime.TryParse(..., InvariantCulture, DateTimeStyles.None)
+        后输出 yyyy-MM-dd；解析失败原样回退，宁可让老师看到原始字符串也不丢信息。
+   L147 WeekdayText(SessionRecord?)：Weekday 1..7 直接映射周一..周日；为 0（老记录
+        没存）时从 StartedAt 反推，((int)DayOfWeek + 6) % 7 + 1（周日=7）。
+   L168 PeriodText(SessionRecord?)：Period>0 写数字；否则写 PeriodName（"上午第 2 节"
+        这类数不出来的记录）；再否则空。
+   L180 DeckName(SessionRecord?)：FilePath 是 "希沃:" 伪键时去掉前缀
+        （SeewoBridge.KeyPrefix），否则 System.IO.Path.GetFileName；
+        GetFileName 对非法字符会抛 ArgumentException，catch 后回退整串 —— 台账键
+        来自外部，不能假设一定合法。
+   L204 TotalSlides(SessionRecord?)：SlideCount>0 用它，否则退到 EndSlide（老记录没有
+        SlideCount 字段）。
+   L214 DurationMinutes(int seconds)：seconds/60 向下取整，负数按 0。
+   L221 TryParseStartedAt(string?, out DateTime)：集中解析入口，InvariantCulture。
+
+2. Ui\ControlPanel.axaml（755 行，课件库页）
+   L83  顶部搜索行：ColumnDefinitions 由 "*,Auto" 改为 "*,Auto,Auto"。
+   L93–104 新增 Button x:Name="ExportButton"：Grid.Column="1"，Content="导出记录"，
+        Height 38（与刷新按钮同高）、MinWidth 100、Margin 12,0,0,0、
+        Click="OnExportClick"、ToolTip.ShowOnDisabled="True"、ToolTip.Tip="还没有记录"。
+        ShowOnDisabled 是为了让"不能用"这件事有解释：灰色按钮悬停也能看到原因。
+   L102–112 原 RefreshButton 挪到 Grid.Column="2"（顺序：搜索框 → 导出记录 → 刷新）。
+   L300–325 底部状态条：内层 Grid 由 "*,Auto" 改为 RowDefinitions="Auto,Auto"
+        ColumnDefinitions="*,Auto"，行 0 仍是 StatusText(L301) + FullScreenButton(L307)。
+   L316 新增 TextBlock x:Name="ExportStatusText"：Grid.Row="1" ColumnSpan="2"，
+        FontSize 11、Margin 0,3,0,0、IsVisible=False、TextTrimming="CharacterEllipsis"。
+        单开一行是因为导出结果（含完整路径）比台账状态更长，挤在同一行会把
+        "数据文件：…" 截断；默认隐藏，只在导出成功/失败/空台账时出现。
+
+3. Ui\ControlPanel.axaml.cs（703 行）
+   L43–44 新增字段：
+        bool exporting;       // 防连点：异步对话框期间重复点击会开两个保存框
+        bool exportHintShown; // 区分"还没有记录"提示与真正的导出结果
+   L102 构造函数末尾调用 UpdateExportState()，首屏就按台账条数定按钮态。
+   L242–249 UpdateStatus(int shown) 末尾调 UpdateExportState()：台账增删后
+        （Reload/Rebuild 都会走这里）按钮可用性立即跟上，不必手动刷新。
+   L271 async void OnExportClick(object? sender, RoutedEventArgs e)：
+        1) exporting 为真直接 return（防重入）；
+        2) LedgerCsv.Collect(ledger) 先拍快照 —— 保存对话框是异步的，期间
+           SessionEngine 可能正往里加记录，快照保证写出的行数与状态条 N 一致；
+        3) 快照 0 条：ShowEmptyHint() 后 return，不弹对话框（让老师对着一本空台账
+           选路径没有意义）；
+        4) TopLevel.GetTopLevel(this) 取 StorageProvider（Avalonia 11 官方写法，
+           见 docs.classisland.tech/dev/settings-page.html 与
+            https://docs.avaloniaui.net/docs/concepts/services/storage-provider/）；
+           取不到 → 状态条报错 return；
+        5) SaveFilePickerAsync(new FilePickerSaveOptions {
+             Title = "导出记录",
+             SuggestedFileName = LedgerCsv.SuggestedFileName(DateTime.Now),
+             DefaultExtension = "csv",
+             ShowOverwritePrompt = true,
+             FileTypeChoices = CSV 一项 });
+        6) file == null → 用户取消，直接 return，状态条一个字都不改；
+        7) TryGetLocalPath() 为空（云端/虚拟位置写不了）→ 报"这个位置不能直接写入，
+           请选本机磁盘上的文件夹"；
+        8) WriteExport(path, records)；
+        9) catch (Exception ex) → ShowExportStatus("导出失败：" + ex.Message) + Log，
+           异常止步于 UI 线程内，不冒出 async void 之外（async void 里漏出的异常会
+           直接崩进程，所以整段必须包住）；
+       10) finally → exporting=false; UpdateExportState()（恢复按钮态，UpdateExportState
+           本身再套 try/catch，免得 finally 里二次抛）。
+   L354 void WriteExport(string path, List<SessionRecord> records)：
+        File.WriteAllBytes(path, LedgerCsv.ToBytes(records)) → ShowExportStatus(
+        LedgerCsv.StatusText(records.Count, path)) → Log。同步写：台账通常几十 KB
+        到几百 KB，同步写完再更新状态条最简单，也不会在离线测试里因为等待
+        未 pump 的消息泵而丢状态；单独抽成方法是为了离线测试能直接调它验证
+        真实落盘，而不必去点真实系统对话框。
+   L367 void UpdateExportState()：
+        has = RecordCount() > 0；
+        ExportButton.IsEnabled = has && !exporting；
+        ToolTip.SetTip(ExportButton, has ? "把整本台账导出成 CSV（Excel 可直接打开）"
+                                         : "还没有记录")；
+        has 且台账为空时把 ExportStatusText 设成"还没有记录"并显示（exportHintShown
+        标记这是提示，不是导出结果）；has 为真后只撤掉这条提示，不覆盖已有导出结果。
+   L395 void ShowEmptyHint()：置提示并显示"还没有记录"，供 0 条分支与测试调用。
+   L402 void ShowExportStatus(string text)：设置并显示 ExportStatusText，同时把
+        exportHintShown 置 false（从此这条是结果，不再被空台账逻辑撤掉）。
+
+二、导出列映射（一行 = 一条 SessionRecord）
+
+列名        来源
+日期        StartedAt → InvariantCulture 解析 → yyyy-MM-dd；解析失败原样输出
+周几        Weekday 1..7 → 周一..周日；0 → 从 StartedAt 反推；都失败留空
+第几节      Period>0 → 数字；否则 PeriodName；再否则空
+科目        Subject
+课件名      FilePath 为 "希沃:…" 伪键 → 去前缀；否则 Path.GetFileName(FilePath)
+起始页      StartSlide
+结束页      EndSlide
+总页数      SlideCount>0 ? SlideCount : EndSlide
+时长(分)    Seconds / 60（向下取整，负数按 0）
+文件路径    原始 FilePath 原样保留（希沃记录保留 "希沃:…" 伪键，方便老师回溯来源）
+
+编码：UTF-8 带 BOM（EF BB BF），行尾 CRLF，字段含 , " CR LF 时加引号。
+排序：按 StartedAt 倒序，新的在前；时间解析失败的排最后；同一时间保持原顺序。
+默认文件名：课件续页-记录-yyyyMMdd.csv（InvariantCulture，不受系统文化影响）。
+
+三、构建结果
+
+命令：
+  & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build
+    'C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\ClassSlideSync.Plugin.csproj'
+    -c Release -t:Rebuild
+
+结果：Build succeeded，0 Error，193 Warning。
+193 个 warning 全部是仓库既有的 nullable/未使用变量类警告，本次三个文件没有新增
+warning 类别（LedgerCsv.cs 全文件 nullable 干净，CSV 拼接全程 string）。
+
+四、离线验收（%TEMP%\panel-export\）
+
+测试工程：C:\Users\xzq\AppData\Local\Temp\panel-export\PanelTests.csproj
+测试程序：C:\Users\xzq\AppData\Local\Temp\panel-export\Program.cs
+方式：Assembly.LoadFrom 加载 bin\Release\net8.0-windows\ClassSlideSync.Plugin.dll，
+      反射调用 LedgerCsv 纯函数；Avalonia 用 AppBuilder.Configure<TestApp>()
+      .UsePlatformDetect().SetupWithoutStarting() 离屏建窗口，
+      RenderTargetBitmap 出图。测试工程不在仓库里，不污染项目。
+注：测试工程额外引用了 Avalonia.Controls.ColorPicker 11.3.17 —— 设置页/面板 XAML
+    里的 ColorPicker 在宿主 ClassIsland 里由宿主提供程序集，离线窗口不引会
+    FileNotFoundException。这只是临时测试工程的事，插件仓库没加任何 NuGet。
+
+运行结果：断言总数 88，失败 0，ALL PASS。
+
+分类明细：
+A. LedgerCsv 纯函数 —— 0 条 / 1 条 / 整行精确
+   Collect(null)=0 条；0 条只写表头；单条"表头+1 行"；整行逐字段精确匹配；
+   日期列只留年月日；斜杠日期也按 Invariant 解析；解析不了原样回退。
+B. 多文化时间解析（5 种文化 × 3 断言）
+   ar-SA / zh-CN / en-US / de-DE / ja-JP 下 ToCsv 输出完全一致、日期仍是
+   yyyy-MM-dd、周几仍是周六；另有一条专门验证 ar-SA 下 2026-10-24 不被写成
+   Hijri 日期。
+C. 转义 / BOM / CRLF
+   普通文本不加引号；逗号加引号；引号翻倍；换行加引号；空值与 null 写空字段；
+   含逗号科目、含引号文件名、含换行科目都被正确包住；字节以 EF BB BF 开头；
+   正文无额外 BOM 字符；每行以 CRLF 结尾；CRLF 数 = 表头 + 行数；无裸 LF、无裸 CR；
+   字节长度合理。
+D. 排序 / 时长 / 页数 / 文件名 / 状态文案
+   Collect 汇总 4 条；新的在前 → 其次倒序 → 旧记录 → 解析失败的排最后；
+   时长 59→0、60→1、2699→44、2700→45、-5→0；SlideCount=0 退到 EndSlide；
+   SuggestedFileName 带日期；StatusText 文案正确；希沃伪键在"课件名"列去前缀、
+   在"文件路径"列保留原键。
+E. Avalonia 控件级断言（真实窗口，940×640）
+   存在 OnExportClick 处理器；窗口尺寸 940×640；ExportButton 存在、有记录时可点、
+   文案"导出记录"、高度 38、位置在搜索框右边且刷新按钮在其右边；有记录时
+   ToolTip 是用途说明；未导出时不显示导出提示；状态条仍显示台账路径；
+   面板台账共 8 条。
+F. 真实落盘（反射调用 WriteExport，绕开系统对话框）
+   CSV 已写出；磁盘文件带 BOM；内容 = 表头 + 8 行 + 末尾 CRLF；每行 10 个字段；
+   无裸 LF；表头正确；首行是最近记录（2026-10-24）；状态条显示
+   "已导出 8 条到 C:\Users\xzq\AppData\Local\Temp\panel-export\export-out.csv"；
+   导出状态条已可见且位于台账状态下方。
+G. 空台账
+   按钮禁用；ToolTip="还没有记录"；状态条="还没有记录"；反射调 OnExportClick
+   不抛异常、文案不变（0 条不弹对话框）。
+
+五、截图（940×640，均已人工查看）
+
+1) %TEMP%\panel-export\shots\panel-export-status-940x640.png
+   8 条台账。顶部一行：搜索框 →「导出记录」→「刷新」，导出按钮与刷新同高；
+   左侧分组列表、右侧课件详情正常；底部第一行仍是
+   "数据文件：…\ledger.json · 记录 8 条 · 当前列出 6 份"，第二行灰字
+   "已导出 8 条到 C:\Users\xzq\AppData\Local\Temp\panel-export\export-out.csv"。
+2) %TEMP%\panel-export\shots\panel-empty-940x640.png
+   空台账。「导出记录」变灰不可点（旁边「刷新」仍可点），底部第一行"记录 0 条"，
+   第二行"还没有记录"。
+
+六、没验证的部分（如实说明）
+
+1. 真实保存对话框：离线环境没有启动 ClassIsland 宿主，SaveFilePickerAsync 弹出的
+   Windows 文件选择器没有被实际点过；已验证的是"按钮存在、可禁用、写盘方法与状态
+   文案"，以及 OnExportClick 在 0 条时不抛异常。真实对话框的默认文件名、
+   "取消后什么都不做"、覆盖提示这三条属于代码路径，未做人工点选验证。
+2. Excel / WPS 实际打开导出文件：只做了字节级 BOM 与 CRLF 断言，没有真的用
+   Excel 打开看中文显示（任务要求不启动 WPS）。
+3. ClassIsland 进程内运行：面板在真实宿主里的布局（尤其是 1000×680 默认尺寸下
+   第二行状态条与全屏按钮的关系）只在 940×640 离屏窗口验证过。
+4. 台账很大（上万条）时的导出耗时与 UI 卡顿：同步写盘，理论上几百 KB 无感，
+   但未做压力测试。
+
+七、结论
+
+「导出记录」按钮已按任务书落在课件库页顶部（搜索框右侧、「刷新」左侧），
+空台账禁用并提示「还没有记录」；导出为 UTF-8 带 BOM、CRLF 的 CSV，列名与顺序
+严格按任务书，时间解析全部走 InvariantCulture；成功/失败/取消三条路径都在
+UI 线程内收口，不会把异常抛出去。构建 0 error，离线 88 条断言全过，两张
+940×640 截图已核对。真实保存对话框与 Excel 打开属未验证项，需人工在宿主里点一次。

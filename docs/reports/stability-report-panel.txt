@@ -1,0 +1,295 @@
+课件续页 · 图形控制面板（ControlPanel）交付与稳定性报告
+======================================================================
+日期：2026-10-24
+仓库：C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin
+构建：0 error / 193 warning
+测试：82 断言 / 0 失败 / ALL PASS
+出图：4 张 940×640 PNG
+
+0. 结论摘要
+----------------------------------------------------------------------
+- 新增独立 Avalonia 窗口 Ui\ControlPanel.axaml(.cs)：搜索、按科目分组、选中看详情、
+  历史三列（时间 / 页范围 / 时长）、打开文件夹、立即跳转、底部台账状态条。
+- 卡片右上角新增 24×24 齿轮（在文件夹图标左边），命中区四周各外扩 6px，
+  触发 public event Action PanelRequested；服务在 UI 线程单实例打开面板。
+- 设置页「基本」区新增开关「在卡片上显示控制面板按钮」（SyncSettings.EnableControlPanel，默认 true）。
+- 卡片总高度、贴边位置、15 秒自动收起、整卡命中/跳页逻辑均未改；只改了顶部三个小图标的
+  一行内布局（齿轮插进文件夹左边，标题可用宽度相应收窄）。
+- 构建 0 error；%TEMP%\control-panel\ 下 82 条反射断言全过；4 张离屏图逐张看过，
+  发现并修掉 3 个真实缺陷（见第 6 节）。
+
+1. 改动文件与行号
+----------------------------------------------------------------------
+新增：
+- Ui\ControlPanel.axaml（257 行）
+  * 1-12：Window 属性：Title=课件续页、940×640、MinWidth 760 / MinHeight 520、
+    CenterScreen、ShowInTaskbar=False、TransparencyLevelHint="AcrylicBlur, Transparent"、
+    TransparencyBackgroundFallback=Transparent、Background={DynamicResource SmokeFillColorDefaultBrush}。
+  * 19-44：样式：Border.deck-row（hover/selected）、Border.history-row（latest）、Button.action。
+  * 49-63：顶部搜索框（Watermark="搜索课件名 / 科目"）+ 刷新按钮。
+  * 66-124：左侧课件库：LayerFillColorDefaultBrush 圆角卡片 + ScrollViewer + ItemsControl，
+    组头 {Binding Header}，组内 ItemsControl {Binding Rows}，行 Border Tag={Binding} PointerPressed。
+  * 132-228：右侧详情：DetailName / DetailMeta / DetailPage（64px 强调色）/
+    DetailTotal / DetailLast / 历史三列表头 + HistoryList / 打开文件夹 + 立即跳转。
+  * 230-244：空状态（EmptyPanel / EmptyTitle）。
+  * 249-258：底部状态条 StatusText。
+- Ui\ControlPanel.axaml.cs（267 行）
+  * 18-36：ControlPanel : Window；字段 ledger/settings/stateProvider/openFolder/groups；
+    public event Action<string,int>? JumpRequested。
+  * 42-60：构造函数（见第 2 节）；InitializeComponent + ItemsSource + KeyDown(Tunnel) + Opened。
+  * 71-103：Reload：取一次 CardState → 找 IsCurrent.Key → CardFileList.Build(...,500,1)。
+  * 105-134：Rebuild：PanelData.Search + PanelData.Group，保选中，否则自动选第一份。
+  * 151-174：Select：PanelData.History + TotalSlides + 页码/共 N 页/上次停在第 N 页。
+  * 187-199：UpdateStatus(shown)：台账路径 + 总记录数 + 当前列出 N 份。
+  * 246-260：Esc 关闭；Ctrl+F 聚焦搜索框并全选。
+- Ui\PanelRows.cs（63 行）：PanelRow（Name/Subject/Subline/Detail/IsCurrent/Badge/IsSelected，
+  INotifyPropertyChanged）、PanelGroup（Subject/Rows/Header=科目 · N 份）。
+- Core\PanelData.cs（187 行）：纯函数数据层（Search / Group / StatusLine / History /
+  TotalSlides / PageText / TotalText / LastText / RangeText / TimeText / DurationText）。
+  Group 直接转调 CardFileGroups.Group，不另写一套分组。
+- stability-report-panel.txt（本文件）。
+
+修改：
+- Ui\NativeOverlayCard.cs
+  * 156-157：Rect32 panelHit; bool showPanelButton = true;
+  * 225：public event Action PanelRequested;
+  * 298-305：Configure(..., bool showPanel = true)，方法体 showPanelButton = showPanel;
+  * 309-340：internal struct TopIconLayout + internal static TopIconLayout ComputeTopIcons(width,dpi,showPanel)
+  * 1349-1355：OnClick 在收起判断之后、文件面板分支之前判 panelHit → PanelRequested。
+  * 1456-1488：DrawGearIcon（GDI 负空间齿轮：8 齿 + 轮盘 + 背景色挖孔）。
+  * 1541：Paint 开头重置 panelHit。
+  * 1578-1592：Paint 顶部改用 ComputeTopIcons；标题宽度改为 iconsLeft-pad-4，避免穿到图标下。
+  * 1857-1859：画齿轮、写 panelHit、再画文件夹（文件夹命中区逻辑未改）。
+  * 2099：Rect32 由 private 改 internal（internal 方法返回它所需）。
+- Core\SyncSettings.cs
+  * 55：bool enableControlPanel = true;
+  * 323-327：public bool EnableControlPanel { get/set Set(...) }
+- Views\SettingsPages\SlideSyncSettingsPage.axaml
+  * 58-66：新 SettingsExpander（IconSource E713，Header「在卡片上显示控制面板按钮」，
+    Description「卡片右上角出现一个齿轮……」，Footer ToggleSwitch 绑定 Settings.EnableControlPanel）。
+- Services\SlideSyncService.cs
+  * 34：ControlPanel panel;
+  * 412 / 742：两处 Configure(..., settings.EnableControlPanel)。
+  * 416：c.PanelRequested += OnPanelRequested;
+  * 478：Disarm 退订 PanelRequested；483-489：关掉面板单例（Close 回 UI 线程）。
+  * 605-639：OnPanelRequested（Dispatcher.UIThread.Post，单实例 Show/Activate）。
+  * 641-645：OnPanelJumpRequested → RequestJump(filePath, slide)，与卡片同一条链。
+  * 651-682：OpenPanelFolder：IAppHost.TryGetService<IUriNavigationService>().Navigate(new Uri(folder))，
+    失败回退 ShellExecute。
+
+2. 面板数据流
+----------------------------------------------------------------------
+卡片齿轮（浮层线程）
+  → NativeOverlayCard.PanelRequested
+  → SlideSyncService.OnPanelRequested
+  → Dispatcher.UIThread.Post
+      panel 已存在 → Show()/Activate()，绝不建第二个
+      否则 → new ControlPanel(ledger, settings, () => lastState, OpenPanelFolder)
+  → Window.Opened → Reload()
+      stateProvider() 取当前 CardState
+      从 st.Files 找 IsCurrent.Key
+      CardFileList.Build(ledger, currentKey, 500, 1)   // 只读内存台账，无文件 IO 循环
+  → Rebuild()：PanelData.Search(SearchBox.Text) → PanelData.Group(...)
+  → Select(row)：PanelData.History(ledger, item, 200) 现读该文件完整历史
+  → 立即跳转：ControlPanel.JumpRequested(filePath, slide)
+      → SlideSyncService.OnPanelJumpRequested → RequestJump(filePath, slide)
+  → 打开文件夹：openFolder 委托 → IUriNavigationService.Navigate，失败 ShellExecute
+
+刷新按钮只重建左栏/状态条，读的是服务里同一个 Ledger 实例（引擎写入的就是它），
+不重新 Ledger.Load：避免面板看到磁盘旧副本、和引擎内存里的记录打架。
+
+构造函数（Ui\ControlPanel.axaml.cs:42）：
+    public ControlPanel(Ledger ledger, SyncSettings settings,
+                        Func<CardState>? stateProvider, Action<string>? openFolder = null)
+openFolder 由服务注入，所以 ControlPanel 本身不直接引用 ClassIsland.Core 类型，
+测试工程只加载 Avalonia/FluentAvalonia 就能构造窗口。
+
+3. 齿轮绘制与命中
+----------------------------------------------------------------------
+几何（Ui\NativeOverlayCard.cs:318-340）与 Paint 共用同一份 ComputeTopIcons，
+测试反射调用的也是它，不存在“测试一套、画图另一套”。
+
+    int S(int v) { return (int)Math.Round(v * dpi / 96.0); }
+    int pad = S(14);
+    var arrow = new Rect32(width - pad - S(16), S(6), width - pad + S(2), S(6) + S(18));
+    int icon = S(FolderIconSize);                  // 24
+    int iconY = Math.Max(S(6), S(6) + (S(18) - icon) / 2);
+    int folderX = arrow.L - S(10) - icon;
+    // showPanel 时：
+    int panelX = folderX - S(14) - icon;
+    PanelIcon = (panelX, iconY, panelX+icon, iconY+icon);
+    PanelHit  = 四周各外扩 S(6);
+
+96dpi（卡片宽 236）：
+    面板图标 134..158，命中区 x 128..164，y 0..36
+    文件夹   172..196，命中区 x 166..202，y 0..36
+    收起箭头 206..224
+    齿轮/文件夹命中区间隔 2px；文件夹/箭头间隔 4px；全部在客户区内。
+144dpi（卡片宽 354）：
+    面板图标 201..237，命中区 x 192..246，y 0..45
+    文件夹   258..294，命中区 x 249..303，y 0..45
+    收起箭头 309..336
+    齿轮/文件夹间隔 3px；文件夹/箭头间隔 6px；全部在客户区内。
+（齿轮-文件夹间距用 14 逻辑像素：若用 10，两个 6px 外扩命中区会重叠 2px。）
+
+齿轮画法（GdiCanvas 只有 FillRounded/StrokeRounded，没有多边形）：
+    disc=Round(size*0.30)  hole=Round(size*0.13)  outer=Round(size*0.46)
+    inner=Round(size*0.26) tw=Round(size*0.17)
+    4 个轴向齿 + 4 个 45° 斜齿（中心取 inner/outer 中点，d=mid*0.7071）全部 FillRounded；
+    再用轮盘盖住齿根，最后用卡片背景色在圆心挖一个洞 —— 负空间画法，不描边也认得出是齿轮。
+24px 时：轮盘半径 7、孔 3、齿外径 11、齿宽 4。
+
+命中区外扩 6px 的点击判定在 OnClick（NativeOverlayCard.cs:1349）：
+    if (panelHit.R > panelHit.L && Inside(panelHit, x, y)) { PanelRequested?.Invoke(); return; }
+放在 filePanel/historyPanel 分支之前、整卡跳页之前，所以点齿轮不会误触跳页。
+
+未改：BaseCardHeight=150、Place/ApplyWindowRegion/贴边计算、autoHideSeconds 与 15 秒收起。
+为满足“命中区必须在客户区内”，24px 图标不能按 18px 行高居中（原公式 96dpi 得 y=3，
+命中区顶端 -3；144dpi 得 -4），改为 Math.Max(S(6), ...)，文件夹图标因此下移 3/4 逻辑像素；
+这不是卡片尺寸/贴边/收起的改动。
+
+4. 面板关键代码
+----------------------------------------------------------------------
+搜索（Core\PanelData.cs:36-57）：
+    string q = (query ?? "").Trim();
+    if (q.Length == 0 || Matches(f, q)) result.Add(f);
+    Matches = DisplayName / Subject / FolderHint，StringComparison.OrdinalIgnoreCase。
+空串、纯空白串都返回全部；null 列表返回空；无命中返回空列表。
+
+分组（Core\PanelData.cs:60-63）：
+    return CardFileGroups.Group(files ?? new List<CardFileItem>());
+组顺序/组内最近优先/“未标注科目”全部复用卡片逻辑。
+
+历史（Core\PanelData.cs:82-109）：
+    string key = string.IsNullOrEmpty(item.FilePath) ? item.Key : item.FilePath;
+    records = ledger.Recent(key, max);
+    TimeText / RangeText / DurationText / Slide = EndSlide>0?EndSlide:StartSlide。
+注意 CardFileItem.Key 是归并身份（file:xxx.pptx），不是台账桶名，查历史必须用 FilePath。
+
+单实例（Services\SlideSyncService.cs:605-639）：
+    Dispatcher.UIThread.Post(() => {
+        if (panel != null) { if (!panel.IsVisible) panel.Show(); panel.Activate(); return; }
+        if (!armed) return;
+        var p = new ControlPanel(ledger, settings, () => lastState, OpenPanelFolder);
+        p.JumpRequested += OnPanelJumpRequested;
+        p.Closed += (_, __) => { if (ReferenceEquals(panel, p)) panel = null; };
+        panel = p; p.Show(); p.Activate();
+    });
+
+5. 构建
+----------------------------------------------------------------------
+固定命令：
+& 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build 'C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\ClassSlideSync.Plugin.csproj' -c Release -t:Rebuild
+
+输出（完整日志 C:\Users\xzq\AppData\Local\Temp\control-panel\build-final2.log）：
+    193 个警告
+    0 个错误
+    已用时间 00:00:02.71
+产物：bin\Release\net8.0-windows\ClassSlideSync.Plugin.dll = 242176 字节。
+
+警告说明：基线 186 个 nullable 警告；新增的主要是 ControlPanel 相关的 nullable 警告，
+以及 Ui/ControlPanel.axaml 的 AVLN3001（“no public constructor found”，和现有
+SlideSyncSettingsPage.axaml 同款）。窗口只由代码 new，运行时 loader 不按 URI 反射创建它，
+这条警告不影响功能。没有新增 NuGet 依赖，没有改 manifest.yml / 版本号 / git。
+
+6. 测试工程与断言
+----------------------------------------------------------------------
+位置：C:\Users\xzq\AppData\Local\Temp\control-panel\（仓库内没有任何测试文件）
+工程：PanelTests.csproj（net8.0-windows，Avalonia 11.3.17 + Avalonia.Desktop +
+FluentAvaloniaUI 2.4.1 + System.Text.Json 9.0.2），Program.cs 用 Assembly.LoadFrom +
+反射访问插件类型。
+
+命令：
+& 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build 'C:\Users\xzq\AppData\Local\Temp\control-panel\PanelTests.csproj' -c Release
+& 'C:\Users\xzq\AppData\Local\Temp\control-panel\bin\Release\net8.0-windows\PanelTests.exe'
+
+结果：断言总数 82，失败 0，EXIT=0，ALL PASS（日志 run-final2.log）。
+
+覆盖：
+- 搜索（11）：空串=全部、空白串=全部、null 关键词=全部、null 列表=空、中文子串、
+  大小写不敏感（双向）、科目命中、科目单字、目录命中、无结果=空。
+- 分组（7）：组数、组顺序=首次出现、组内按最近时间降序、组标题文案、
+  空科目归入“未标注科目”、空列表。
+- 历史/文案（15）：历史条数、新的在前、时间格式、页范围、时长、最新标记、
+  页码 0=破折号、共 N 页、页数未知、上次停在第 N 页、无页码、状态条路径/记录数、
+  TotalSlides 取台账 SlideCount（30）、缺记录返回 0。
+- 齿轮/卡片（25）：ComputeTopIcons 存在；96/144dpi 各 10 条——箭头/文件夹/齿轮都在
+  客户区内、图标 24×24、命中区四周外扩 6、命中区在客户区内、齿轮与文件夹不重叠、
+  文件夹与箭头不重叠、齿轮在文件夹左边、关掉开关后不画齿轮；另 4 条卡片事件：
+  PanelRequested 存在、Configure 多 showPanel 参数、showPanelButton 字段、panelHit 字段。
+- 窗口/出图（24）：标题、940×640、MinWidth/MinHeight、ShowInTaskbar、CenterScreen、
+  Acrylic 提示、左栏分组数、自动选中第一份、“共 30 页”、历史非空、状态条路径、
+  搜索后只剩 1 组、搜索后状态条 1 份、无结果空状态、无结果 0 份、
+  空台账空状态、空台账 0 条，以及 4 张 PNG 写出检查。
+
+测试过程中修掉的真实缺陷：
+1) PanelData.History 用 item.Key 查台账，而 Key 是“file:xxx.pptx”归并身份 → 历史恒为空；
+   改为优先 item.FilePath。测试“历史列表非空”由失败转通过。
+2) ComputeTopIcons 的 iconY 在 144dpi 把 24px 图标顶到 -4px，命中区出客户区；
+   改为 Math.Max(S(6), ...)。96/144 命中区都从 y=0 开始。
+3) 详情“共 N 页”误用 CardFileItem.Total（=台账记录条数，显示成“共 2 页”）；
+   新增 PanelData.TotalSlides 从最近一条记录的 SlideCount 取（样本“共 30 页”）。
+另修：搜索后状态条仍写 allFiles.Count（“当前列出 5 份”），改为过滤后的 filtered.Count。
+
+7. 离屏出图与排版结论
+----------------------------------------------------------------------
+目录：C:\Users\xzq\AppData\Local\Temp\control-panel\shots\
+1) panel-full.png（47030 字节）
+   顶部 38px 搜索框 + 右侧刷新；左栏 360px 圆角卡片，组头“数学 · 1 份 / 语文 · 2 份 /
+   英语 · 1 份 / 未标注科目 · 1 份”；右栏文件名 20px、科目 12px、64px 页码“12”+
+   “共 30 页 / 上次停在第 12 页”；历史三列 104/*/84（时间、页范围、时长）；
+   “打开文件夹 / 立即跳转”固定在右下；底部状态条路径 + “记录 8 条 · 当前列出 5 份”。
+   结论：三栏比例、字号层级、按钮落点都成立，没有压字/溢出。
+2) panel-search.png（32955 字节）
+   输入“数学”后左栏只剩“数学 · 1 份”一组一行，右侧详情保持选中，底部变“当前列出 1 份”。
+   结论：实时过滤没有闪空详情，过滤后状态数字正确。
+3) panel-no-results.png（15795 字节）
+   左栏空白，右侧显示“没有匹配的课件 / 这里会显示页码和历史记录”，底部“当前列出 0 份”。
+   结论：空结果与空台账文案能区分，不会残留上一份的详情。
+4) panel-empty.png（16243 字节）
+   空台账：左栏空列表，右侧“从左侧选一份课件”，底部“记录 0 条 · 当前列出 0 份”。
+   结论：首次使用/新装环境不会出现空白窗口。
+
+排版观察与取舍：
+- 左栏每行两行字：第一行文件名 + 右侧“当前”徽章，第二行“科目 · 第 N 页 · X 小时前”，
+  满足“文件名 / 第 N 页 · 3 小时前 / 科目”三项；科目既在组头也在行内（按需求保留，略重复）。
+- 左栏空时留白较大，属于正常空列表，不额外画插画。
+- 历史三列表头与行对齐；样本只有 2 条，滚动区大面积留白，条目多时会出滚动条。
+- 状态条路径过长时按 CharacterEllipsis 截断，右侧“记录/当前列出”仍可见。
+- 搜索框聚焦时底部有强调色下划线，属于 FluentAvalonia 原生焦点样式。
+
+8. 没做到 / 没验证的部分（直说）
+----------------------------------------------------------------------
+- 没有启动 ClassIsland / WPS / PowerPoint / 希沃白板，也没有打开真实老师数据目录，
+  因此面板没有在宿主里实际显示过；“像 ClassIsland 原生窗口”只做到资源键 + 控件风格一致，
+  真亚克力模糊、真实主题字体/圆角没有在运行时确认。
+- 离屏渲染时把 TransparencyLevelHint 设为 None、背景用 #F3F3F3 近似
+  SmokeFillColorDefaultBrush（测试程序没有宿主主题），所以 PNG 里看不到亚克力透明；
+  PNG 也不包含系统标题栏（Window.Render 只画客户区），标题栏外观未验证。
+- 齿轮只做了几何/命中区测试与代码审查，没有截到真实 GDI 卡片上的齿轮图；
+  24px 下 8 齿是否足够清晰，需要真机看一眼。
+- 设置页开关只保证编译与绑定路径正确（Settings.EnableControlPanel），没有在宿主里点过；
+  “关掉开关后卡片不画齿轮”由反射单测（showPanel=false）覆盖，不是真机验证。
+  另外任务里写的是「通用」区，但设置页现有分区第一个叫「基本」（没有「通用」），
+  开关插在「基本」区「记录每节课的进度台账」之后（SlideSyncSettingsPage.axaml:58-66）。
+- “打开文件夹”的 IUriNavigationService.Navigate 分支没有在宿主里执行过（拿不到宿主服务），
+  只做了与现有 TryOpenSubjectFolder 相同的代码路径 + ShellExecute 回退；未实际弹资源管理器。
+- 面板单实例、Esc、Ctrl+F、15 秒自动收起等交互只做了代码审查/单测，没在真机连点验证。
+- 96/144dpi 是给 ComputeTopIcons 传 dpi 模拟的，不是在两种缩放的真实显示器上跑。
+- 左栏行是自绘 Border + PointerPressed（规范允许 ItemsControl 方案），鼠标可选中，
+  但 Tab 键不能在行间移动焦点，键盘无障碍弱于 ListBox。这是已知取舍。
+- 刷新按钮重建的是服务内存里的 Ledger，不重新读 ledger.json；如果老师在别处改了台账文件，
+  面板不会看到磁盘新内容（避免与引擎内存记录冲突）。
+- 任务开始时仓库里并没有 Ui\CardWindow.axaml(.cs)（全工作区搜不到），所以没有参考它；
+  透明三件套按任务给的三项 + 现有 ClassIsland 资源键写的。
+- 工作期间 NativeOverlayCard.cs / SessionEngine.cs 有另一路“功能3”并发改动
+  （HistoryLine.cs、DrawHistoryPanel 等），文件行数从 2140 涨到 2281；本报告行号以
+  最终构建时为准，若之后继续改同文件，行号可能漂移，但上述代码块可按关键字 grep 到。
+
+9. 复现
+----------------------------------------------------------------------
+构建：
+& 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build 'C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\ClassSlideSync.Plugin.csproj' -c Release -t:Rebuild
+测试：
+& 'C:\Users\xzq\AppData\Local\Temp\control-panel\bin\Release\net8.0-windows\PanelTests.exe'
+（测试工程首次需先 build PanelTests.csproj；它按固定路径加载插件 bin\Release 下的 dll。）

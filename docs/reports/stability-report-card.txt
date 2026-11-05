@@ -1,0 +1,295 @@
+ClassSlideSync.Plugin 悬浮卡片改版（A 方案 236×176）验收报告
+============================================================
+生成时间：2026-10-24 18:18（Asia/Shanghai）
+改动范围：Ui\NativeOverlayCard.cs、Core\Appearance.cs（就这两个文件）
+结论：dotnet build -c Release -t:Rebuild = 0 error / 193 warning；
+      反射测试 64 条断言全过（0 失败）；
+      7 组共 14 张 PNG（1:1 + 3x）已逐张看过，看图后改了 5 处，改完重出图再验。
+
+一、老师四句话的落地位置
+------------------------
+原话（第一段）：
+  1「课件进度条现在缩成药丸也竖屏显示进度条(进度条，已上页数按进度条和未上页数显示长度，
+    就是 classisland 的课程时间条)」
+  2「历史记录放最下面」
+  3「这个删了，原位置改成设置，把缩小的跟最早一版一样放在悬浮窗靠左竖着」
+原话（第二段，回答“药丸放哪边”）：
+  4「把这个不是缩小成药丸的按键吗，把他放在悬浮窗最左边竖着跟悬浮窗的宽一样长」
+
+落地：
+  1 展开态：卡片最下面倒数第二行是一条 4px 高的横向进度条，按「已讲页数/总页数」把长度切成
+    两段（讲过的 accent，没讲的 #CDD0D5 浅灰轨道），参照 ClassIsland 课程时间条。
+    收起态：药丸是竖向的，内部也有一条竖向进度条，从下往上按 已讲页数/总页数 填 accent，
+    剩余部分是浅灰轨道（PillFillHeight）。
+  2 纵向顺序固定五行：文件名 → 大页码 + 右侧「共 N 页」「还剩 N 页 · 约 M 分钟」→
+    「从第 N 页接着讲」实心按钮 → 进度条 → 最底下一行「历史 · N 次 ›」。
+    历史入口从原来的“按钮下面、进度条上面”挪到整张卡的最后一行。
+  3 右上角文件夹图标删除（DrawFolderIcon / folderHit / OpenFilePanel 代码保留，只是不可达），
+    原位放齿轮；点齿轮发 PanelRequested，由 Service 打开独立 Avalonia 控制面板。
+  4 收起控件从右上角小箭头搬到卡片左边缘：一条竖贯整张卡片高度的把手（18px 宽，x=0..18，
+    y=0..176，整条都能点），箭头竖着指向收进去的方向（❮）；收起后的药丸也落在同一条竖带上
+    （药丸矩形固定 L=0..tabWidth）。从卡片左边缘向内拖仍然是移动窗口的手势（>4px 即拖动），
+    不会误触收起。
+
+二、改了哪些文件、哪些行
+------------------------
+Ui\NativeOverlayCard.cs（现 2420 行，LF 行尾，UTF-8）
+  1-4        + using System.Globalization;（新排版里所有数字格式化走 InvariantCulture）
+  117-118    注释：FolderIconSize 语义改为「右上角那个图标（原来是文件夹，现为齿轮）」
+  120-147    新增整张卡唯一的行高/尺寸常量表（见第四节）+ ProgressTrack 轨道色
+  337-340    TopIconLayout 结构体只留 GearIcon / GearHit（Arrow、FolderIcon、FolderHit、
+             PanelIcon、PanelHit 全删）
+  342-359    ComputeTopIcons 重写：齿轮贴右上角，命中区四周外扩 6px
+  361-371    + RailRect(width,height,dpi)：左边缘竖带 = (0,0,min(S(18),width),height)
+  373-379    + ProgressRatio(page,total)：夹到 0..1
+  381-391    + ProgressFillWidth(width,page,total)：横向填充宽度，讲过但算成 0 时至少 2px
+  393-402    + PillFillHeight(height,page,total)：竖向填充高度，同上
+  533-543    Place()：x 在两种状态下都不动（OnRight ? screenRight-cardWidth : screenLeft）
+  620-670    + FitRemain(g,text,maxWidth)：「还剩 N 页 · 约 M 分钟」放不下时逐级退让
+  811-839    ContentHeight96()：正常卡片分支直接 return CardContent96（=176）；面板分支未动
+  855-871    ApplyContentHeight()：need 与 look.CardHeight 统一 Scaled() 后比大小
+  894-928    ApplyWindowRegion()：贴屏那侧保持直角的判断改成
+             「expanded && OnRight → 右侧直角；否则 !OnRight → 左侧直角」
+  937-946    CollapsedPill()：统一返回 new Rect32(0, top, tabWidth, top+ph)
+  1540-1586  DrawGearIcon()：轮盘 0.34 / 齿宽 0.22 / 内 0.29 / 外 0.47 / 孔 0.11（出图后调粗）
+  1589-1989  Paint()：开头补 pending==null 兜底（若为 null 就 new CardState()）；收起分支（竖向药丸 + 竖向进度）、展开分支（全新五行版式）、
+             左边缘竖带 + 齿轮
+  2118-2260  GdiCanvas：+ fontTitle/fontSub/fontSub2/fontPage 与 FontTitle/FontSub/FontSub2/
+             FontPage 属性；FontHeight 参数改 double；Dispose 里补 DeleteObject
+Core\Appearance.cs
+  264        public int Radius = 10;（原 8，对应视觉规格「圆角 10（96dpi）」）
+  393        设置项缺省与主题跟随：a.Radius = （s.CardCornerRadius >= 0 ? 设置值
+             : follow ? Max(theme.Radius,10) : 10)
+
+没动的地方（刻意）：DrawHistoryPanel / FitHistory / 历史面板正文（另一个子 agent 在改）、
+OpenFilePanel/CloseFilePanel/课表面板全部代码、OnClick 里 folderHit 分支（保留但不可达）、
+manifest.yml、版本号、NuGet、git。
+
+三、关键代码片段
+----------------
+1) 唯一一份行高表（ContentHeight96 与 Paint 共用，加起来必须正好 176）
+   const int CardPadTop96 = 12;      const int TitleStep96    = 20;
+   const int PageBlockStep96 = 54;   const int BtnGapTop96    = 8;
+   const int BtnHeight96     = 32;   const int BarGapTop96    = 8;
+   const int BarHeight96     = 4;    const int HistGapTop96   = 8;
+   const int HistStep96      = 18;   const int CardPadBottom96 = 12;
+   const int CardContent96 = CardPadTop96 + TitleStep96 + PageBlockStep96 + BtnGapTop96
+                           + BtnHeight96 + BarGapTop96 + BarHeight96 + HistGapTop96
+                           + HistStep96 + CardPadBottom96;              // = 176
+   const int HandleWidth96     = 18;                 // 左边缘竖向把手宽
+   const int ContentPadLeft96  = HandleWidth96 + 10; // = 28：正文给把手让位
+   const int ContentPadRight96 = 14;
+   const int PageColumn96      = 70;                 // 大页码列上限
+   static readonly Color32 ProgressTrack = Color32.FromArgb(255, 0xCD, 0xD0, 0xD5);
+
+2) 左边缘竖把手（整条高度可点，药丸落在同一条竖带上）
+   internal static Rect32 RailRect(int width, int height, int dpi)
+   {
+       int S(int v) { return (int)Math.Round(v * dpi / 96.0); }
+       if (width <= 0 || height <= 0) return new Rect32(0, 0, 0, 0);
+       return new Rect32(0, 0, Math.Min(S(HandleWidth96), width), height);
+   }
+
+3) 进度换算（横向/竖向共用同一套夹取规则）
+   internal static double ProgressRatio(int page, int total)
+   { if (total <= 0 || page <= 0) return 0; if (page >= total) return 1; return page / (double)total; }
+
+   internal static int PillFillHeight(int height, int page, int total)
+   {
+       if (height <= 0) return 0;
+       int hh = (int)Math.Round(height * ProgressRatio(page, total));
+       if (hh < 0) hh = 0;
+       if (hh > height) hh = height;
+       // 讲了一页也要看得见：算出 0 但确实讲过时至少留 2px，否则会被圆角整段吃掉。
+       if (hh == 0 && page > 0 && total > 0) hh = Math.Min(height, 2);
+       return hh;
+   }
+
+4) 收起态药丸（固定贴窗口左边 = 展开态竖带那条线）与窗口形状
+   Rect32 CollapsedPill()
+   {
+       int ph = Scaled((int)Math.Round(96 * look.CardScale));
+       int min = Scaled(44); if (ph < min) ph = min;
+       int cap = cardHeight * 2 / 3; if (ph > cap) ph = cap;
+       int top = (cardHeight - ph) / 2;
+       return new Rect32(0, top, tabWidth, top + ph);      // 默认 (0,40)-(32,136)
+   }
+
+   // Place()：窗口 x 两种状态都不动，收起只把可见区收窄到 tabWidth
+   int x = look.OnRight ? screenRight - cardWidth : screenLeft;
+   SetWindowPos(hwnd, HWND_TOPMOST, x, y, cardWidth, cardHeight, SWP_NOACTIVATE);
+
+   // ApplyWindowRegion()：贴屏那一侧保持直角
+   if (expanded && look.OnRight) square = CreateRectRgn(visible.R - r, visible.T, visible.R + 1, visible.B + 1);
+   else if (!look.OnRight)       square = CreateRectRgn(visible.L, visible.T, visible.L + r + 1, visible.B + 1);
+
+5) 药丸里的竖向进度（从下往上填）
+   int barRadius = Math.Min(Scaled(4), (bxr - bx) / 2);   // 圆角只给 4px，否则 30% 会画成一颗球
+   g.FillRounded(ProgressTrack, new Rect32(bx, barTop, bxr, barBottom), barRadius, true, true);
+   int fh = PillFillHeight(barBottom - barTop, pillPage, pillTotal);
+   if (fh > 0) g.FillRounded(accent, new Rect32(bx, barBottom - fh, bxr, barBottom), barRadius, true, true);
+
+6) 「还剩 N 页 · 约 M 分钟」放不下时的逐级退让
+   string FitRemain(GdiCanvas g, string text, int maxWidth)
+   {
+       if (string.IsNullOrEmpty(text) || maxWidth <= 0) return text ?? "";
+       if (g.TextWidth(text, g.FontSub2) <= maxWidth) return text;
+       string t = text.Replace(" · 约 ", " · ");                     // 先砍「约」
+       if (g.TextWidth(t, g.FontSub2) <= maxWidth) return t;
+       if (t.StartsWith("还剩 ", StringComparison.Ordinal))           // 再把「还剩」缩成「剩」
+       { t = "剩 " + t.Substring(3); if (g.TextWidth(t, g.FontSub2) <= maxWidth) return t; }
+       return t;                                                     // 都放不下才交给 Ellipsis
+   }
+
+7) 页码列按数字实际宽度收窄（让右列把话说完）
+   int pageColW = Math.Max(Scaled(46), Math.Min(Scaled(PageColumn96),
+                                            g.TextWidth(pageText, g.FontPage) + Scaled(8)));
+   int rightX = pad + pageColW;
+
+8) 齿轮几何
+   int icon = S(FolderIconSize);                                  // 24
+   int iconY = S(CardPadTop96) + (S(TitleStep96) - icon) / 2;     // 96dpi = 10
+   int iconX = width - S(ContentPadRight96) - icon;               // 96dpi = 198
+   layout.GearIcon = new Rect32(iconX, iconY, iconX + icon, iconY + icon);
+   layout.GearHit  = new Rect32(iconX - S(6), iconY - S(6), iconX + icon + S(6), iconY + icon + S(6));
+
+四、版式常量表（96dpi 稿，236×176）
+-----------------------------------
+y 区间     高度   元素 / 规格
+0..176     176    左边缘竖向把手（RailRect），18 宽，整条可点；箭头 ❮ 竖带垂直居中
+            -     竖带底色 Color32.Mix(bg,text,0.10)，右边缘 1px hairline（避开圆角）
+12..32      20    文件名：FontTitle 12.5px 加粗，正文字色（亮色主题 = #1B1C1E），超长走 Ellipsis
+32..86      54    页码块：
+                    页码 40px 加粗、正文字色、左对齐 x=28，列宽 = clamp(TextWidth+8, 46, 70)
+                    右列第 1 行 y+2..y+22：「共 N 页」FontSub 10.5，muted
+                    右列第 2 行 y+24..y+54：「还剩 N 页 · 约 M 分钟」FontSub2 11.5 加粗，正文字色
+94..126     32    「从第 N 页接着讲」实心按钮：accent 填充、圆角 8、白字 FontTitle 12.5 加粗，
+                   宽 = 内容宽 194（x 28..222）；没有上次进度时画灰掉同形按钮（文案解释原因）
+134..138     4    进度条：轨道 #CDD0D5 + accent 从左填充，圆角 2，x 28..222
+146..164    18    历史行「历史 · N 次 ›」FontSub 10.5 muted；命中区外扩到 (21,146)-(229,164)
+                   没有历史时这一行改显示课表上下文 / 提示（BitsText / 诊断 status），高度不变
+(198,10)-(222,34) 齿轮图标 24px；命中区 (192,4)-(228,40)（四周外扩 6）
+
+合计 12+20+54+8+32+8+4+8+18+12 = 176，ContentHeight96 在三种状态下都返回 176。
+
+实测命中矩形（测试工程反射读真实字段）：
+  96dpi  客户区 (0,0)-(236,176)  齿轮 (192,4)-(228,40) 36×36
+         竖带 (0,0)-(18,176) 18×176  按钮 (28,94)-(222,126) 194×32
+         历史 (21,146)-(229,164) 208×18  文件夹 (0,0)-(0,0)（已删）
+  144dpi 客户区 (0,0)-(354,264)  齿轮 (288,6)-(342,60) 54×54
+         竖带 (0,0)-(27,264) 27×264  按钮 (42,141)-(333,189) 291×48
+         历史 (32,219)-(343,246) 311×27  文件夹 (0,0)-(0,0)
+  药丸 96dpi：(0,40)-(32,136) 32×96（贴窗口最左，宽 = 收起标签宽度 32）
+
+五、构建输出
+------------
+& 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build
+  'C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\ClassSlideSync.Plugin.csproj'
+  -c Release -t:Rebuild
+→   193 个警告
+    0 个错误
+    已用时间 00:00:02.59
+（与改动前基线同量级：193 条全部是仓库原有的 nullable 系列 CS86xx、两条 Avalonia AVLN3001
+  和 NativeOverlayCard 里那条 CS0414，逐类数过，没有一条来自本次改动。）
+
+六、反射测试工程（仓库外）
+--------------------------
+位置：%TEMP%\card-gui\（card-gui.csproj + Program.cs；net8.0-windows / UseWindowsForms / Exe，
+      所以有 System.Drawing，可直接存 PNG）。
+做法：Assembly.LoadFrom 加载 bin\Release\net8.0-windows\ClassSlideSync.Plugin.dll，反射造
+      NativeOverlayCard、CreateWindowEx、SetWindowPos、InvalidateRect/UpdateWindow 真画一遍，
+      再读私有字段（hit 区、expanded、dpi、paintCount 等）；事件用 Delegate.CreateDelegate 挂
+      到 PanelRequested / JumpRequested / HistoryRequested 上计数。
+注意：本机屏幕 DPI=144，卡片自建时会取到 144，所以「96dpi」那一段先把私有字段 dpi 压回 96 再
+      重排重画，否则量到的全是 144 的数。
+结果：断言 64 条，失败 0 条，进程退出码 0（退出码 = 失败数 ? 1 : 0）。
+
+断言覆盖（全部通过）：
+  A  ContentHeight96 三种状态（有剩余页数 / 无剩余 / 无课件 null）都 == 176 …… 3 条
+  B  药丸竖向填充 PillFillHeight(100px)：0%=0、50%=50、100%=100、超总页数夹到 100%=100、
+     总页数 0 => 0；横向 ProgressFillWidth(194)：0%=0、50%=97、100%=194、超页夹到 194；
+     ProgressRatio 5/10=0.5、40/10 夹到 1 …… 11 条
+  C  96dpi 版式：客户区 236×176；五个命中区非空/文件夹为空；竖带贴 x=0、宽 = Scaled(18)、
+     覆盖整卡高度；按钮宽 = 内容宽 194、高 32；齿轮在右侧；四个可点矩形两两不重叠；
+     四个都在客户区内 …… 25 条
+  D  点击命中：点齿轮 → PanelRequested 1 次；点历史行 → 历史面板打开；点按钮 →
+     JumpRequested 1 次；点竖带 → 卡片收起 …… 4 条
+  F  药丸态：收起成功、药丸 x=0、宽 = 32 …… 5 条（含 70% 那张前的状态确认）
+  G  144dpi：客户区 354×264；齿轮/竖带/按钮/历史都在客户区内且两两不重叠；
+     竖带宽 27、覆盖整高；文件夹仍为空 …… 15 条
+  J  pending=null 时直接调 Paint 不抛异常（paintError 为空）…… 1 条
+
+七、出图（%TEMP%\card-gui\shots\，每组 1:1 与 3x 两张，共 14 张）
+------------------------------------------------------------------
+01-expanded-96-remaining.png / @3x.png     展开、还有 17 页（7/24）
+02-expanded-96-noremaining.png / @3x.png   展开、已讲到最后一页（24/24）
+03-pill-30pct-96.png / @3x.png             药丸、7/24（29%）
+04-pill-70pct-96.png / @3x.png             药丸、17/24（71%）
+05-expanded-144.png / @3x.png              144dpi 展开
+06-pill-144.png / @3x.png                  144dpi 药丸
+07-expanded-96-left.png / @3x.png          贴左（OnRight=false）展开
+另：zoom-gear.png 是齿轮的 8 倍放大图（用来看图标形状）。
+
+逐张看图的结论：
+  01 五行全在：标题 12.5 加粗；大页码 7 深色 40px；右列「共 24 页」弱化、「还剩 17 页 · 约 17 分钟」
+     完整一句话（没有省略号）；实心 accent 按钮白字居中、宽满；进度条 29% 处断开、轨道浅灰；
+     底部「历史 · 3 次 ›」；左边缘竖带可见、箭头在竖带垂直中心；齿轮在右上角，与标题同一中线；
+     没有任何压字或重叠；四角圆角一致。
+  02 无剩余态：页码 24、右列「已经讲到最后一页」右对齐放得下；进度条满格 accent。
+  03 药丸 30%：竖向轨道从箭头下方开始，少量 accent 在底部——改圆角前它是一颗圆球，改后是一条
+     小圆角条，看得出「条」的方向；药丸整体半透明（alpha 128），箭头 ❯ 指向展开方向。
+  04 药丸 70%：accent 占下方七成、上方三成浅灰，比例一眼可读。
+  05 144dpi：等比放大（客户区 354×264），字号行高同步放大，五行间距与 96dpi 完全一致，
+     齿轮也清晰；无重叠、无溢出。
+  06 144dpi 药丸：宽 48、高 144，箭头与轨道比例正常。
+  07 贴左：整张卡左侧不再留直角色块、右侧圆角正常，正文与齿轮位置与贴右完全一致；
+     左边缘竖带贴着屏幕边（像素抽样 (2,2) 是卡底而不是白，说明左侧直角区生效）。
+
+八、看图后改掉的 5 处（都是先出图看见问题再改，改完重出图）
+------------------------------------------------------------
+1) 大页码原来是 accent 橙色：40px 的橙数字把整张卡的重心全抢走，跳转按钮反而不像主操作；
+   按视觉规格「页码 40px 加粗（深色）」改成正文字色（st.Showing ? accent : text → text）。
+2) 「还剩 17 页 · 约 17 分钟」被截成「还剩 17 页 · 约 17…」：右列只有 124px。两处一起改——
+   页码列改成按数字实际宽度收窄（一位数只占 46px，省出 22px），再加 FitRemain 逐级退让兜底。
+   现在 17 页这种三位数字的状态也是完整一句话。
+3) 药丸 30% 时填充被画成一颗圆球（圆角取半宽 10px + 填充只有 18px 高）：圆角降到 4px，
+   填充才读得出是「条」。
+4) 左边缘竖带 Mix 0.06 在 #EEEEEE 上几乎看不见（#EEEEEE → #E9E9EA）：提到 0.10，
+   箭头从 FontSub2 放大到 FontSmall。
+5) 齿轮 24px 下轮盘 0.30、齿宽 0.17 画出来像雪花，认不出是「设置」：轮盘 0.34、齿 0.22、
+   内 0.29、外 0.47、孔 0.11，形状变 chunky，8 齿看得出是齿轮。
+
+九、没做到 / 没验证的部分（直说）
+--------------------------------
+1) 没有在真实 ClassIsland 里跑过（铁律禁止启动 ClassIsland / WPS / PPT / 希沃）。所以以下只有
+   代码层推理或合成窗口验证，没有端到端实机验证：置顶与 Z 序、真实 WM_DPICHANGED 换屏、
+   真实鼠标拖动、ClassIsland 主题切换时的即时重绘。
+2) 「从左边缘向内拖不误触收起」只按代码审过（WM_MOUSEMOVE 里 |dx|>Scaled(4) 或 |dy|>Scaled(4)
+   才置 dragging，WM_LBUTTONUP 里 dragging=true 走 DropCard 不调 OnClick），没有用合成鼠标消息
+   跑一遍。竖带命中区覆盖整卡高度这点是测过的。
+3) 药丸位置的一个已知副作用：贴右（默认 OnRight=true）时，收起后的药丸停在卡片左边缘、
+   离屏幕右边缘还有 cardWidth-tabWidth = 204px，不再像改版前那样紧贴屏幕边。原因是老师要求
+   「药丸和竖带落在同一条线上」，而竖带只可能在卡片左边缘。这是设计选择不是 bug，
+   代码注释（Place）与本报告都写明了；如果老师更想要「药丸贴屏边」，只需把 Place 的收起分支
+   改回 screenRight-tabWidth / screenLeft+tabWidth-cardWidth，两行的事。
+4) 144dpi 那两张是把私有字段 dpi 压到 144 后重排重画的，不是真的把显示器缩放改成 144 再跑；
+   相当于验证了「按 144dpi 计算出来的几何 + 绘制」，没验证系统级 DPI 迁移。
+5) 控制面板窗口（Ui\ControlPanel.axaml，另一个子 agent 的活）没验证内容与排版，只验证了
+   「点齿轮 → PanelRequested 触发一次」这条链路（Service 里 OnPanelRequested 是既有代码，未改）。
+6) 历史面板的正文文案（另一个子 agent 正在改）我没动、也没复验，只保证历史行点击仍打开面板。
+7) 没测 CardScale≠1、自定义圆角（设置页可改）、暗色主题：这些只读了 Appearance.Resolve 的代码，
+   没有出图。正文颜色一律取 look 的 text/muted（没有硬编码 #1B1C1E），暗色主题理论上不会翻车，
+   但没有实际图。
+8) 「进度条按已讲页数/总页数分段」是长度分段，没有画刻度或分段线；如果老师想要“一格一页”的
+   分段观感（像课程时间条的分钟刻度），需要再加一层刻度绘制——目前没做。
+
+十、复现
+--------
+构建：
+  & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build 'C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\ClassSlideSync.Plugin.csproj' -c Release -t:Rebuild
+跑测试与出图：
+  cd %TEMP%\card-gui
+  & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build card-gui.csproj -c Release
+  & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' bin\Release\net8.0-windows\card-gui.dll
+  （断言逐条打印，末尾「断言 N 条，失败 M 条」，退出码 = 失败数 ? 1 : 0）
+图：%TEMP%\card-gui\shots\

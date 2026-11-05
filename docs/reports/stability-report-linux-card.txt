@@ -1,0 +1,324 @@
+Linux 浮层卡片实现报告（ClassSlideSync.Plugin）
+日期：2026-10-31
+范围：为 Linux 增加 Avalonia 版浮层卡片；Windows 继续用现有 Win32/GDI 卡片，同一份 dll、同一套版式。
+
+====================================================================
+0. 结论
+====================================================================
+- 新增 Ui/ICardSink.cs（78 行）+ Ui/LinuxCardWindow.cs（833 行）；NativeOverlayCard 实现 ICardSink（只加显式实现，绘制/消息循环零改动）；SlideSyncService 的 card 字段改成接口类型，Arm/Disarm 在非 Windows 上走 Linux 分支。
+- Windows：-t:Rebuild 0 error / 216 warning；Linux（WSL UbuntuCi, /root/plugin）：-t:Rebuild 0 error / 216 warning。
+- WSL 里实际跑起来验证：卡片出现、位置贴右、页码跟随 current.json、点按钮/齿轮有事件、拖动可改位置、96dpi 236×176 与 144dpi（scale 1.5）354×264 与 Windows 卡片尺寸一致。
+- 截图：shots/linux-card-96-right.png、shots/linux-card-96-left.png、shots/linux-card-144-right.png、shots/linux-card-jump-status.png、shots/linux-card-longname.png（均为窗口级截图）。
+- 没做到的地方见第 8 节（整屏截图不可得、拖动位置未落盘、页码源只读、收起把手未做等）。
+
+约束遵守：
+- 没有启动 Windows 上的 ClassIsland / WPS。
+- 没有部署到 C:\Users\xzq\Desktop\github\ClassSlideSync\classisland\... 那个正在用的宿主。
+- 没有动 git（该目录本身也不是 git 仓库，`git status` 直接报 not a git repository）。
+
+====================================================================
+1. 改了哪些文件 / 行号
+====================================================================
+1.1 新增 Ui/ICardSink.cs（78 行）
+    - 23 行：`public interface ICardSink : IDisposable`
+    - 26/29/32/35/38 行：事件 JumpRequested、PanelRequested、PositionChanged(bool,int)、
+      HistoryJumpRequested(string,int)、OpenDeckRequested(string,int)（全部 `?` 可空）
+    - 41 行：`Action<string>? Log { get; set; }`
+    - 44 行 `bool IsCreated`、47 行 `bool IsHidden`、50 行 `string Diag()`
+    - 53 行 `void Start()`、58 行 `void Configure(CardAppearance,bool showOnStart,bool autoHide,int autoHideSeconds,bool showPanel=true)`
+    - 61 行 `void SetAppearance(CardAppearance)`、64 行 `void Apply(CardState)`、67 行 `void ShowStatus(string)`
+    - 70 行 `void Show()`、73 行 `void Hide()`、76 行 `void Expand()`
+
+1.2 新增 Ui/LinuxCardWindow.cs（833 行，Avalonia，代码构建 UI，无 axaml）
+    - 29 行 `public sealed class LinuxCardWindow : ICardSink`
+    - 89-93 行：5 个事件（与接口同签名）
+    - 96 行 Log、98 行 IsCreated、100 行 IsHidden、102 行 Diag()
+    - 124 行 Start、138 行 Configure、158 行 SetAppearance
+    - 178 行 `public void ApplyExternal(string deckName, int page, int total, bool isShowing)`（外部状态驱动，任务第 4 条）
+    - 193 行 `public void Apply(CardState)`（与 Windows 同签名，保留给以后接引擎）
+    - 208 行 ShowStatus、214 行 Show、231 行 Hide、245 行 Expand、251 行 Dispose
+    - 300 行 BuildStructure()（每次重建版式）、335 行 Canvas、349 行 BuildGear、791 行 BuildGear(向量齿轮)
+    - 547 行 RenderNow、568 行 UpdateVisuals、653 行 Place、678 行 ScreenFor(Window)、
+      684 行 UpdateDiag、698 行 ShowWindow、710 行 ScalingOf、716 行 DropCard、740 行 RestartHideTimer、769 行 Post
+    - 495-537 行：拖动（按下不 Capture，移动超过 4 DIP 才 Capture；松手 → DropCard）
+
+1.3 Ui/NativeOverlayCard.cs（只加接口，不改绘制）
+    - 29 行：`public sealed class NativeOverlayCard : IDisposable, ICardSink`
+    - 288/295/301/307/314 行：5 个事件从 `Action` 改成 `Action?`（可空）。安全性：
+      所有触发点原本就是 `var h = XxxRequested; h?.Invoke(...)`（1899/1917/1932/1959/2024/2044 行），
+      改成可空不改变任何运行时行为，只是消除 CS8612。
+    - 589-600 行：显式接口实现（新增，不改原方法）
+        `void ICardSink.Show() { Expand(); }`
+        `void ICardSink.Hide() { HideForAutomation(); }`
+        `Action<string>? ICardSink.Log { get => Log; set => Log = value ?? (_ => { }); }`
+    - 绘制、窗口过程、消息泵、定时器、点击/拖动逻辑全部未改。
+
+1.4 Services/SlideSyncService.cs
+    - 33 行：字段 `ICardSink card;`（原来是 `NativeOverlayCard card;`）
+    - 35 行：新字段 `LinuxCardWindow? linuxCard;`
+    - 120 行：`public ICardSink Card { get { return card; } }`
+    - 271 行 `PublishLinuxPage(LinuxSlideRead read)`：触发 LinuxPageChanged 后，非 Windows 上
+      `if (read.Ok && started && !armed) Arm("Linux 页码源：检测到放映")`，然后 PushLinuxPage(read)。
+    - 828 行：`Arm()` 开头 `if (!PlatformGuard.IsWindows) { ArmLinux(reason); return; }`
+      （Windows 分支一行未动）
+    - 930 行 `void ArmLinux(string reason)`：armed=true、记 ArmReason、BuildLinuxCard、订阅
+      OnLinuxPageChanged、立刻推一帧、写日志 "linux card: armed, waiting for ..."、1.5s 后打 Diag。
+    - 966 行 `LinuxCardWindow BuildLinuxCard()`：Configure(Appearance, AutoShowOverlay, AutoHide,
+      AutoHideSeconds, EnableControlPanel)，订阅 JumpRequested→OnLinuxJumpRequested、
+      PositionChanged→OnPositionChanged、PanelRequested→OnPanelRequested，接 Log，Start()。
+    - 983 行 `PushLinuxPage(LinuxSlideRead)`：空/无效 → `ApplyExternal("",0,0,false)`；否则
+      `ApplyExternal(Path.GetFileNameWithoutExtension(read.File), read.Page, read.Total, read.Showing)`。
+    - 999 行 OnLinuxPageChanged、1009 行 OnLinuxJumpRequested（只读源：给一句状态 + 记日志）。
+    - 1024 行 `void DisarmLinux(string reason)`：与 Disarm 对称（退订、置空、发空 CardState、Dispose、关面板）。
+    - 1073 行：`Disarm()` 开头 `if (!PlatformGuard.IsWindows) { DisarmLinux(reason); return; }`
+    - 1635 行 `Stop()`：非 Windows 分支先 `DisarmLinux("插件停止 / ClassIsland 退出")`，再停 500ms 定时器、清 LogSink。
+    - 1775 行 `CardVisible`、1785 行 `HideCardForAutomation`（内部改为 `c.Hide()`，Windows 语义仍落到
+      HideForAutomation，结果完全一致）。
+
+1.5 未改：Plugin.cs、Core/LinuxSlideSource.cs、ControlPanel 等。
+    - 非 Windows 启动分支里「注册只读设置页 + 启动 500ms 页码文件桥（LinuxSlideSource）」是同事已写好的
+      （Plugin.cs 50-92 行，15:51 修改），我按它的实际接口直接调用，没有自造 LinuxSlideSource 桩。
+    - Views/SettingsPages/PlatformUnavailablePage.cs 仍是现状（Linux 上设置页文案还是「依赖 Windows…」，
+      这次没改文案——见第 8 节）。
+
+====================================================================
+2. 接口设计
+====================================================================
+服务只认 ICardSink，不再关心「Win32 分层窗口」还是「Avalonia Window」：
+
+    +----------------------+        +-------------------+        +---------------------+
+    | SlideSyncService     |  --->  | ICardSink         |  --->  | NativeOverlayCard   | (Windows)
+    |  card / linuxCard    |        | (Ui/ICardSink.cs) |  --->  | LinuxCardWindow     | (Linux)
+    +----------------------+        +-------------------+        +---------------------+
+
+- 语义化别名：Show() = Windows 的 Expand()（清抑制 + 20s 预览）；Hide() = Windows 的 HideForAutomation()
+  （只收卡片不拆引擎）。Windows 侧用显式接口实现转发，所以重构前后行为逐字节一致。
+- 线程约定：接口方法可从任意线程调用；实现自己负责切 UI 线程（Win32 是 PostMessage，Avalonia 是
+  Dispatcher.UIThread.Post）。接口注释里写明了「实现不得把异常抛回服务」。
+- IsCreated / IsHidden 用于自动化「显示/隐藏悬浮卡片」的判断；Linux 的 IsCreated = Avalonia Window 已 Show。
+- HistoryJumpRequested / OpenDeckRequested 在 Linux 上保留但从不触发（历史面板、外部打开器还没做），
+  LinuxCardWindow 里用 `#pragma warning disable CS0067` 标注。
+
+Windows 侧的映射（全部落在既有方法上，零语义变化）：
+    Show()  -> Expand()
+    Hide()  -> HideForAutomation()
+    Log     -> 原有 public Action<string> Log 字段（setter 把 null 换成空委托，防止实现方未接日志时 NRE）
+
+====================================================================
+3. LinuxCardWindow 设计
+====================================================================
+3.1 窗口属性（任务指定项，逐条落实）
+    SystemDecorations = None
+    WindowStartupLocation = Manual
+    Topmost = true
+    ShowInTaskbar = false
+    CanResize = false
+    TransparencyLevelHint = new[] { WindowTransparencyLevel.Transparent }
+    Background = Brushes.Transparent
+    外层 Border：CornerRadius = CardAppearance.Radius（默认 10）、BorderThickness 1（hairline）、
+    ClipToBounds = true；背景色为 CardAppearance 的 Bg + BgAlpha（默认 230）带 alpha 的 SolidColorBrush。
+
+3.2 版式（坐标全部是 DIP，取自 Windows 卡片的 96dpi 像素值；Windows 那套本来就是「1 DIP = 1 px @96dpi」）
+    W = look.CardWidth（默认 236），H = look.CardHeight（默认 176）
+    onRight 时：padL = 14，padR = 28；onLeft 时对调（把手一直在外侧）
+    inner = W - padL - padR = 194
+    标题：      (padL, 12)，宽 = 齿轮左侧 - padL - 4，高 20，12.5 SemiBold，超长 CharacterEllipsis
+    齿轮：      24×24，位于 (W - (onRight?28:14) - 24, 10)，向量绘制（8 齿 + 圆环），点击 → PanelRequested
+    大页码：    (padL, 32)，高 54，40 SemiBold，左列宽 max(30, rightX-padL-4)，rightX = padL + 70
+    「共 N 页」：(rightX, 34)，宽 rightW，高 20，10.5 常规，muted，右对齐
+    「还剩…」： (rightX, 56)，宽 rightW，高 30，11.5 SemiBold，text 色，右对齐，超长省略
+    按钮：      (padL, 94)，inner×32，圆角 8；实心 accent 填充 + 白字 12.5 SemiBold
+                「从第 N 页接着讲」；无页码时灰底 muted 文案（与 Windows 同文案/同切换条件）
+    进度条：    (padL, 134)，inner×4，圆角 2，轨道 #CDD0D5，填充 accent，
+                宽 = round(inner × page/total)，页码>0 时最小 2px（与 Windows ProgressFillWidth 同规则）
+    底部一行：  (padL, 146)，inner×18，10.5 muted：有历史显示「历史 · N 次 ›」，否则显示状态/页码
+    外侧把手：  宽 18、整高，贴外边缘；底色 Mix(bg,text,0.10)，箭头 ❯/❮（14），点击 → Hide()
+
+    与 Windows 的对应常量核对过：CardPadTop 12、TitleStep 20、PageBlockStep 54、BtnGapTop 8、
+    BtnHeight 32、BarGapTop 8、BarHeight 4、HistGapTop 8、HistStep 18、CardPadBottom 12，
+    合计 12+20+54+8+32+8+4+8+18+12 = 176 = CardAppearance.Resolve 的默认高度。
+
+3.3 DPI / 缩放
+    - 全部用 DIP，字号直接取 Windows 那套「96dpi 下的 px 值」（12.5/10.5/11.5/40/14），
+      因为 Avalonia 的 FontSize 单位也是 DIP；窗口像素尺寸 = DIP × TopLevel.RenderScaling。
+    - 实测：scale=1 → 窗口 236×176；scale=1.5 → 354×264（= 236×1.5 / 176×1.5），
+      与任务里 96/144dpi 的 236×176 / 354×264 完全一致（见 shots/linux-card-144-right.png）。
+    - 位置计算用「物理像素」：x = 工作区右 - 像素宽，y = 工作区上 + round((工作区高 - 像素高) × v%)，
+      像素尺寸 = DIP × RenderScaling，所以 1.5 倍下贴边仍然严丝合缝。
+
+3.4 交互
+    - 点按钮 → JumpRequested；点齿轮 → PanelRequested；点把手 → Hide()。
+    - 拖动：任意空白处按下不立即 Capture（否则按钮/齿轮的 PointerReleased 会被吞），
+      移动超过 4 DIP 才 Capture；拖动中实时 `win.Position = start + delta × scaling`；
+      松手 → DropCard()：按窗口中心在屏幕左半/右半决定 onRight，按
+      (top - 工作区上) / (工作区高 - 窗高) 算竖直百分比，改 look、重建、重新 Place，然后
+      触发 PositionChanged(onRight, percent)。
+    - 自动隐藏：DispatcherTimer，5..600s（默认 15s）；Expand()/Show() 会给 20s 预览期；
+      新数据到达会重新显示（实测卡片自动隐藏后，页码更新会把它唤回来）。
+
+3.5 线程安全
+    - 所有窗口操作都经 Post()（Dispatcher.UIThread.Post）；状态字段 volatile。
+    - Diag() 曾被服务在后台线程调用，Avalonia 抛 "Call from invalid thread"；现在 Diag 返回
+      UI 线程缓存的 lastDiag 字符串 + volatile 状态位，任意线程安全（这个坑已修掉，最终日志里没有该异常）。
+
+3.6 外部状态驱动（任务第 4 条）
+    `ApplyExternal(deckName, page, total, isShowing)`：
+    - deck=课件名（服务已用 Path.GetFileNameWithoutExtension 去扩展名）
+    - page/total 直接来自 LinuxSlideSource.TryReadDetailed
+    - isShowing 决定按钮文案与「等待放映 / 正在识别」的兜底
+    - 剩余页 = total - page；剩余分钟暂按 1.5 分钟/页估算（代码里标了 TODO，等 Ledger 的页速）
+    - 历史次数固定 0（Linux 还没有台账面板），所以底部显示页码行而不是「历史 · N 次」
+
+服务侧数据流（每 500ms，同事写的桥 + 我的卡片）：
+    current.json ──(LinuxSlideSource.TryReadDetailed)──> LinuxTick ──> PublishLinuxPage
+        ──> LinuxPageChanged ──> OnLinuxPageChanged ──> PushLinuxPage ──> ApplyExternal
+    （页码没变就不推；文件消失/过期 10s/坏 JSON → 推 Empty → 卡片回「无页码」并自动隐藏）
+
+====================================================================
+4. Windows 构建
+====================================================================
+命令：
+    & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build ClassSlideSync.Plugin.csproj -c Release -t:Rebuild
+
+结果：
+    216 个警告
+    0 个错误
+（警告数与基线 200 左右相当；新增代码没有引入新的 warning 类型——ICardSink 事件可空就是为了避免 CS8612。）
+
+Windows 行为不变性的保证：
+- NativeOverlayCard 只改了类声明多一个接口、事件可空、加 3 个显式接口成员；绘制、窗口过程、消息泵、
+  定时器、命中测试、位置/DPI 计算一行未动。
+- SlideSyncService 的 Windows 分支（Arm/Disarm 的 IsWindows 路径、BuildCard、OnStateChanged、
+  OnSettingsChanged、自动化、看门狗）未改逻辑；`HideCardForAutomation` 里 `c.HideForAutomation()`
+  换成 `c.Hide()`，而 Windows 的 Hide() 显式实现就是 HideForAutomation()，行为等价。
+
+====================================================================
+5. Linux 构建（WSL UbuntuCi / root）
+====================================================================
+同步源码：
+    tar -C /mnt/c/Users/xzq/Documents/deepseek-harness/default-workspace/ClassSlideSync.Plugin \
+        --exclude=bin --exclude=obj -cf - . | tar -C /root/plugin -xf -
+
+命令：
+    cd /root/plugin && dotnet build -c Release -t:Rebuild
+
+结果：
+    .../SlideSyncSettingsPage.axaml : Avalonia warning AVLN3001: XAML resource ... won't be reachable ...
+        216 Warning(s)
+        0 Error(s)
+    Time Elapsed 00:00:07.69
+
+部署：
+    cp -f /root/plugin/bin/Release/net8.0/ClassSlideSync.Plugin.dll \
+          /root/ci-linux/data/Plugins/ClassSlideSync.Plugin/ClassSlideSync.Plugin.dll
+
+====================================================================
+6. WSL 实机验证
+====================================================================
+环境：Xorg（xrdp）:0，2560×1600，XWayland/Weston；ClassIsland 2.1.0.1 宿主 /root/ci-linux。
+启动：
+    pkill -9 -f ClassIsland
+    cd /root/ci-linux && DISPLAY=:0 XDG_RUNTIME_DIR=/tmp/xdg-runtime setsid ./ClassIsland >/tmp/ci12.log 2>&1 &
+页码源（模拟主讲状态）：
+    /root/.local/share/classslidesync/current.json
+    {"file":"/root/课件/浮层卡片测试.pptx","page":7,"total":18,"showing":true,"updated":"...Z","app":"libreoffice"}
+    （注意：LinuxSlideSource 的过期阈值是 10 秒，updated 必须是「刚刚」；过期会回「无页码」）
+
+6.1 启动 + 建卡片 + 位置（app.log 片段，原样）
+    2026-10-31 08:05:45 === plugin start (linux), data folder: /root/ci-linux/data/Config/Plugins/ClassSlideSync.Plugin
+    2026-10-31 08:05:45 linux source: watching /root/.local/share/classslidesync/current.json every 500ms (stale after 10s)
+    2026-10-31 08:05:45 linux source: 浮层卡片测试.pptx 第 5/18 页（放映中，libreoffice）
+    2026-10-31 08:05:45 arm: Linux 页码源：检测到放映
+    2026-10-31 08:05:45 linux card: armed, waiting for /root/.local/share/classslidesync/current.json
+    2026-10-31 08:05:45 card: [linux-card] window created 236x176
+    2026-10-31 08:05:45 card: [linux-card] start
+    2026-10-31 08:05:47 overlay: linux-avalonia window=yes created=True visible=yes scale=1 card=236x176 pos=2324,712 hidden=False side=right v=50% | deck=浮层卡片测试 page=5/18 showing=True hist=0
+
+    xwininfo 核对：窗口 236x176，绝对位置 +2324+712（= 2560-236，(1600-176)×50%）。
+    左贴 + 25% 测试（改 SyncSettings.CardOnLeft=true / CardVerticalPercent=25 后重启）：
+    overlay: ... pos=0,356 hidden=False side=left v=25%    → x=0，y=(1600-176)×25%=356，正确。
+
+6.2 点「从第 N 页接着讲」
+    （用 XTEST 注入真实鼠标事件，非直接调 API）
+    2026-10-31 08:05:53 jump ignored (linux, read-only source): 浮层卡片测试.pptx 第 5/18 页（放映中，libreoffice）
+    卡片底部状态行变为「Linux 版暂不支持跳页（页码来自只读适配器）」（shots/linux-card-jump-status.png）。
+    说明：页码来源目前是只读适配器，按设计不假装能跳页。
+
+6.3 点齿轮
+    2026-10-31 08:04:56 panel: opened
+    控制面板窗口被创建（ClassIsland 自己的窗口）；台账在 Linux 上是只读的。
+
+6.4 拖动
+    2026-10-31 08:06:01 card: [linux-card] moved: side=right v=37%
+    窗口 y 从 712 变为 527（= (1600-176)×37%），贴边逻辑保持右侧。
+
+6.5 DPI（144dpi / scale 1.5）
+    env AVALONIA_GLOBAL_SCALE_FACTOR=1.5 AVALONIA_SCREEN_SCALE_FACTORS='rdp-0:1.5,*:1.5' ...
+    overlay: ... scale=1.5 card=236x176 pos=2206,668 ...
+    xwininfo: 354x264（= 236×1.5 × 176×1.5），x=2560-354=2206，y=(1600-264)×50%=668。
+    注：只设 Xft.dpi=144 时 Avalonia 仍报 scale=1（Avalonia 11 的 X11 后端不读 Xft.dpi），
+    所以用 AVALONIA_* 环境变量模拟 144dpi。
+
+6.6 其它状态
+    - 数据过期（>10s 没更新）→ 日志「数据中断（文件不存在/过期/坏 JSON），卡片回到「无页码」」，
+      卡片先显示无页码、随后按 15s 自动隐藏规则收起；新数据到达会重新出现。
+    - 超长文件名：标题正确省略（shots/linux-card-longname.png 里显示为「这是一份名字特别特别长的…」）。
+    - 历史次数为 0 时底部显示「第 N / M 页」；有历史（Windows）时还是「历史 · N 次 ›」。
+
+====================================================================
+7. 截图
+====================================================================
+（窗口级截图，PNG；整屏截图见第 8 节说明，XWayland 下抓不到 root）
+    shots/linux-card-96-right.png     236×176  scale=1，贴右 50%，page 10/18（主图）
+    shots/linux-card-96-left.png      236×176  scale=1，贴左 25%，page 4/10（把手在左、❮ 箭头）
+    shots/linux-card-144-right.png    354×264  scale=1.5（对应 Windows 144dpi 卡片尺寸）
+    shots/linux-card-jump-status.png  236×176  点击按钮后的状态行
+    shots/linux-card-longname.png     236×176  超长文件名省略 + 非放映态
+对照用的 Windows 卡片（仓库里原有，未改动）：
+    shots/audit-card-96-right-normal.png（236×176）、shots/audit-card-144-right-normal.png（354×264）
+逐项对比：标题/齿轮/大页码/共 N 页/还剩行/按钮/进度条/底部行 的纵向位置与尺寸一致；
+背景色随 CardAppearance/ClassIsland 主题走（WSL 里是浅色主题，所以看起来是浅底深字，Windows 深色主题下就是深底浅字）。
+
+====================================================================
+8. 没做到的地方 / 已知差距
+====================================================================
+1) 整屏截图抓不到：这台 WSL 是 Xorg(xrdp) + XWayland，`import -window root` 报
+   "Resource temporarily unavailable"，`xwd -root`/`xwd -id` 报 BadMatch，机器上也没有 grim/scrot/ffmpeg。
+   所以只有窗口级截图（import -window <id>），没有「卡片贴在桌面右侧」的整屏图。
+2) 拖动位置没有落盘到 SyncSettings.json：Plugin.cs 的非 Windows 分支（同事所写，50-92 行）
+   没有像 Windows 分支（107-110 行）那样订阅 Settings.PropertyChanged → ConfigureFileHelper.SaveConfig。
+   服务里 OnPositionChanged 已把 CardOnLeft/CardVerticalPercent 写进内存 settings，
+   但重启后仍读文件里的旧值（实测拖到 37% 后文件里还是 50）。
+   建议在 Linux 分支补 3 行保存钩子；这次没改，避免和正在改 Plugin.cs 的同事冲突。
+3) 页码源只读：按钮点击只显示「Linux 版暂不支持跳页（页码来自只读适配器）」；
+   历史面板、打开课件、页速/剩余分钟的真实估算都没有（剩余分钟目前按 1.5 分钟/页估，代码里 TODO）。
+4) 收起态「把手/药丸」没做：Linux 卡片只有展开态，点外侧把手是隐藏而不是缩成窄条。
+   （任务接口里只有 Show/Hide/Expand，没有要求 pill，但和 Windows 的视觉行为有差别。）
+5) 控制面板（ControlPanel）是普通 Avalonia 窗口，打开后可能盖住卡片：
+   实测先开面板再点卡片按钮时，点击被面板吃掉；关掉面板后按钮正常。
+   后续可让面板不抢置顶，或卡片点击时先激活自己。
+6) 自动化（Automation/Action/Trigger）仍只在 Windows 注册；Linux 上「显示/隐藏悬浮卡片」
+   这类动作暂时不可用（Plugin.cs 非 Windows 分支直接 return）。
+7) Linux 设置页文案还是「本插件依赖 Windows 的窗口与 COM 自动化，当前平台不可用。」
+   （Views/SettingsPages/PlatformUnavailablePage.cs），现在已经不准确了，但不在这次范围内，没改。
+8) 只在 WSL 的 xrdp/XWayland 环境验证过，没在真机 GNOME/KDE Wayland 或纯 Xorg 桌面上跑；
+   多显示器、混合 DPI（每屏不同缩放）没测（Place() 用 ScreenFromWindow 取当前屏，理论上支持）。
+9) 未在 Linux 上验证「自动隐藏 15s / 预览 20s」的完整时序边界（只看到 auto-hidden 与重新显示）。
+
+====================================================================
+9. 手工复现步骤（给同事）
+====================================================================
+Windows：
+    & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build ClassSlideSync.Plugin.csproj -c Release -t:Rebuild
+Linux：
+    tar -C /mnt/c/Users/xzq/Documents/deepseek-harness/default-workspace/ClassSlideSync.Plugin \
+        --exclude=bin --exclude=obj -cf - . | tar -C /root/plugin -xf -
+    cd /root/plugin && dotnet build -c Release -t:Rebuild
+    cp -f bin/Release/net8.0/ClassSlideSync.Plugin.dll /root/ci-linux/data/Plugins/ClassSlideSync.Plugin/
+    pkill -9 -f ClassIsland
+    printf '{"file":"/root/课件/浮层卡片测试.pptx","page":7,"total":18,"showing":true,"updated":"%s","app":"libreoffice"}' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /root/.local/share/classslidesync/current.json
+    cd /root/ci-linux && DISPLAY=:0 XDG_RUNTIME_DIR=/tmp/xdg-runtime setsid ./ClassIsland >/tmp/ci12.log 2>&1 &
+    # 日志：/root/ci-linux/data/Config/Plugins/ClassSlideSync.Plugin/app.log
+    # 截图：DISPLAY=:0 import -window <id> /tmp/card.png
+    # 备注：current.json 的 updated 必须每 10 秒内刷新一次，否则会被判过期。

@@ -1,0 +1,475 @@
+================================================================================
+课件续页（ClassSlideSync.Plugin）—— ClassIsland 老版本兼容 / Linux 兼容 事实调研
+================================================================================
+调研时间：2026-10-31（Asia/Shanghai）
+调研方式：纯只读。未修改插件源码，未构建，未启动 ClassIsland。
+证据分级：
+  [文档] 官方文档原文（URL 可点开复核）
+  [源码] ClassIsland 宿主源码（本地 clone，附文件:行号）
+  [包]   NuGet 实际下载的包内容
+  [本机] 本机已安装的 ClassIsland 2.1.0.1 实例
+
+
+================================================================================
+0. 一页结论（每条的来源在后续章节）
+================================================================================
+1) 宿主 1.x：Windows only。WPF + WinForms 工程，TFM net8.0-windows，没有 Linux/macOS 构建。
+   官方口径 Windows 10 及以上；Win7 只有「.NET 6 兼容版」，而该兼容版明确不支持插件。
+2) 宿主 2.x：三平台官方构建。Windows 10+（编译期最低平台 10.0.19041.0）、macOS Big Sur 11+、
+   Linux Debian 10+（x86_64 / arm64）。有 platforms/ClassIsland.Platforms.Linux 工程与 UOS deb 打包。
+3) manifest 的 apiVersion 在 1.x 宿主里【完全不生效】：1.7.0.1 全树只有字段声明，没有一处读取。
+4) 2.x 宿主的 apiVersion 规则只有一条下限：apiVersion < 2.0.0.0 → 拒绝加载。
+   【没有上界校验】——apiVersion 高于宿主版本照样加载（源码里是 TODO）。
+   因此「apiVersion 声明 ≥2.0.0.0 就一定能在 2.x 跑」这句话只在「下限」意义上成立。
+5) ClassIslandPluginSdkVersion 只是 csproj 里的局部变量，喂 PackageReference 的版本号；
+   SDK 的 build targets 不读它，宿主更不读它。它不产生任何加载期约束。
+6) 1.x 宿主【不能】加载 2.x 插件，而且做不到优雅降级：
+   1.x 在 asm.ExportedTypes 阶段就会抛（我们的 Avalonia 基类在 1.x 不存在），
+   异常发生在插件 Initialize 之前，插件代码没有机会跑一行。
+7) 真正卡死 1.x 的不是 apiVersion，而是三条架构差异：
+   WPF→Avalonia、AddAction(id,name,PackIconKind,delegate)→AddAction<TAction>()、
+   AddSettingsPage<T> where T : (WPF) SettingsPageBase→Avalonia 版。
+8) 2.0.x 与 2.1.x 之间：manifest apiVersion 写 2.0.0.0 是「宣称最低 2.0」；静态核对 Core 2.0.4 已有
+   ITutorialService.BeginTutorial / ActionBase / TriggerBase / ComponentBase / AddRule / SettingsPageBase，
+   所以 2.0.x 很可能能加载（未实测，本轮不允许运行）。
+9) Linux：宿主侧没问题（官方支持），插件加载器侧【也没有任何平台闸门】——
+   supportedOSPlatforms 只影响插件市场 UI 的警告，不阻止加载/启用/运行。
+   所以「能编译、能加载、功能不可用」这条路线在技术上是成立的。
+10) 但「功能不可用」不是小事：插件有三处硬 Windows 依赖——Win32 悬浮窗（50 处 DllImport）、
+    PowerPoint/WPS COM 自动化（13 处）、Shell_NotifyIcon 托盘（7 处）；
+    另有 WinRT 通知 helper（独立 exe，TFM net8.0-windows10.0.19041.0，Linux 上无法运行）。
+11) 结论一句话：老版本（1.x）兼容 = 做不到，能做的是「别让 1.x 用户装上 / 装上后看懂报错」；
+    Linux 兼容 = 宿主能跑、插件能装，但功能要重写（COM→UNO/DBus、Win32 窗口→Avalonia 窗口、
+    WinRT 通知→IAppHost 里的通知服务），属于重写而不是配置。
+12) 最小改动清单（若目标是「不撒谎 + 不炸」）：
+    manifest.yml 保持 apiVersion 2.0.0.0 / supportedOSPlatforms: [Windows]；
+    README 注明「ClassIsland 2.1+ / Windows 10+」；
+    Plugin.cs 在非 Windows 上早退并给一条设置页说明（避免 Linux 用户以为坏了）；
+    csproj 若真要出 Linux 包，TFM 需改 net8.0 并把 ToastHelper 子工程隔到 Windows 条件里。
+
+
+================================================================================
+1. 宿主系统支持矩阵
+================================================================================
+┌──────────┬────────────────────────────┬───────────────┬───────────────────┐
+│ 宿主版本 │ Windows 最低版本            │ Linux         │ macOS             │
+├──────────┼────────────────────────────┼───────────────┼───────────────────┤
+│ 1.x      │ Win10（官方，x86_64）；      │ 无官方支持    │ 无官方支持        │
+│ (≤1.7.x) │ Win7 仅「.NET 6 兼容版」，   │ （WPF 架构，   │ （WPF 架构，      │
+│          │ 该版插件功能被移除          │ 无对应工程）  │ 无对应工程）      │
+├──────────┼────────────────────────────┼───────────────┼───────────────────┤
+│ 2.x      │ Win10 及以上（官方，x86_64  │ Debian 10+（或 │ macOS Big Sur 11+ │
+│ (2.0–2.1)│ /arm64）；编译期最低平台    │ 衍生版），     │ （Intel / Apple   │
+│          │ 10.0.19041.0（= Win10 2004）│ x86_64 / arm64 │ Silicon）         │
+└──────────┴────────────────────────────┴───────────────┴───────────────────┘
+
+1.1 2.x 官方系统要求
+[文档] https://docs.classisland.tech/get-started/setup.html
+  原文：
+    「要运行 ClassIsland，您的系统必须满足以下任意一条要求：
+      - Windows: Windows 10 及以上版本的系统，x86_64 或 arm64 架构
+      - macOS: macOS Big Sur 11 或更高版本，Intel 或 Apple Silicon
+      - Linux: Debian 10（或其衍生版本）或更高版本，x86_64 或 arm64 架构」
+[文档] https://www.classisland.tech/download（Build_3.0.0.4）
+  同口径：「Windows 10 及更高版本」「Linux Debian 10 或其衍生版」「Mac MacOS Big Sur 11 及更高版本」，
+  页面上另有「下载 ClassIsland 1」入口（说明 1.x 仍在分发）。
+
+1.2 2.x 的 Windows 真实下限（比文档更硬）
+[源码] 仓库 ClassIsland/ClassIsland，文件 `CrossPlatformProps.props`（Windows 分支）：
+    <PropertyGroup Condition="'$(Platforms_Windows)'=='true'">
+        <TargetFramework>$(BaseFramework)-windows10.0.19041.0</TargetFramework>
+  → TFM 的 platform 版本即 SupportedOSPlatformVersion 默认值 = 10.0.19041.0（Win10 2004）。
+    文档只写「Windows 10」，实现上低于 19041 的 Win10（1809/1909）官方不保证。
+  macOS 分支：`$(BaseFramework)-macos15.0` + `<SupportedOSPlatformVersion>10.15</SupportedOSPlatformVersion>`
+  Linux 分支：只有 `<DefineConstants>…;Platforms_Linux</DefineConstants>`，TFM 保持 `$(BaseFramework)`（=net8.0）。
+
+1.3 2.x 确实是跨平台工程（有 Linux 产品化投入）
+[源码] 同仓库：
+  - 目录 `platforms\ClassIsland.Platforms.Linux\`（含 Notification\FreeDesktopNotificationProxy.cs、
+    Services\DesktopService.cs、DesktopToastService.cs、WindowPlatformService.cs，依赖 Tmds.DBus）
+  - 解决方案筛选器 `ClassIsland.Filter.Linux.slnf` / `ClassIsland.Filter.MacOs.slnf`
+  - 打包工程 `ClassIsland.Packaging`（含 Packaging.DebUOS，UOS 商店的 deb 包）
+  - `global.json`：sdk 9.0.100
+[本机] 本机安装的是 Windows 包：`…\classisland\app-2.1.0.1-0\` 只带
+  `ClassIsland.Platforms.Abstractions.dll` + `ClassIsland.Platforms.Windows.dll`。
+
+1.4 1.x 官方系统要求
+[文档] https://docs-v1.classisland.tech/app/setup.html
+  原文：「Windows 10 及以上版本的系统，x86_64 架构」；需要 .NET 8 桌面运行时。
+  另有 Windows 7 路径（需 .NET 6 桌面运行时 + KB3063858 等），文档注明「不建议」；
+  「.NET 6 兼容版」明确列出「以下功能在此兼容版不可用：- 插件功能」。
+  → 即：Win7 用户根本用不了插件，1.x 插件的真实目标平台就是 Win10+ / .NET 8。
+[源码] 1.7.0.1 的 `ClassIsland/ClassIsland.csproj`：
+    <UseWPF>true</UseWPF> / <UseWindowsForms>True</UseWindowsForms>
+    <SupportedOSPlatformVersion>7.0</SupportedOSPlatformVersion>
+    非 MSIX 分支（第 45-47 行）: <TargetFramework>net8.0-windows</TargetFramework>
+    MSIX 分支（第 31 行）: net8.0-windows10.0.26100.0
+  → 工程自身声明技术支持 Win7，但产品口径是 Win10+，且 Win7 必须走无插件的兼容版。
+
+
+================================================================================
+2. apiVersion 的确切匹配规则
+================================================================================
+2.1 字段定义（两个大版本都有）
+[源码] `ClassIsland.Core\Models\Plugin\PluginManifest.cs:58`
+        public string ApiVersion { get; set; } = "";
+[文档] https://docs.classisland.tech/dev/plugins/create-project.html 清单属性表：
+    「apiVersion | Version | 是 | 此插件面向的 ClassIsland 版本。此插件将只能在高于此版本的
+      ClassIsland 上工作。」
+[文档] https://docs.classisland.tech/dev/plugins/publishing.html 市场清单属性表：
+    「apiVersion | string | 是 | 指定插件所支持的最低插件加载器版本。ClassIsland 2.0 起将拒绝
+      加载此字段低于 2.0.0.0 的插件。| 2.0.0.0」
+
+2.2 2.x 宿主真正执行的判断（唯一的加载闸门）
+[源码] `ClassIsland\Services\PluginService.cs:168-173`（master 与 2.1.0.1 tag 一致）：
+    168:  if (info.IsEnabled && Version.TryParse(info.Manifest.ApiVersion, out var apiVersion) && apiVersion < new Version(2, 0, 0, 0))
+    169:  {
+    170:      info.LoadStatus = PluginLoadStatus.Error;
+    171:      info.Exception = new InvalidOperationException($"不兼容的 API 版本 {apiVersion}。插件的 API 版本需要至少为 2.0.0.0 才能被当前版本的 ClassIsland 加载。");
+    172:      PluginLoadedStatus.Add(info);
+    173:  }
+  紧随其后第 175 行只对 `LoadStatus == NotLoaded` 的插件做加载排序：
+    175:  var loadOrder = ResolveLoadOrder(IPluginService.LoadedPluginsInternal.Where(x => x.LoadStatus == PluginLoadStatus.NotLoaded).ToList());
+  → 被判 Error 的插件不会进入 loadOrder，即「拒绝加载」的实际实现。
+
+  规则精确表述：
+  - Version.TryParse 失败（空串 / 非法格式）→ 整个条件为 false → 不做任何限制，照常加载。
+  - apiVersion >= 2.0.0.0 → 放行。
+  - apiVersion <  2.0.0.0 → 拒绝，插件列表显示错误，消息原文见第 171 行。
+  - 【关键】没有任何比较 apiVersion 与宿主版本（AppBase.AppVersion）的代码。
+
+2.3 上界校验：不存在（源码里是 TODO）
+[源码] `ClassIsland\Services\PluginMarketService.cs:445-452`：
+    445:  if (Version.TryParse(pluginLocal.Manifest.Version, out var versionLocal) &&
+    446:      Version.TryParse(plugin.Manifest.Version, out var versionRemote) &&
+    447:      Version.TryParse(plugin.Manifest.ApiVersion, out var apiVersion) &&
+    448:      Version.TryParse(AppBase.AppVersion, out var appVersion) &&
+    449:      versionRemote > versionLocal)  // TODO: 在 2.0 发布后，添加 api 版本校验！
+  → apiVersion 与 appVersion 都被解析出来，但条件里【只用了版本号比较】，
+    「apiVersion <= 宿主版本」的检查就是这条 TODO，至今没写。
+  全仓 grep `ApiVersion` 只有 6 处命中（PluginService.cs:168/171、PluginMarketService.cs:434/447、
+  PluginsSettingsPage.axaml.cs:277 仅展示、PluginManifest.cs:58 定义），没有第七处做比较。
+
+2.4 市场索引侧的过滤（2.x 只收 >= 2.0.0.0 的插件）
+[源码] `ClassIsland\Services\PluginMarketService.cs:433-435`：
+    foreach (var plugin in index.Plugins.Where(x =>
+                 Version.TryParse(x.Manifest.ApiVersion, out var version) &&
+                 version >= Version.Parse("2.0.0.0")))
+  → 插件市场里不会出现 apiVersion < 2.0.0.0 的插件；但也仅此而已，不看宿主版本。
+
+2.5 文档承诺 vs 实现的落差（重要）
+文档说「此插件将只能在高于此版本的 ClassIsland 上工作」，
+实现只做了 `>= 2.0.0.0` 的常量下限。后果：
+  - 把 apiVersion 写到 2.1.1.1，在 2.0.4 宿主上依然会被加载（如果插件真的调用了 2.1.1 才有的成员，
+    则在使用处炸 MissingMethodException，表现为运行期异常而不是「拒绝加载」）。
+  - 因此 apiVersion 不能当作「最低宿主版本」护栏，它只是给 2.0 之前的旧插件用的门禁。
+  - 想约束宿主版本，只能自己在 Initialize 里读 AppBase.AppVersion 判断。
+
+2.6 ClassIslandPluginSdkVersion 的真实作用
+[本机 + 包] 我们的 `ClassSlideSync.Plugin.csproj`：
+    <ClassIslandPluginSdkVersion>2.1.0.1</ClassIslandPluginSdkVersion>
+    <PackageReference Include="ClassIsland.PluginSdk" Version="$(ClassIslandPluginSdkVersion)">
+        <ExcludeAssets>runtime; native</ExcludeAssets>
+    </PackageReference>
+  核对两个版本的 SDK 包（1.7.0.1 与 2.1.0.1）：
+    - `build/net8.0/ClassIsland.PluginSdk.targets` 内容基本一致，只有 CreateCipx（ZipDirectory + MD5 +
+      缺 manifest.yml 报 CISDK0001）目标；grep 不到 `ClassIslandPluginSdkVersion`。
+    - 包里没有任何“宿主版本声明”机制。
+  → 结论：这个属性纯粹是模板留下的局部变量，只决定 PackageReference 的版本（即编译期引用哪版
+    ClassIsland.Core/P luginSdk）。宿主运行时完全看不到它。
+    它唯一实际影响是：编译时引用的 Core 版本越高，插件可能用到宿主没有的 API。
+
+2.7 SDK 版本 ↔ 宿主版本 对照（NuGet 全量版本表实取）
+[包] https://api.nuget.org/v3-flatcontainer/classisland.pluginsdk/index.json
+  1.x 线：
+    1.4.3.1 … 1.6.3、1.7.0、1.7.0.1
+      - 1.7.0.1 包：lib/net8.0-windows7.0/ClassIsland.PluginSdk.dll，
+        依赖 ClassIsland.Core >= 1.7.0.1，repository commit eaad05d3…
+      - 说明：1.x 的 SDK 是「Windows + WPF」，lib 路径带 windows7.0。
+    dev-v2 过渡线：1.7.103-dev-v2 … 1.7.106.2-dev-v2
+      - 1.7.106.2-dev-v2 包：lib/net8.0-windows7.0/…、依赖 Core 1.7.106.2-dev-v2，
+        tags 里写着 “classisland plugin addin wpf material design”，commit 27e93bb7…
+      - 官方 2.x 插件模板 `ClassIsland.PluginTemplate.Packaging 2.0.0.2` 到现在仍把默认 SDK
+        钉在 1.7.106.2-dev-v2，而模板 manifest 的 apiVersion 是 2.0.0.0。
+        → 这条线的包仍是 WPF 时代产物，不能当作 2.1 的 API 参考。
+  2.x 线：
+    2.0.0-dev-v2、2.0.0.1、2.0.0.2、2.0.1、2.0.1.1、2.0.2、2.0.3、2.0.3.1、2.0.3.2、
+    2.0.4、2.1.0、2.1.0.1、2.1.1、2.1.1.1
+      - 2.1.0.1 包：lib/net8.0/ClassIsland.PluginSdk.dll（跨平台），依赖 Core >= 2.1.0.1，
+        commit 15273f82…（正是本机安装版 ProductVersion 的后缀 15273f82c9d2d55929df83b5fb806e68ee4547c0）
+      - 2.1.1.1（最新）：targets net10.0、依赖 ClassIsland.Core >= 2.1.1.1
+  结论：1.7.x SDK → 1.x 宿主；2.x SDK → 2.x 宿主。我们用的是 2.1.0.1，对应本机 2.1.0.1 宿主，正确。
+
+2.8 本机实证
+[本机] `…\classisland\data\Plugins\` 已装 6 个插件，manifest 值：
+  action.inquiryWindow 1.0.0.0 / apiVersion 2.0.0.0
+  CIImage 1.1.0.0 / 2.0.0.0（其 publish\manifest.yml 还是 1.0.2.0 / apiVersion 1.6.0.5）
+  ClassGuard 1.0.1.0 / apiVersion 2.1.0.1 → 在 2.1.0.1 宿主上正常加载
+  ClassSlideSync.Plugin 1.2.2.0 / 2.0.0.0
+  com.bigscreen.clock 1.1.1.6 / 2.0.0.0
+  SystemTools 2.5.1.0 / 2.0.0.0
+  日志 `…\data\Logs\log-2026-10-25-14-10-00-1.log`：「此次会话已加载插件: …课件续页(ClassSlideSync.Plugin,1.2.2.0)…」
+  ※ 注：ClassGuard 的 2.1.0.1 能加载，只能证明「相等可以」，不能证明「上界被校验」；
+    上界不校验已由 2.3 的源码与 TODO 证伪。
+
+
+================================================================================
+3. 1.x 宿主能不能加载 2.x 插件
+================================================================================
+3.1 结论：不能。而且做不到「加载后友好提示」——失败发生在插件代码执行之前。
+
+3.2 证据链（五层）
+(a) 1.x 根本没有 apiVersion 闸门。
+    [源码] 对 1.7.0.1 全树（*.cs/*.xaml/*.csproj）grep `ApiVersion`，只有 1 处命中：
+      `ClassIsland.Core/Models/Plugin/PluginManifest.cs:57: public string ApiVersion { get; set; } = "";`
+      宿主加载代码里零引用。
+      → 所以 manifest 写 apiVersion: 2.0.0.0 对 1.x 完全没有拦截作用，1.x 会「照常尝试加载」。
+    [源码] 1.x `ClassIsland\Services\PluginService.cs` 的加载路径（157-186 行）与 2.x 同构：
+      157:  var asm = loadContext.LoadFromAssemblyName(…)
+      159:  var entrance = asm.ExportedTypes.FirstOrDefault(x =>
+      161:      x.GetCustomAttributes().FirstOrDefault(a => a.GetType() == typeof(PluginEntrance)) != null);
+      168:  if (Activator.CreateInstance(entrance) is not PluginBase entranceObj)
+      183:  catch (Exception ex) { … info.LoadStatus = PluginLoadStatus.Error; }
+      唯一的区别就是 2.x 在 148-173 行多了一段 apiVersion 判断，1.x 没有。
+
+(b) 入口类型本身是兼容的（所以 1.x 会走到「尝试加载」这一步）。
+    [源码] 1.7.0.1 与 2.x 的 `ClassIsland.Core\Abstractions\PluginBase.cs` 逐字相同：
+      public abstract class PluginBase {
+          public string PluginConfigFolder { get; internal set; } = "";
+          public PluginInfo Info { get; internal set; } = null!;
+          public abstract void Initialize(HostBuilderContext context, IServiceCollection services);
+      }
+    → 我们的 `Plugin : PluginBase` + `[PluginEntrance]` + `Initialize(HostBuilderContext, IServiceCollection)`
+      在 1.x 上签名完全对得上，1.x 不会因为入口类型不匹配而提前跳过。
+
+(c) 但 1.x 是 WPF，2.x 是 Avalonia —— 类型系统层面完全不兼容。
+    [源码] 1.7.0.1 的 ClassIsland.csproj：UseWPF / UseWindowsForms / TFM net8.0-windows；
+      1.7.0.1 的 ClassIsland.Core.dll（884 KB）引用 PresentationFramework，**不含 Avalonia**；
+      2.1.0.1 的 ClassIsland.Core.dll（3510 KB）引用 Avalonia，**不含 PresentationFramework**。
+    → 我们的 UI 类型（Avalonia UserControl / SettingsPageBase 派生页 / 悬浮卡片控件）在 1.x 进程里
+      连基类都解析不到（Avalonia.Base.dll 不存在）。
+
+(d) 插件注册 API 完全不同（不是「改个值」能解决的）。
+    [源码] 1.x `ClassIsland.Core\Extensions\Registry\ActionRegistryExtensions.cs:22`：
+      public static IServiceCollection AddAction(this IServiceCollection services, string id,
+          string name = "", PackIconKind iconKind = PackIconKind.BacteriaOutline,
+          ActionRegistryInfo.HandleDelegate? onHandle = null)
+      // 1.x 的「行动」是 id + 名称 + MaterialDesign 图标 + 一个委托；没有基类、没有特性。
+    [源码] 1.x `SettingsWindowRegistryExtensions.cs:20`：
+      public static IServiceCollection AddSettingsPage<T>(this IServiceCollection services)
+          where T : SettingsPageBase     // 1.x 的 SettingsPageBase 是 WPF UserControl 体系
+    [本机插件代码] 我们的 `Plugin.cs:65-93` 用的是 2.x 形态：
+      services.AddAction<OpenUnfinishedDeckAction>()、AddAction<NotifyAction, NotifyActionSettingsControl>()、
+      AddTrigger<SlidePageReachedTrigger, SlidePageReachedSettingsControl>()、AddComponent<DeckProgressComponent>()、
+      AddSettingsPage<SlideSyncSettingsPage>()、AddRule(id, name, glyph, handler)
+    → 1.x 里这些泛型重载/基类（ActionBase、TriggerBase）不存在于同名签名下，
+      即便类型能加载，JIT `Initialize` 也会失败。
+      （注：1.x Core 里存在 `ActionSettingsControlBase`、`ComponentBase` 这些旧名，但语义是 WPF 的，
+        不是 2.x 的 ActionBase/TriggerBase 体系。）
+
+(e) 我们插件还有 2.1 专属用法。
+    [本机插件代码] `Core\TutorialGuide.cs:67` `ITutorialService.RegisteredTutorialGroups`、
+      `:104` `service.BeginTutorial(tutorial)`、`:10 using ClassIsland.Core.Models.Tutorial`；
+      `Plugin.cs:97` `TutorialGuide.Register();`（Initialize 内同步调用）。
+
+3.3 1.x 尝试加载时的确切失败点
+[源码] 1.x `PluginService.cs:159` 的 `asm.ExportedTypes`：
+  .NET 的 `Assembly.ExportedTypes` 会先枚举全部导出类型再返回（底层 GetExportedTypes() 返回 Type[]），
+  任一类型解析失败就抛 ReflectionTypeLoadException，在谓词执行前发生。
+  我们的程序集里有 Avalonia 基类的类型（设置页、控件），1.x 进程里没有 Avalonia →
+  第 159 行抛 → 被第 183 行 catch → `info.LoadStatus = PluginLoadStatus.Error`。
+  → 插件列表里插件是「错误」状态，Exception 是 ReflectionTypeLoadException（内部 LoaderExceptions 里是
+    Avalonia 程序集找不到）。
+  ※ 这是「读 .NET 反射语义 + 源码行」的推断，未在 1.x 上实机复现（本轮不允许运行；且装一个 2.x 插件进
+    1.x 会污染本机 1.x 环境）。
+
+3.4 为什么做不到「加载时给出明确提示」
+  插件代码的唯一入口是 Initialize，而 Initialize 只有在 ExportedTypes 枚举成功、Activator.CreateInstance
+  成功之后才会被调用（1.x 第 168-180 行）。类型枚举阶段就抛了 → 插件没有任何代码路径可以运行。
+  要想在 1.x 里「说话」，唯一办法是把入口程序集做成一个只引用 ClassIsland.Core + Shared 的极小程序集
+  （不导出任何 Avalonia 类型），在其中读 AppBase.AppVersion、提示用户升级，然后再决定是否加载真正的
+  插件程序集 —— 这等于拆分插件，属于重写级别的工作量，而且 1.x 里也没有 AddAction<TAction>() 可用。
+
+3.5 manifest 能不能声明「最低宿主版本」——不能
+  1.x manifest 字段里没有 SupportedOSPlatforms（1.7.0.1 全树 grep 只命中 csproj 的
+  SupportedOSPlatformVersion）；2.x 才有（PluginManifest.cs:70-74，默认 [Windows, OSX, Linux]）。
+  两个大版本的 manifest 都没有 minHostVersion / minClassIslandVersion 这类字段；
+  唯一近似的手段就是 apiVersion，而它只在 2.x 的加载器里被读，且只做 <2.0.0.0 的下限判断。
+  → 「在 manifest 里声明最低宿主版本」这条路不存在。
+
+
+================================================================================
+4. Linux 可行性
+================================================================================
+4.1 宿主侧：官方支持
+  见第 1 章。2.x 有 platforms/ClassIsland.Platforms.Linux、UOS deb 包、Linux 解决方案筛选器。
+
+4.2 加载器侧：没有任何平台闸门
+[源码] `ClassIsland\PluginLoadContext.cs`（全文）：
+  - 只有两个分支：`UseMacOsPluginLoadingBehavior`（macOS 专用解析器）与默认 `AssemblyDependencyResolver`；
+  - `Load()` 里对 WinRT.Runtime / Microsoft.Windows.SDK.NET 返回 null（用宿主自带的）；
+  - **没有** TFM 检查、没有 RuntimeInformation.IsOSPlatform 的 Windows 分支拒绝逻辑；
+  - **不读** manifest 的 SupportedOSPlatforms。
+[源码] 全仓 grep `SupportedOSPlatforms|IsNotSupportCurrentOS` 只有 8 处，全部在：
+  PluginManifest.cs:74（定义，默认三平台）、PluginMarketService.cs:458（`plugin.IsNotSupportCurrentOS =
+  !plugin.Manifest.SupportedOSPlatforms.Contains(_currentOSPlatform);`）、
+  PluginsSettingsPage.axaml.cs:280/461（列表里显示徽标/警告）、SupportedOSPlatformsToBooleanConverter.cs（转换器）、
+  PluginInfo.cs:193-199（属性）。
+  → supportedOSPlatforms 只影响「插件市场与插件列表里显示一条警告」，不影响安装、加载、启用、运行。
+[文档] https://docs.classisland.tech/dev/plugins/publishing.html 原文印证：
+    「支持的操作系统平台。倘若在未声明所支持的操作系统平台上浏览此插件，则在插件市场上浏览时和安装时
+      会显示一条警告信息，但不会阻止用户安装。若此字段未声明，则在 Windows、Linux、macOS 平台上不显示警告。」
+  → 所以 `supportedOSPlatforms: [Windows]` 不能阻止 Linux 用户安装/启用。
+
+4.3 插件侧的硬依赖（这才是「功能不可用」的原因）
+[本机插件代码] 统计：
+  - `Ui\NativeOverlayCard.cs`：50 处 DllImport（user32 / gdi32：CreateWindowExW、SetLayeredWindowAttributes、
+    GDI 绘制、GetMessage/PeekMessage 消息循环）。Linux 无 user32/gdi32 → 首次调用 DllNotFoundException。
+  - `Core\PptBridge.cs`：13 处 DllImport + COM 绑定（PowerPoint / WPS 的 ProgID、ROT 遍历、
+    Marshal.GetActiveObject 一类）。Linux 无 COM/OLE → 抛异常。
+  - `Core\TrayNotifier.cs`：7 处 DllImport（RegisterClassExW / CreateWindowExW / DestroyWindow /
+    DefWindowProcW / LoadIconW / Shell_NotifyIconW / GetModuleHandleW，第 79-100 行）。
+  - `Tools\ToastHelper`（子工程，TFM net8.0-windows10.0.19041.0，WinRT 通知）——Linux 上既不能构建也不能运行。
+
+4.4 「能编译、能加载、功能不可用」——成立，但需要代码护栏
+  - 能编译：ClassIsland.PluginSdk 2.1.0.1 的 lib 是 net8.0（跨平台），Avalonia XAML 也跨平台；
+    前提是 TFM 从 net8.0-windows 改成 net8.0（否则 Linux 上要 `EnableWindowsTargeting=true` 才能还原）。
+    WinRT 的 ToastHelper 必须从默认构建里摘出去（Windows 条件）。
+  - 能加载：宿主没有平台闸门（4.2），ALC 加载一个 net8.0-windows 的程序集在 Linux 上也不会因为 TFM 失败
+    （TFM 是编译期概念，运行时只按 AssemblyRef 解析）。所以插件会被加载、Initialize 会被调用、
+    Action/Rule/设置页会出现在 UI 里。
+  - 功能不可用：所有 Win32/COM 路径都会抛。静态看 `Services\SlideSyncService.cs` 的调度器
+    （System.Threading.Timer，每 2 秒一跳）有大量 try/catch（354/386/480/547/560/603/644/777/809/825/886/937… 行），
+    `Plugin.cs:107` 也是 `try { Service.Start(); } catch`；
+    但 Timer 回调里若出现未捕获异常会直接终止宿主进程，这一点必须在 Linux 上实测才能下结论（本轮不允许运行）。
+  - 「该不该待命」的判定依赖进程枚举（PptBridge.SuiteIsRunning）在 Linux 上恒为 false，
+    所以大概率表现为「插件装着、按钮在、永不触发」——即安静地不可用。
+
+4.5 若要 Linux「真的能用」，缺什么（属于重写，不属于兼容）
+  - 课件控制：COM → LibreOffice UNO（Python/CLI）或 WPS Linux 的 DBus/命令行；PowerPoint 无 Linux 版。
+  - 悬浮卡片：Win32 分层窗口 + GDI → Avalonia 无边框透明置顶窗口 + Avalonia 绘制（HistoryLine 里的
+    绘制逻辑是纯计算，可复用）。
+  - 通知：WinRT Toast / Shell_NotifyIcon → 宿主提供的通知服务（ClassIsland.Platforms.Linux 里有
+    FreeDesktopNotificationProxy / DesktopToastService），插件应改用 IAppHost.TryGetService 拿宿主的通知服务，
+    而不是自己 P/Invoke。
+  - 进程名：POWERPNT.EXE / wpp.exe 这类判断需要平台分支。
+
+
+================================================================================
+5. 「老版本兼容」：①能做什么 ②做不到什么 ③最小改动清单
+================================================================================
+① 能做到
+   - 在 2.x 内部保持向下兼容的「声明」：manifest 的 apiVersion: 2.0.0.0 已经表达了「最低 2.0」。
+   - 通过市场索引选址控制可见性：只投 `index/plugins-v2`（2.x 市场），1.x 市场 `index/plugins` 不放，
+     1.x 用户就搜不到（[文档] publishing.html：按该方法上架的插件「只会出现在 2.x 的插件市场」）。
+   - 在 README / 插件市场描述里写清系统要求，减少误装。
+   - 2.0.x 兼容性可以做一次实测确认（本轮不允许运行，故未做）；静态核对 Core 2.0.4 已含
+     ITutorialService / BeginTutorial / ActionBase / TriggerBase / ComponentBase / AddRule / SettingsPageBase，
+     2.0.x 很可能可加载。
+
+② 做不到
+   - 1.x 宿主加载本插件（3.2 的五层证据：WPF vs Avalonia、AddAction 签名、Avalonia XAML、2.1 教程 API）。
+   - 在 1.x 里弹「请升级到 2.x」提示（3.3/3.4：异常发生在 ExportedTypes 阶段，插件代码没有执行机会）。
+   - 用 manifest 声明最低宿主版本（3.5：没有这个字段；apiVersion 只在 2.x 被读，且只挡 <2.0.0.0）。
+   - 用 apiVersion 挡住「宿主太旧」：2.x 没有上界校验（2.3 的 TODO），写高 apiVersion 不产生任何拦截。
+
+③ 最小改动清单（建议，未执行）
+   1. `manifest.yml`：保持 `apiVersion: 2.0.0.0`（不要为了「准确」写到 2.1.0.1——宿主不校验上界，
+      写高不会多挡一层，只会让市场描述与真实行为不一致）。
+      保持 `supportedOSPlatforms: [Windows]`（诚实声明；它只影响市场警告）。
+   2. `README.md`：在第 9 行「ClassIsland 2.1 插件」处补一句明确要求：
+      「需要 ClassIsland 2.1.0.1 或更高（2.0.x 未验证）；仅支持 Windows 10 及以上。」
+      （README:80 已有「仅 Windows（ClassIsland 2.1.0.1 上开发测试）」，可复用。）
+   3. `ClassSlideSync.Plugin.csproj`：无需改（2.1.0.1 SDK 与本机宿主一致）。
+   4. （可选，成本高）若真要「1.x 用户也看到人话提示」：把入口拆成极小的 `Plugin.Entry` 程序集
+      （entranceAssembly 指向它，只引用 ClassIsland.Core/Shared，不导出任何 Avalonia 类型），
+      在 Initialize 里读 `AppBase.AppVersion`，< 2.0 时记日志并 return；真正的实现程序集由它按需加载。
+      这是架构改动，不是配置改动。
+   5. （上架前核对，非本次核心）`manifest.yml` 的 `assetsRoot: main/` 与文档要求的
+      `<默认分支>/<插件项目相对存储库的路径>`（示例 `master/HelloWorldPlugin`）格式对不上；
+      若插件就在仓库根目录，需确认 PluginIndex 期望的写法（`main` 还是 `main/`）。
+
+
+================================================================================
+6. 「Linux 兼容」：①能做什么 ②做不到什么 ③最小改动清单
+================================================================================
+① 能做到
+   - 宿主能跑（官方 Debian 10+ 支持）。
+   - 插件能被加载：加载器无平台闸门，supportedOSPlatforms 只影响市场警告。
+   - UI 能显示：Avalonia 跨平台，设置页/组件/行动在 Linux 上可渲染。
+   - 「不炸」可以做到：只要在非 Windows 上早退（或把 Win32/COM 调用全部包在平台判断里），
+     插件表现为「安静地无功能」，不会拖垮宿主。
+
+② 做不到（除非重写）
+   - PowerPoint / WPS / 希沃的 COM 自动化（Linux 无 COM；PowerPoint 无 Linux 版）。
+   - Win32 分层悬浮窗与 GDI 绘制（NativeOverlayCard 的 50 处 DllImport）。
+   - Shell_NotifyIcon 托盘气泡与 WinRT Toast（ToastHelper.exe 是 net8.0-windows10.0.19041.0）。
+   - 「same page restore」这类真实功能在没有 COM 的情况下无法达成。
+
+③ 最小改动清单（目标：Linux 上可编译、可加载、明确不可用；未执行）
+   1. `ClassSlideSync.Plugin.csproj`：
+      - 若只求「Linux 上能编译」：TFM 改 `<TargetFramework>net8.0</TargetFramework>`
+        （SDK 包有 lib/net8.0，Avalonia XAML 可编译）；把 `<ProjectReference>` 到 `Tools\ToastHelper`
+        的项目放到 `Condition="'$(OS)'=='Windows_NT'"` 里，或让 ToastHelper 只在 Windows 下构建。
+      - 若不想动 TFM：保持 net8.0-windows 也能在 Linux 上被加载（运行时不去校验 TFM），
+        但 Linux 上无法从源码构建，需要 Windows 交叉发布。
+   2. `Plugin.cs`（Initialize 开头，第 36 行之前）：
+        加上平台判断，非 Windows 时：
+        - 跳过 `ToastNotifier.InstallOnce`、跳过 `Service.Start()`（或在 `AppStarted` 回调里判断）；
+        - 仍注册一个设置页，页面里写明「本插件依赖 Windows 上的 PowerPoint/WPS COM 与 Win32 悬浮窗，
+          在当前平台上不可用」；
+        - 记一行日志，然后 return。
+      （可用的判断：`System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(OSPlatform.Windows)`，
+        或 `OperatingSystem.IsWindows()`。）
+   3. `manifest.yml`：`supportedOSPlatforms: [Windows]` 保持不变——这是诚实声明，且不会阻止加载；
+      不要为了让警告消失而加上 Linux。
+   4. 若要 Linux 真能用：按 4.5 重写三块（COM 桥、悬浮窗、通知），本质是新产品，不是兼容性改动。
+
+
+================================================================================
+7. 复现方式（本机可执行，全部只读）
+================================================================================
+7.1 GitHub 在本机被 hosts 拦截（127.0.0.1），web_fetch 报 “resolves to a non-public IP address”。
+    绕行（已成功）：
+      git -c http.schannelCheckRevoke=false clone --depth 1 https://ghproxy.net/https://github.com/ClassIsland/ClassIsland.git %TEMP%\ci-research
+      Invoke-WebRequest https://ghproxy.net/https://github.com/ClassIsland/ClassIsland/archive/refs/tags/1.7.0.1.zip -OutFile %TEMP%\ci1701.zip
+    （1.7.0.1.zip 26.7 MB，解压后是真正的 1.x 结构：ClassIsland / ClassIsland.Core / ClassIsland.Launcher …）
+    NuGet 与 docs 站点可直连：api.nuget.org、docs.classisland.tech、docs-v1.classisland.tech。
+
+7.2 关键源码位置（clone 内相对路径）
+    2.x：
+      ClassIsland\Services\PluginService.cs:168-175（apiVersion 闸门 + loadOrder 过滤）
+      ClassIsland\Services\PluginMarketService.cs:433-435 / 445-452 / 458（市场过滤、TODO、OS 警告）
+      ClassIsland\PluginLoadContext.cs（无平台/TFM 闸门；WinRT 依赖用宿主自带）
+      ClassIsland.Core\Models\Plugin\PluginManifest.cs:58 / 70-74（ApiVersion、SupportedOSPlatforms）
+      CrossPlatformProps.props（Windows 19041 / macOS 10.15 / Linux net8.0）
+    1.x（1.7.0.1 tag）：
+      ClassIsland\Services\PluginService.cs:157-186（加载流程，无 apiVersion 判断）
+      ClassIsland.Core\Models\Plugin\PluginManifest.cs:57（只有字段声明）
+      ClassIsland\ClassIsland.csproj:4-5/10/45-47（UseWPF、WinForms、SupportedOSPlatformVersion 7.0、net8.0-windows）
+      ClassIsland.Core\Extensions\Registry\ActionRegistryExtensions.cs:22（1.x 的 AddAction 签名）
+      ClassIsland.Core\Extensions\Registry\SettingsWindowRegistryExtensions.cs:20（AddSettingsPage<T> 约束）
+
+7.3 本机实证点
+    C:\Users\xzq\Desktop\github\ClassSlideSync\classisland\ClassIsland.exe（ProductVersion 2.1.0.1+15273f82…）
+    …\data\Plugins\*\manifest.yml（6 个插件的 apiVersion 实测值，见 2.8）
+    …\data\Logs\log-2026-10-25-14-10-00-1.log（插件加载成功记录）
+
+
+================================================================================
+8. 未验证项 / 风险（诚实边界）
+================================================================================
+1. 未在 1.x 宿主上实机试装本插件（不允许运行；且会污染本机 1.x 环境）。
+   「1.x 加载失败」的依据是 1.x 源码加载流程 + .NET 反射语义 + 两版 Core 的程序集扫描，属强推断。
+2. 未在 Linux 上实测（本轮禁止构建/运行，本机也是 Windows）。
+   「能编译、能加载、功能不可用」是静态分析结论；Timer 回调的未捕获异常是否会拖垮宿主，必须实机验证。
+3. 2.0.x 宿主兼容性未实测：只核对了 Core 2.0.4 的 API 存在性（ITutorialService / BeginTutorial /
+   ActionBase / TriggerBase / ComponentBase / AddRule / SettingsPageBase 均在），未验证 2.0.x 宿主上的
+   行为差异（例如教程中心窗口名 TutorialCenterWindow 是否存在于 2.0.x 宿主可执行文件里）。
+4. 「1.x 的 ExportedTypes 一定先抛」依赖程序集里存在无法解析基类的类型 —— 我们的 Avalonia UI 类满足；
+   若未来把 UI 挪到独立程序集，结论会变（那时拆入口才有意义）。
+5. 新版 SDK（2.1.1.1，targets net10.0）未评估：本机宿主是 net8.0，不能直接升级到该 SDK。
+6. 文档与实现不一致（2.5）是宿主的现状，未来版本可能补上 TODO；若宿主补了上界校验，
+   本报告 2.3 的结论会失效（届时 apiVersion 会变成真正的护栏）。
+================================================================================
+（完）

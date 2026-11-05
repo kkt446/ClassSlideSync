@@ -1,0 +1,183 @@
+ClassIsland 插件「课件续页」功能 9（同名不同课件，问一下）稳定性报告
+==================================================================
+日期：2026-10-24
+范围：Core\CardFileList.cs（同名候选计算）+ Ui\NativeOverlayCard.cs（「哪一份？」面板）
+      + Core\SessionEngine.cs（CardState.Hash 补同名候选，最小改动）
+构建：net8.0-windows / ClassIsland 2.1.0.1 SDK / 纯 Win32 + GDI
+      命令：dotnet build ...\ClassSlideSync.Plugin.csproj -c Release -t:Rebuild
+      结果：0 个错误 / 200 个警告（与基线一致，本次没有新增警告）
+
+一、结论
+--------
+- 功能 9 已实现并落盘：同名一行的背后若有两份以上「内容可能不同」的文件，
+  点这一行先出「哪一份？」面板，点哪份就跳哪份（路径 + 那一份自己的页码）。
+  同一份拷贝（指纹相同/都未知）保持老行为：直接进历史，不打扰老师。
+- 反射验收工程 %TEMP%\samename-test 共 133 条断言：133 通过 / 0 失败。
+- 出图 4 张（96dpi ×2、144dpi ×2），逐张看过：无压字、无溢出、命中区互不重叠、
+  不压齿轮与右侧竖带。
+- 没有启动 ClassIsland / WPS / PowerPoint / 希沃，没有碰 data 目录、没有部署、没有动 git。
+  真机链路未验证，见第六节。
+
+二、改了哪些文件、哪些行
+------------------------
+（路径前缀：C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\）
+
+1) Core\CardFileList.cs
+   - 41-46：`CardFileItem` 末尾新增
+     `public List<CardSameNameItem> SameName = new List<CardSameNameItem>();`
+     默认空 = 不用问。卡片只读快照，不碰台账。
+   - 49-67：新增 `public sealed class CardSameNameItem { FilePath, FolderHint, Detail, Slide }`。
+     比需求多了一个 `Slide`：Detail 里其实也写着「第 N 页」，但让卡片去解析自己拼的文案
+     太脆（改一次文案就跳错页），所以页码单独递一遍。
+   - 92-96：新增 `public const int MaxSameName = 6;`（面板不做滚动，再多会顶出屏幕）。
+   - 76-79：类注释补上功能9 的取舍：按显示名归并**仍然**是有意的（少一行比多一行更难点错），
+     只是「默认跳哪一份」不再由 ChooseJumpPath 单方面决定。
+   - 187：`Build` 里 History 填完之后 `item.SameName = SameNameOf(g.Records);`
+     （放在 History 之后是因为两者都读同一份已排序 records，先填 History 少一次遍历；
+      放在 result.Add 之前，保证快照里的对象一出生就是完整的）。
+   - 216-298：新增 `static List<CardSameNameItem> SameNameOf(List<SessionRecord> records)`。
+
+2) Core\SessionEngine.cs（只加 Hash 的最小字段）
+   - 118-133：`CardState.Hash()` 的 Files 循环里，在 `f.Subject` 之后追加同名候选：
+     `h = h*31 + 4000000 + f.SameName.Count;` 然后逐个 `h = h*31 + FilePath.GetHashCode()`
+     `h = h*31 + c.Slide` `h = h*31 + c.Detail.GetHashCode()`。
+     FolderHint 不单独算（它就是 FilePath 的那两级目录，路径变了它自然变）。
+     不加这一段，候选换了一份 / 多了一份 / 某一份停到别的页时卡片收到新状态也不重画，
+     老师点下去跳的是旧路径。
+
+3) Ui\NativeOverlayCard.cs
+   - 117-123：新增 `const int SameNameRowStep = FileRowStep + 14;`（见第五节第 1 条）
+   - 211-219：新增字段 `bool sameNamePanel; CardFileItem? sameNameFile;`
+     以及三个并行数组 `sameNameRowHits[MaxSameName]`（Rect32）、
+     `sameNameRowPaths[MaxSameName]`、`sameNameRowSlides[MaxSameName]`。
+     为什么另开一份而不是复用 historyRowSlides：面板三的点击必须在面板一之前独立判，
+     混用一套数组会出现「面板刚切、命中区还是上一帧」的错跳。
+   - 783-795：`int SameNameHeight96(int rows)` = 10 + FileHeadStep + rows*SameNameRowStep
+     + FileBackStep + 10（96dpi 稿；2 份 = 152，6 份 = 312）。写法照 FilePanelHeight96。
+   - 797-819：`CardFileItem? SameNameTarget(CardState? st)`：按归并键从**最新快照**重新找这一行。
+     不直接信 sameNameFile 引用 —— 台账一刷新 BuildState 就造一批新 CardFileItem，
+     旧引用上的 SameName 还是上一轮候选（文件可能刚被删，点下去打不开）。找不到或候选不足 2 条返回 null。
+   - 821-843：`string FitFolderHint(GdiCanvas g, string hint, int width)`：
+     放不下就一级一级拆父目录（「…\桌面\classisland插件」→「…\classisland插件」→省略号）。
+     不能用尾部省略号：同名两份差的就是路径尾部，「…\桌面\class…」和「…\课件\class…」截完一模一样。
+   - 918-927：`ContentHeight96` 的 `showTopName` 增加 `!sameNamePanel`（面板里不画文件名抬头），
+     并新增分支 `if (sameNamePanel) return SameNameHeight96(候选数)`（放在 filePanel 分支之前）。
+   - 975：`ApplyContentHeight` 的条件加 `sameNamePanel`：面板打开时窗口高严格等于
+     `Scaled(ContentHeight96)`，不跟老师给正常卡片调的高度/缩放走。
+   - 1151-1152 与 1176-1177：`ResetPanels()` / `OpenFilePanel()` 一并清掉 sameNamePanel/sameNameFile。
+   - 1195-1213：`void OpenSameNamePanel(CardFileItem f)`：候选 <2 直接 return；置 sameNamePanel、
+     顶掉 filePanel/historyPanel/selectedFile，重置 15 秒倒计时，Relayout。
+   - 1215-1227：`void CloseSameNamePanel()`：清两个字段 + `filePanel = true`。
+     刻意不走 OpenFilePanel —— 那个函数是「从文件夹图标进来」的语义，会把筛选和页码复位；
+     这里要保留老师刚才那一页。
+   - 1229-1241：`CardFileItem? FileByKey(CardState st, string key)`（按归并键找行，OpenFileHistory 也改用它）。
+   - 1450：`ApplyPending` 的预备态强制收面板条件加 `sameNamePanel`。
+   - 1479-1484：`ApplyPending` 里 `else if (sameNamePanel && SameNameTarget(st) == null)` →
+     收掉面板回课件库（那一行已经被删到不足两份了）。
+   - 1634-1661：`OnClick` 新增面板三分支（在准备态分支之后、文件面板分支之前）：
+     点候选行 → 先收面板再 `HistoryJumpRequested(path, slide)`；点返回 → CloseSameNamePanel；
+     其他位置 `return`（面板开着点空白不会误触整卡跳页）。
+   - 1688-1696：文件面板的行点击：`FileByKey` 拿到行，`SameName.Count > 1` 时
+     `OpenSameNamePanel` 并 return，否则维持原来的 `OpenFileHistory`。
+   - 1905-1909：Paint 每帧清命中区时一并清 sameNameRowHits/Paths/Slides。
+   - 1984：标题行条件加 `!sameNamePanel`。
+   - 2121-2181：Paint 新增 `else if (sameNamePanel)` 分支（在 filePanel 与 historyPanel 之间）：
+     抬头「哪一份？（同名 N 份）」+ 分隔线；每行两截（文件夹 / 「第 N 页 · 时间」）；
+     当前默认那一份用淡强调底 + 左侧强调竖条 + 强调色文字；底部「‹ 返回」居中。
+
+三、「问」还是「不问」的判定表
+------------------------------
+候选 = 组内记录按时间倒序、`Normalize(FilePath)` 去重（OrdinalIgnoreCase）、
+      跳过希沃伪键与空串、只留 `File.Exists` 为真的路径、按各自最新时间倒序、最多 6 条。
+
+| 组里的情况                                                | SameName | 卡片行为         |
+|-----------------------------------------------------------|----------|------------------|
+| 去重后只有 1 条路径（同一份文件两种写法/大小写/尾部空格） | 空       | 直接进历史       |
+| ≥2 条候选，全部无指纹（空串 = 不知道）                    | 空       | 直接进历史       |
+| ≥2 条候选，非空指纹全部相同（同一份拷贝换了目录）         | 空       | 直接进历史       |
+| ≥2 条候选，出现两条不同的非空指纹                         | 填       | 「哪一份？」面板 |
+| ≥2 条候选，有指纹 + 无指纹混合（说不清是不是同一份）      | 填       | 「哪一份？」面板 |
+| ≥2 条路径，但有文件已不存在 → 有效候选 <2                 | 空       | 直接进历史       |
+| 希沃记录（伪键「希沃:课件名」）                           | 假键跳过 | 直接进历史       |
+| 候选 >6 条（极端）                                        | 截到 6   | 面板列 6 条      |
+
+为什么「全都不知道指纹」按同一份处理：空串只表示不知道，而同名课件绝大多数就是同一份拷贝
+（从桌面拖进插件目录、换台电脑再拷一份）。每节课都问一次「哪一份？」会变成纯噪音，
+老师闭着眼点第一行反而更容易点错。反过来「有指纹 + 无指纹」必须问 —— 那说明其中一份
+确实被改过（指纹只在内容变化时变），另一份说不清，猜错的代价是把老师扔到另一份课件的同一页。
+
+四、验收数字
+------------
+构建：0 error，200 warning（基线 200）。
+反射验收：%TEMP%\samename-test\bin\Release\net8.0-windows\samename.dll
+          ==== 通过 133 条，失败 0 条 ====
+逐段：
+- 数据层「不询问」：同路径两种写法/不同目录同名同指纹/另一份不存在/希沃伪键/单条记录 → 均 1 行 0 候选。
+- 数据层「询问」：指纹不同 → `SameName.Count == 2`；候选顺序 pA（第 8 页·10 小时前）→ pB（第 3 页·11 小时前）；
+  `same[0].Detail` 与那一行的 `Detail` 完全一致；`FolderHint` 分别是「…\桌面\classisland插件」
+  与「…\网盘\课件备份」；`Slide` 分别是 8 / 3；`f.FilePath == pA`（默认跳转仍是最近用过的那份）。
+  有指纹+无指纹混合 → 2 条；全都没指纹 → 0 条。
+- 数据层「顺序/截断」：8 份同名 → 1 行、候选 6 条，第 1 条是最近的副本1、第 6 条是副本6、
+  被截掉的副本7 不在候选里、副本1 的 Slide = 19。
+- 卡片 96/144 dpi 命中区（各 21 条）：面板打开时 filePanel 关闭、候选 2 行、返回可点、
+  齿轮与竖带仍在（优先级没变）；候选行与返回都在客户区内、两两不重叠、
+  且不与齿轮命中区（96dpi `(178,4)-(214,40)`）和竖带（`(218,0)-(236,124)`）重叠。
+- 点击链路（31 条）：点第 2 行 → `HistoryJumpRequested` 收到 (pB, 3)、面板关掉、回正常卡片；
+  点第 1 行 → (pA, 8)；返回 → 回课件库且 `fileFilter`/`filePage` 原样保留；
+  面板开着点齿轮 → 仍进控制面板且不跳页；面板里点抬头空白 → 不跳整卡、面板还开着。
+- 「不用问的行」：同名同指纹那一行 `SameName.Count == 0`，点它直接进历史面板且能回课件库。
+- 高度：2 条候选 96dpi 窗口 236×152、6 条 236×312；144dpi 354×228 / 354×468；
+  客户区高 == Scaled(ContentHeight96)、cardHeight 一致、96 稿高度 ≤500、不超过工作区。
+
+出图（%TEMP%\samename-test\shots\，逐张看过）：
+- samename-96.png      236×152  2 份候选：「…\桌面\classisland插件 / 第 8 页 · 10 小时前」
+                                「…\网盘\课件备份 / 第 3 页 · 11 小时前」+ 居中「‹ 返回」
+- samename6-96.png     236×312  6 份候选，末条是「…\decks\多份4」，底部返回完整不裁切
+- samename-144.png     354×228  同上 2 份（1.5×）
+- samename6-144.png    354×468  同上 6 份（1.5×）
+四张都没有压字/溢出：第一行顶部让开齿轮、行尾停在竖带左边、两截文字之间不重叠。
+
+五、实现里值得记一笔的决定
+--------------------------
+1. 面板三的行高是 40（`FileRowStep + 14`），不是需求里写的 `FileRowStep`(26)。
+   原因：236 宽的卡片里，「…\桌面\classisland插件」和「第 8 页 · 10 小时前」挤在同一行时
+   两边各只剩十几个像素，实测第一版就是「classislan…」+「第 8 页 · 10 小…」——
+   两份候选长得几乎一样，等于没问。所以一行拆成两截（文件夹一截、页码时间一截）。
+   高度公式仍是「10 + 抬头 + 行×步长 + 返回 + 10」，只是步长换成 SameNameRowStep，
+   窗口高依然由 ContentHeight96 → ApplyContentHeight 推导，断言里对齐过。
+2. 命中矩形让开齿轮与竖带：行首会顶到右上角齿轮（96dpi 行#0 顶边 36 < 齿轮底 40）、
+   行尾会伸进右侧竖带（行右 229 > 竖带左 218）。功能上不冲突（OnClick 里 collapseHit/panelHit
+   本来就排在面板之前），但命中矩形叠着容易被当成「点错行」，所以只裁命中区（
+   `hitT = max(row.T, GearHit.B)`、`hitR = min(row.R, rail.L)`，两者都有"空矩形不裁"的守卫），
+   画出来的行底不动 —— 和课件库的行保持同一套视觉。
+3. 返回不调 OpenFilePanel：那个函数的语义是「从文件夹图标进来」，会复位筛选和页码；
+   老师刚就是从「数学 / 第 2 页」点进来的，回来还得再翻一次就太烦了。
+4. 候选页码单独递（`CardSameNameItem.Slide`）而不是让卡片解析 Detail 文案。
+5. Hash 只加 FilePath/Slide/Detail 三项，FolderHint 由路径派生不单独算；
+   候选整组消失时 `SameName.Count` 变化已经覆盖。
+6. 文件存在性用 `File.Exists` + try/catch（网络盘掉线会抛 IO 异常），
+   这一步只在「组里确实有 ≥2 条不同路径」时才做，绝大多数行一次磁盘都不碰。
+
+六、没有验证的（别当成已验证）
+------------------------------
+1. 真机没启动：没有启动 ClassIsland 宿主，没有 WPS / PowerPoint / 希沃白板，也没有真实课表。
+   因此「卡片上点候选行 → 服务层 → 打开/切到那份课件并跳到那一页」的端到端链路未走通；
+   验收只到「HistoryJumpRequested(path, slide) 参数正确」为止（该事件服务层已接好，签名未改）。
+2. 指纹（SessionRecord.Fingerprint）在真机上何时写入、粒度如何，没有在真实课件上核对过；
+   本次结论「指纹相同 = 同一份拷贝」依赖引擎既有语义（PptBridge/SeewoBridge 那边的实现没动）。
+3. 卡片宽度不是 236 时（老师调 CardScale 放大/缩小）的行宽与截断只在 236 上出过图；
+   FitFolderHint 有宽度兜底，但没有逐档出图确认。
+4. 候选 >6 条时只验证了「截断到 6」，没有验证被截掉的第 7 份以后是否会在别的科目分组里出现。
+5. 快速连点 / 面板打开时台账刚好刷新（SameNameTarget 返回 null → 自动收面板）只写了逻辑，
+   没有做压力测试。
+6. 触摸输入、多显示器、125%/150% 混合缩放：只在 96/144 两档用强制 dpi 出图，未在真实显示器上跑。
+
+七、复现命令
+------------
+构建：
+  & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build 'C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\ClassSlideSync.Plugin.csproj' -c Release -t:Rebuild
+验收（机器上只有 .NET 10 在 PATH，必须用 8.0.25 的 dotnet 跑）：
+  & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' 'C:\Users\xzq\AppData\Local\Temp\samename-test\bin\Release\net8.0-windows\samename.dll'
+测试工程：%TEMP%\samename-test\{samename.csproj, Program.cs}（net8.0-windows，按 HintPath 引用插件 DLL，
+         用反射构造 NativeOverlayCard + CardState，不引用插件工程、不加任何 NuGet 包）。
+出图目录：%TEMP%\samename-test\shots\

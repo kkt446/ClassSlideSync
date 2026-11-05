@@ -1,0 +1,232 @@
+课件续页 2.1 插件 — 控制面板三页化（课件库 / 设置 / 关于）改动报告
+日期：2026-10-24
+仓库：C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin
+构建：& 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build 'C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\ClassSlideSync.Plugin.csproj' -c Release -t:Rebuild
+结果：0 个错误 / 192 个警告（任务给的基线是 193 个 nullable/AVLN 警告；本轮期间另有 agent 在改 Core 文件，警告数随源码浮动，无新增 error）
+
+======================================================================
+一、改了哪些文件、哪些行
+======================================================================
+
+1) Ui\ControlPanel.axaml —— 整文件重写，275 行 → 748 行
+   - 20-27  顶部注释：说明三页签是“插件统一入口”的第二轮要求。
+   - 53-72  新增样式：TextBlock.settings-group 分组标题；TabItem 字号/最小高度/内边距；
+            TabItem:selected 用 AccentFillColorDefaultBrush（Fluent 资源，跟随宿主强调色）。
+   - 74     <TabControl x:Name="Tabs" SelectedIndex="0">，三页签容器。
+   - 79-314 TabItem「课件库」：原单页内容原样搬入（搜索/刷新、左 320px 分组列表、
+            右侧详情+历史、打开文件夹/立即跳转、底部状态条+全屏按钮），行为未改。
+   - 316-665 TabItem「设置」：ScrollViewer x:Name="SettingsScroll"（317）+ 内容
+            StackPanel x:Name="SettingsContent"（320，MaxWidth=900、水平居中、Margin 24），
+            6 个分组标题（基本 / 运行时机 / 学科课件文件夹 / 卡片外观 / 显示内容 / 交互），
+            28 个 controls:SettingsExpander、5 个 SettingsExpanderItem、18 个 ToggleSwitch、
+            7 个 Slider、4 个 NumericUpDown、4 个 ComboBox（含科目行模板里的两个）、2 个 ColorPicker。
+   - 450-492 各科目的文件夹：SettingsExpander（IsExpanded=True，IsVisible 绑定
+            Settings.AutoOpenSubjectFolder）→ ItemsControl x:Name="SubjectFolderList"
+            ItemsSource={Binding Settings.SubjectFolders}，行模板 x:DataType="core:SubjectFolder"
+            （x:CompileBindings=True，因为 Options 是 internal）：ComboBox/TextBox 科目、
+            路径 TextBox、选择…（OnPickSubjectFolder）、删除（OnRemoveSubjectFolder）、
+            下方「添加一行」（OnAddSubjectFolder）。
+   - 599-628 显示内容：外层 SettingsExpander（IsExpanded=True）+ 5 个 SettingsExpanderItem，
+            每个 Footer 里放 ToggleSwitch（FluentAvalonia 2.4.1 的 SettingsExpanderItem 没有
+            IsOn 属性，这一点写在 600-601 的注释里）。
+   - 667-746 TabItem「关于」：插件名、版本（x:Name="AboutVersionText"）、仓库链接
+            （AboutRepoLink，蓝色可点）、数据目录（AboutDataFolderText）、台账记录
+            （AboutRecordsText）、打开数据文件夹（AboutOpenFolderButton）。
+
+2) Ui\ControlPanel.axaml.cs —— 整文件重写，342 行 → 593 行
+   - 44-53  新增公开绑定源：Settings（同一个 SyncSettings 实例）、Appearance
+            （复用 Views\SettingsPages\SlideSyncAppearanceViewModel）、SubjectOptions。
+   - 66-67  构造函数新增可选参数：SlideSyncService? service = null（放在最后，旧调用方
+            即使不传也能编过）；服务在 SlideSyncService.cs:620 传入 this。
+   - 76      Appearance = new SlideSyncAppearanceViewModel(settings, service!)；
+            ViewModel 内部对 service 做了 null 判断，离线测试传 null 不会崩。
+   - 86      预览卡片按钮：离线（service==null）时禁用，实机可用。
+   - 90      订阅 Tabs.SelectionChanged。
+   - 111-116 切页签：只在进入设置页时 RefreshSubjectsSafe() + Appearance.Refresh()，
+            不重新读台账（课件库页的列表/选中项保持原样）。
+   - 141      Reload() 末尾顺带 UpdateAbout()，刷新按钮/打开窗口时记录数、数据目录跟着更新。
+   - 257-269 UpdateAbout()：版本 = "版本 " + ReadPluginVersion()；数据目录 = ledger.Root；
+            记录数 = string.Format(InvariantCulture, "共 {0} 条记录", RecordCount())。
+   - 275-297 ReadPluginVersion()：在插件 dll 同目录找 manifest.yml，逐行找 version:，
+            去引号；文件缺失/异常返回「未知」。
+   - 344-374 OnWindowKeyDown：F11 / Esc 逻辑原样保留；Ctrl+F 现在会先切回课件库页
+            再聚焦搜索框（在设置/关于页按也能直接搜课件），其余未动。
+   - 394-431 ApplySavedGeometry / SaveGeometry：几何记忆逻辑一行未改
+            （PanelWidth/PanelHeight/PanelLeft/PanelTop）。
+   - 440-478 RefreshSubjects()：照抄设置页 RefreshSubjects 的写法——IAppHost.TryGetService
+            <IProfileService>() → Profile.Subjects.Values 取 Name.Trim() 去重；把设置里已存的
+            科目并入（不 Trim）；只增不删地填 SubjectOptions；useDropdown = loaded 且
+            课表科目非空；异常时 ApplySubjectInput(false)。
+   - 490-498 ApplySubjectInput(bool)：给每行写 Options / UseDropdown / UseTextBox。
+   - 501-523 OnPickSubjectFolder：TopLevel.GetTopLevel(this).StorageProvider
+            .OpenFolderPickerAsync(new FolderPickerOpenOptions{Title="选择这个科目的课件文件夹",
+            AllowMultiple=false})，TryGetLocalPath() 后写 folder.Folder；取消/不支持时忽略。
+   - 526-547 OnAddSubjectFolder / OnRemoveSubjectFolder：对 Settings.SubjectFolders 增删。
+   - 550-554 OnPreviewClick：service.ShowCardNow()（和原设置页同一条链路）。
+   - 559-567 OnRepoClick：Process.Start(new ProcessStartInfo(url){UseShellExecute=true})。
+   - 570-586 OnAboutOpenFolderClick：优先用服务注入的 openFolder（宿主 IUriNavigationService），
+            没有就 explorer.exe 兜底。
+
+3) Services\SlideSyncService.cs —— 仅 1 行精确替换（该文件改动前 mtime 17:49:10，
+   距操作超过 3 分钟；改完 mtime 18:07:31，没有被并发覆盖）
+   - 620     var p = new ControlPanel(ledger, settings, () => lastState, OpenPanelFolder, this);
+             （原为 4 个参数，补第 5 个 this，让面板能预览卡片/取外观摘要；未动其他任何逻辑）
+
+没有改：manifest.yml、版本号、csproj、Core\SyncSettings.cs、Ui\NativeOverlayCard.cs、
+         Ui\PanelRows.cs、Core\PanelData.cs、git、NuGet 引用。也没有部署。
+
+======================================================================
+二、设置项对照表（ClassIsland 设置页 → 面板设置页）
+======================================================================
+标记：[x] 已搬且绑定同一个 Settings 实例；[—] 未搬（见第三节）。
+绑定路径全部是 Settings.XXX / Appearance.XXX，和 Views\SettingsPages\SlideSyncSettingsPage.axaml 一致。
+
+[x]  1 授课时显示悬浮卡片            ToggleSwitch   Settings.AutoShowOverlay
+[x]  2 无人操作时自动贴边            Slider(5-120, Tick5, Snap, F0) + ToggleSwitch
+                                     Settings.AutoHideSeconds / Settings.AutoHide
+[x]  3 记录每节课的进度台账          ToggleSwitch   Settings.RecordLedger
+[x]  4 在卡片上显示控制面板按钮      ToggleSwitch   Settings.EnableControlPanel
+[x]  5 最短记录时长                  NumericUpDown(0-600, Inc5) Settings.MinSessionSeconds
+[x]  6 上课前自动待命                ToggleSwitch   Settings.AutoStartBeforeClass
+                                     Description 仍绑 Appearance.RuntimeSummary
+[x]  7 提前多少秒待命                NumericUpDown(0-600, Inc10) Settings.PreClassLeadSeconds
+                                     IsVisible 绑 Settings.AutoStartBeforeClass
+[x]  8 下课后保留多久                NumericUpDown(0-1800, Inc30) Settings.PostClassGraceSeconds
+                                     IsVisible 绑 Settings.AutoStartBeforeClass
+[x]  9 课表外打开课件也加载          ToggleSwitch   Settings.ArmOnDeckOpenOutsideClass
+[x] 10 检测到 PPT 就显示卡片         ToggleSwitch   Settings.ShowCardOutsideClass
+[x] 11 历史保留天数                  NumericUpDown(1-365, Inc1) Settings.HistoryRetentionDays
+[x] 12 诊断日志                      ToggleSwitch   Settings.DiagnosticLog
+[x] 13 上课时自动打开本科目文件夹    ToggleSwitch   Settings.AutoOpenSubjectFolder
+[x] 14 各科目的文件夹                ItemsControl Settings.SubjectFolders（ComboBox 科目 /
+                                     TextBox 路径 / 选择… / 删除 / 添加一行），
+                                     IsVisible 绑 Settings.AutoOpenSubjectFolder
+[x] 15 跟随 ClassIsland 主题         ToggleSwitch   Settings.FollowClassIslandTheme
+                                     Description 绑 Appearance.ThemeSummary
+[x] 16 强调色                        ColorPicker    Appearance.AccentColor（跟随主题时隐藏）
+[x] 17 卡片底色                      ColorPicker    Appearance.BackgroundColor（同上隐藏）
+[x] 18 不透明度                      Slider(20-100, Tick5, Snap) Settings.CardOpacityPercent
+[x] 19 圆角                          Slider(0-24, Tick1) Appearance.CornerRadius +
+                                     ToggleSwitch Appearance.CustomRadius（On=自定义 / Off=跟随）
+[x] 20 大小                          Slider(0.6-2, Tick0.05, F2) Settings.CardScale
+[x] 21 字号微调                      Slider(-4-12, Tick1, F0) Settings.CardFontSizeDelta
+[x] 22 贴哪一边                      ComboBox Appearance.SideIndex（0=右边 / 1=左边）
+[x] 23 垂直位置                      Slider(0-100, Tick5) Settings.CardVerticalPercent
+[x] 24 收起标签宽度                  Slider(16-96, Tick2) Settings.CollapsedTabWidth
+[x] 25 显示内容（1 个外层 + 5 行）    5 个 SettingsExpanderItem + ToggleSwitch：
+                                     Settings.CardShowFileName / CardShowSlideCount /
+                                     CardShowContext / CardShowStatusLine / CardShowJumpLine
+[x] 26 点击卡片跳页                  ToggleSwitch   Settings.CardClickToJump
+[x] 27 跳转时重播该页动画            ToggleSwitch   Settings.JumpResetsAnimation
+[x] 28 预览卡片「显示卡片」按钮      Button → service.ShowCardNow()（服务注入时可用）
+[—] 29 新手引导「开始引导」          Button → TutorialGuide.Start()（见第三节）
+
+另有 ClassIsland 设置页上的两个纯展示 TextBlock（Appearance.CardSummary、
+Appearance.RuntimeSummary 已分别作为「卡片外观」末尾摘要和「上课前自动待命」的 Description
+保留），不是可编辑项，不单列。
+
+======================================================================
+三、没搬过来的项和原因
+======================================================================
+1. 「新手引导 / 开始引导」按钮（SettingsPage 第 29 项）
+   原因：它调用宿主的 TutorialGuide（ClassIsland.Core 教程系统 + 需要主界面窗口做引导层），
+   面板进程里没有宿主页面上下文；强行搬会点到就抛异常。故按任务要求不画这一项。
+2. 各设置行左侧的图标（ciControls:FluentIconSource，Glyph 来自 ClassIsland.Core）
+   原因：那是 ClassIsland.Core 的控件/图标源，面板要能在不加载宿主程序集的情况下
+   独立构造与离屏验收（否则测试进程直接 XAML 崩）。改用 settings-group 文字标题 +
+   Fluent 的次要文字颜色，分组、字重、行距与设置页一致，见 axaml 53-61。
+   这不是设置项，只是观感差异，特此列出。
+3. 「预览卡片」按钮已搬，但离线测试里 service 为 null，按钮呈禁用态（截图里是灰的）；
+   实机从齿轮打开时 service 一定存在，点击走 ShowCardNow()。
+4. 没有搬「确认跳转」(ConfirmBeforeJump)：它本来就不在 SlideSyncSettingsPage 上
+   （属性仍在 SyncSettings 里，供别处使用），不属于“设置页全部设置项”的范围。
+
+======================================================================
+四、构建输出（最后一次，重编译）
+======================================================================
+$ & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build '...\ClassSlideSync.Plugin.csproj' -c Release -t:Rebuild
+    192 个警告
+    0 个错误
+已用时间 00:00:02.60
+
+（警告全部是仓库既有的 CS86xx nullable 与 AVLN 警告；无 CS 错误、无 XAML 编译错误。）
+
+======================================================================
+五、离线验收：测试工程、断言、PNG
+======================================================================
+测试工程：%TEMP%\panel-settings\（即 C:\Users\xzq\AppData\Local\Temp\panel-settings\，
+          PanelTests.csproj + Program.cs，仓库内没有放任何测试文件）
+方式：Assembly.LoadFrom 加载 bin\Release\net8.0-windows\ClassSlideSync.Plugin.dll，
+      反射构造真实 ControlPanel，Avalonia 11.3.17 + FluentAvaloniaUI 2.4.1 离屏跑；
+      不启动 ClassIsland / WPS / PowerPoint / 希沃，不读写宿主 data 目录（台账用临时目录）。
+
+最后一次运行：断言总数 84，失败 0，ALL PASS。
+覆盖点：
+  - 台账回归 12 条：搜索（空串/中文/大小写/科目/无结果/null）、分组顺序、历史条数/倒序/
+    时间格式、状态条含记录数。
+  - 三页签：TabControl 存在、页签数=3、标题依次「课件库 / 设置 / 关于」；
+    面板暴露的 Settings 与传入的是同一个实例（ReferenceEquals）。
+  - 课件库页：搜索框、分组列表非空、详情已选中。
+  - 设置页读取当前值（6 个代表项）：不透明度 100、自动收起 20 秒、显示控制面板按钮=开、
+    跟随主题=开、贴右边（索引 0）、学科文件夹 2 行；另有「自动收起秒数滑块」「贴哪边下拉」
+    「学科文件夹列表」控件存在性 5 条。
+  - 双向绑定：控件→Settings 5 条（滑块 55、秒数 45、开关关、下拉左、跟随主题关），
+    Settings→控件 5 条（73、30、开、右、跟随主题开），改完再读一致。
+  - 学科文件夹增删：添加一行后 Settings 与列表都变 3 行，删除后都回到 2 行。
+  - 切页签不重建左栏数据源（同一个 ItemsSource 实例）。
+  - 关于页：插件名、版本控件、数据目录控件、记录数控件、
+    版本 == "版本 " + manifest.yml 的 version（1.2.1.5）、版本不含「未知」、
+    数据目录 == ledger.Root、记录数 == "共 8 条记录"（InvariantCulture 格式）、
+    仓库按钮存在且内容为 https://github.com/KKT446/ClassSlideSync、打开数据文件夹按钮存在。
+  - 96 dpi（1000×680）与 144 dpi 等价最小窗（720×480）各 8 条布局断言：
+    ScrollViewer/内容容器存在、内容不超 MaxWidth 900、无横向溢出、子项右边界在容器内、
+    内容高于视口（可滚）、滚到底 Offset.Y>0 且不越界。
+    说明：Avalonia 按 DIP 布局，DPI 只改变物理像素；144 dpi 下 1080p 屏可用逻辑宽度约 720，
+    所以用最小窗 720×480 作为更严格的等价验证，没有做真实 144dpi 渲染缩放。
+  - 窄窗（720×480）下 ScrollViewer.Extent.Width <= Viewport.Width，无横向滚动。
+
+PNG（离屏 RenderTargetBitmap，逐张人工看过）：
+  C:\Users\xzq\AppData\Local\Temp\panel-settings\shots\panel-library.png            1100×820
+  C:\Users\xzq\AppData\Local\Temp\panel-settings\shots\panel-library-search.png     1100×820
+  C:\Users\xzq\AppData\Local\Temp\panel-settings\shots\panel-settings-top.png       1100×820
+  C:\Users\xzq\AppData\Local\Temp\panel-settings\shots\panel-settings-middle.png    1100×820
+  C:\Users\xzq\AppData\Local\Temp\panel-settings\shots\panel-settings-bottom.png    1100×820
+  C:\Users\xzq\AppData\Local\Temp\panel-settings\shots\panel-settings-appearance.png 1100×820
+  C:\Users\xzq\AppData\Local\Temp\panel-settings\shots\panel-about.png             1100×820
+  C:\Users\xzq\AppData\Local\Temp\panel-settings\shots\panel-settings-720.png       720×480
+
+看图后改过的地方：
+  - 首轮出图发现「各科目的文件夹」「显示内容」两个 SettingsExpander 默认收起，
+    学科行和 5 个显示项根本看不见；已给这两个 expander 加 IsExpanded="True"
+    （axaml 452、601），重编译重跑后中段图能看到 2 行科目（语文/数学、
+    D:\课件\语文、D:\课件\数学）和选择…/删除/添加一行，底部图能看到 5 个显示开关。
+  - 为了确认取色控件不撑破行，额外把「跟随主题」关掉拍了 panel-settings-appearance.png：
+    强调色/卡片底色两个 ColorPicker 正常显示在右侧，高度与其它行一致。
+  - 为了覆盖上/下半图之间的学科文件夹段，补拍 panel-settings-middle.png。
+  - 逐张检查：无控件挤压、无文字截断（分组标题、说明文字、状态条都完整）、
+    无异常大空白（关于页内容偏上、下方留白属正常页面结构）。
+
+======================================================================
+六、没验证的部分（直说）
+======================================================================
+1. 没有在真实 ClassIsland 里启动并点齿轮打开窗口（铁律禁止启动宿主），因此：
+   - 亚克力/TransparencyLevelHint、SmokeFillColorDefaultBrush 在宿主主题下的实际观感；
+   - 真实 IProfileService 科目下拉（离屏时 IAppHost 不可用，走的是「设置里已有科目」分支，
+     截图里能看到语文/数学，验证的是 TextBox/ComboBox 行本身，不是课表读取链路）；
+   - 真实 StorageProvider 文件夹选择对话框的返回值（只做了代码对齐）；
+   - 预览卡片按钮实机点击效果、宿主主题摘要文字。
+2. 96/144 dpi 用逻辑尺寸等价验证（见上），未做 RenderScaling=1.5 的真实像素渲染。
+3. F11 / Esc / Ctrl+F 键盘路径只做了代码审查（离屏窗口没有真实键盘焦点）；
+   本轮把 Ctrl+F 改成「先切回课件库再聚焦」，没有实机按键验证。
+4. 设置改动后的落盘链路未在测试中触发（测试只验证同一个 SyncSettings 实例的双向绑定）；
+   保存由 Plugin.cs:39-41 的 Settings.PropertyChanged → ConfigureFileHelper.SaveConfig 负责，
+   面板自身不写文件，这一点是代码审查结论。
+5. 台账记录数为测试造的 8 条，不是老师真实数据。
+
+======================================================================
+七、结论
+======================================================================
+三页签面板已完成：课件库行为未变；设置页 28/29 项搬入并绑定同一 SyncSettings 实例，
+改动即时生效、由插件原有的 PropertyChanged 保存链路落盘；关于页版本/仓库/数据目录/记录数
+齐全。构建 0 error，离线 84 条断言全过，8 张离屏图逐张看过并修掉了两处默认收起的展开器。
+未搬的只有依赖宿主教程系统的「新手引导」和 ClassIsland.Core 的图标，原因见第三节。

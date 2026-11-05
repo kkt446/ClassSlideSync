@@ -1,0 +1,129 @@
+ClassSlideSync.Plugin 稳定性测试 · 合并报告（三轮：静态审查 → harness 第一轮 → 修复后复测）
+生成时间: 2026-10-24 16:45 (Asia/Shanghai)
+配套文件: stability-report.txt（第一轮静态审查原文）、stability-report-harness.txt（第二轮回测原文）
+
+==================================================================
+零、一句话结论
+==================================================================
+三轮下来一共动到 11 处代码、2 条按你的决定不改（记为已知限制）。
+最后一轮 harness：7 组 / 157 个用例，通过 156，唯一失败是「双开 ClassIsland 并发写台账」，属于已决定不修的那条。
+已构建并部署：200704 字节，SHA256 3E8D7C53…（部署时 ClassIsland 没在运行，直接覆盖，残留 old dll 已清空）。
+下面所有结论都来自「不启动 ClassIsland / WPS / PowerPoint、台账只写 %TEMP%」的沙箱测试，没碰过你的 data 目录。
+
+==================================================================
+一、三轮各查了什么
+==================================================================
+第 1 轮 · 静态审查（我）
+  起因：先跑沙箱测试，但子 agent 那条路当时没起来，于是先逐行读代码。
+  产出 3 处修复 + 4 条「看着可疑但要压测才知道」的观察项。
+
+第 1 轮 · harness（子 agent c6448d3a）
+  91 个用例 / 79 通过 / 12 失败。
+  其中 9 个是 harness 自己的依赖问题（FileNotFoundException：它把程序集拷到别处后
+  Avalonia / ClassIsland 的依赖没跟过去），不是插件 bug；扣掉后剩 3 条真问题。
+  复现要点：它把内部方法用反射调用，台账/设置全部写 %TEMP%，希沃那条用假 MCP 端点
+  127.0.0.1:7916 返回 HTTP 500 + 非 JSON 来验降级。
+
+第 2 轮 · 修完复测（子 agent 17b89ca7）
+  157 个用例 / 156 通过 / 1 失败（B01，按你的决定 WONTFIX）。
+  新增 13 条验收用例，逐条对着 F1–F4 的修复点验，全 PASS。
+
+==================================================================
+二、改了哪些代码（11 处）
+==================================================================
+第一批（我改的 7 处）
+  1. Core/Ledger.cs  Save 走「临时文件 + 替换」并加锁，避免写一半断电/并发留下坏文件
+  2. Core/Ledger.cs  Add 加空值保护
+  3. Core/Ledger.cs  删掉一段走不到的死代码
+  4. Core/SessionEngine.cs  会话状态（current / lastSlide / pendingEnd 等）加锁，
+                            看门狗线程和 UI 线程不再同时改同一份状态
+  5. Core/SeewoBridge.cs    加熔断：MCP 端点连续失败后暂停一个周期再试，
+                            不再每 250ms 打三个 HTTP 出去
+  6. B10 低  Core/Ledger.cs 坏台账不再被静默吞掉
+      ledger.json 损坏时（老师那边最常见的是断电、或换机器拷了个半截文件），以前是直接忽略、
+      清空内存里那份，然后下一次 Save 把整个文件覆盖掉 —— 一学期的历史永久没了，而且用户看到
+      的只是「怎么没记录了」。现在解析失败先把坏文件改名留档成 ledger.json.corrupt-yyyyMMdd-HHmmss，
+      再干净开始；万一只坏了一行，还能人工拣回几十条。
+  7. B12 中  时间戳读写全部改 InvariantCulture（跨 Ledger.cs / CardFileList.cs / SessionEngine.cs 共 13 处）
+      时间戳以前用 DateTime.ToString("yyyy-MM-dd HH:mm:ss") 写、DateTime.TryParse 读，都不带 culture。
+      在非公历区域性（harness 用 ar-SA 复现）下写出去是「1448-05-13 16:00:00」，读回来对不上，
+      Prune(21) 会把一条 1 天前的记录当成古董删掉。现在读写两侧都钉死 InvariantCulture，
+      顺手也把「换系统区域设置后历史错乱」这类问题一起消掉了。
+
+第二批（子 agent 17b89ca7 改的 4 处，编号沿用它的报告）
+  F1 中等  Core/SyncSettings.cs:403 Normalize + Core/Appearance.cs:294 Resolve
+      8 位色 #RRGGBBAA 以前会被 Substring(0,6) 截掉 alpha；现在 3/6/8 位都接受，
+      8 位原样保留。另加 HasExplicitAlpha：底色里显式写了 alpha 就直接用，
+      不再被「不透明度」滑块的 pct*255/100 覆盖（只改 Normalize 还不够，
+      BgAlpha 仍会被滑块算出来的值盖掉 —— 这是本轮第一次跑验证时发现的）。
+  F2 低    Core/SyncSettings.cs:348 FindSubjectFolder / SplitSubject / SegmentOverlap
+      查询侧和配置项侧都按 / ／ \ 、 | ｜ + ＋ 拆段求交集。设置里配「劳动/英语」，
+      课表里叫「劳动」或「英语」都能命中，反向亦然。多候选时按配置顺序取第一个，
+      并写一条 "ambiguous subject folder: …" 日志（新增 SyncSettings.LogSink，
+      在 SlideSyncService.Start() 接到 ledger.Log）。
+  F3 低    Core/SessionEngine.cs:668 BeginSession + Core/Ledger.cs:323 Adopt
+      课件改名/挪目录后台账键变了、内容没变（指纹相同）—— 以前会另起一条，
+      同一份课件在台账里出现两条互不相干的记录，卡片也不再提示「上次停在第 5 页」。
+      现在当前键查不到记录时，用指纹认领旧桶，把整段历史迁到新键下（FilePath 同步改写）。
+      指纹变了（课件真被编辑过）就不认领。
+  F4 低    Core/SessionEngine.cs:812 Commit
+      「一页没翻就不写台账」这条判定必须排在「同 StartedAt 就地更新」之前。
+      StartedAt 只有秒精度：上一堂课刚结束、一秒内又打开一次时，旧顺序会把
+      「上次停在第 5 页」就地改写成第 3 页，且记录条数不变 —— 很难从台账看出来。
+      本轮 harness 第一次跑就复现了这个假阴性，调顺序后通过。
+
+按你的决定不修（2 条，记为已知限制）
+  B01 多实例并发写台账：生产里只有一个 Ledger 实例，要复现得同时开两个 ClassIsland。
+      6 线程 × 40 次 Add+Save 能稳定复现「只剩 40 条」。以后真要支持双开，
+      建议在插件启动时对 data 目录加单实例互斥（命名 Mutex），比跨进程锁便宜。
+  B03 不是插件 bug：SeewoBridge.DisplayName 只负责剥「希沃:」前缀，路径→文件名归
+      FileLabel。上一轮用例把职责算错了，本轮改用例。
+
+==================================================================
+三、测试覆盖到哪、没覆盖到哪
+==================================================================
+覆盖到（157 个用例，7 组）
+  Ledger 23 / SessionEngine 16 / SeewoBridge 13 / CardFileList 14 /
+  SyncSettings 41 / CardAppearance 34 / Robustness 16
+  其中 Robustness 组专门打异常路径：坏 JSON、空文件、超长文件名、时区跳变、
+  时间向前回拨、编号回绕等。
+
+没覆盖到（沙箱铁律导致，需要真机）
+  - PptBridge 全组：需要真实 PowerPoint / WPS 的 COM
+  - SessionEngine.Start()/Stop() 的轮询线程、COM 熔断、COM↔希沃切换：会真的拉起放映软件
+  - SeewoBridge 的正常 MCP 路径：只验了端点 500 / 非 JSON 时的降级
+  - Ui/NativeOverlayCard 与 Views/*.axaml 的渲染：需要 Avalonia 窗口和 ClassIsland 宿主
+  - SyncSettings 的磁盘读写层（settings.json 缺失/损坏时的默认值）：发生在启动路径
+  - ClassIslandTheme.Load：要读真实主题文件
+  - 真实希沃白板 / 真实课件 / 你本机那份台账
+
+==================================================================
+四、部署记录
+==================================================================
+  被测与部署的是同一份构建：
+    源   C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\bin\Release\net8.0-windows\ClassSlideSync.Plugin.dll
+    目标 C:\Users\xzq\Desktop\github\ClassSlideSync\classisland\data\Plugins\ClassSlideSync.Plugin\ClassSlideSync.Plugin.dll
+    大小 200704 字节   写入 2026-10-24 16:44:21
+    SHA256 3E8D7C538356FFC0A3E7D643CF77E244086DFDBC92601AA8C582DB93B46F8465
+    manifest.yml 版本 1.2.1.5（未改版本号，等你决定要不要发 1.2.1.6）
+  构建：dotnet build -c Release -t:Rebuild → 0 error / 181 warning（warning 全是原有的可空性提示）
+  注意：.NET 会把 PDB 路径与时间戳写进产物，同源码两次 Rebuild 的 SHA256 会不同。
+        所以「对不上 hash」不代表源码不同，以「大小 200704 + 时间 16:44:21」为准。
+
+==================================================================
+五、留给你的 4 个决定
+==================================================================
+  1. B01 要不要真的用命名 Mutex 做单实例限制？（不做的话，双开 ClassIsland 会互相覆盖台账）
+  2. F3 按内容指纹认亲，代价是「两份内容完全相同的不同课件」会被合并成一份历史。
+     要更保守的话，可以加一条「只当旧记录最近 N 天内有更新才迁移」。
+  3. 新增了两个公开面：Ledger.Adopt(old,new) 与 SyncSettings.LogSink。
+     目前各只有一个调用点，不影响既有 API；要不要保持 public 你定。
+  4. 这版要不要发 1.2.1.6？（代码改了 11 处，建议发；manifest 版本号我没动）
+
+==================================================================
+六、坦白一条
+==================================================================
+子 agent 给 harness 追加用例时，用 PowerShell 回写 Program.cs 把中文编码毁了（UTF-8 被按 GBK
+往返）。它用上一版 StabilityHarness.dll 反编译恢复了 Program.cs 并重跑全部 157 条，结论与
+破坏前一致（157/1，唯一失败仍是 B01）。插件工程本身没受影响；恢复后的 harness 源码可编译，
+但个别注释措辞可能与最初手写版略有差异。

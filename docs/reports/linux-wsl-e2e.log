@@ -1,0 +1,33 @@
+[drive] connected
+[drive] loading file:///root/plugin/test/%E7%BA%AF%E9%A1%B5%E7%A0%81%E8%AF%BE%E4%BB%B6.pptx
+[drive] loaded, pages=10 url=file:///root/plugin/test/%E7%BA%AF%E9%A1%B5%E7%A0%81%E8%AF%BE%E4%BB%B6.pptx
+[drive] starting presentation
+[drive] presentation running
+[drive] slide count=10 index=0
+[drive] after goto index=3
+[drive] running adapter --once (defaults: 127.0.0.1:2002, out=/tmp/classslidesync-verify/classslidesync/current.json)
+[drive] adapter rc=0
+[drive] adapter stdout: {"file": "/root/plugin/test/纯页码课件.pptx", "page": 4, "total": 10, "showing": true, "updated": "2026-10-31T08:05:00Z", "app": "libreoffice"}
+[drive] adapter stderr: [slidesync-lo 08:05:00] output: /tmp/classslidesync-verify/classslidesync/current.json
+[slidesync-lo 08:05:00] connecting to uno:socket,host=127.0.0.1,port=2002 ...
+[drive] current.json: {"file":"/root/plugin/test/纯页码课件.pptx","page":4,"total":10,"showing":true,"updated":"2026-10-31T08:05:00Z","app":"libreoffice"}
+[drive] running LinuxSlideSource probe with XDG_DATA_HOME=/tmp/classslidesync-verify
+[drive] plugin probe rc=0
+[drive] plugin probe stdout:
+PASS maintain-dir  /tmp/classslidesync-verify/classslidesync
+PASS maintain-readme  /tmp/classslidesync-verify/classslidesync/README.txt
+json=/tmp/classslidesync-verify/classslidesync/current.json
+PASS fresh-read  page=4 total=10 showing=True file=/root/plugin/test/纯页码课件.pptx
+PASS fresh-snapshot  纯页码课件.pptx 第 4/10 页（放映中，libreoffice）
+PASS stale-rejected  ok=False
+PASS stale-logged  bridge: 已写协议说明 /tmp/classslidesync-verify/classslidesync/README.txt | bridge: 数据过期 215597102 秒（/tmp/classslidesync-verify/classslidesync/current.json）
+PASS bad-json-rejected  ok=False
+PASS missing-rejected  ok=False
+PASS restored-read  page=4
+logs (4):
+  bridge: 已写协议说明 /tmp/classslidesync-verify/classslidesync/README.txt
+  bridge: 数据过期 215597102 秒（/tmp/classslidesync-verify/classslidesync/current.json）
+  bridge: current.json 解析失败（JsonReaderException）: 't' is an invalid start of a property name. Expected a '"'. LineNumber: 0 | BytePositionInLine: 2.
+  bridge: 没有 current.json（适配器还没运行）: /tmp/classslidesync-verify/classslidesync/current.json
+RESULT ALL PASS
+[drive] screenshot rc=0 path=/tmp/slidesync-shot.png stderr=

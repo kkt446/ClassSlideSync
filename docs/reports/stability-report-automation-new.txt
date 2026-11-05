@@ -1,0 +1,241 @@
+课件续页 · 自动化新行动（Windows 提示 / 打开控制面板 / 跳到上次停的那一页）
+稳定性报告 —— 2026-10-24 23:25
+====================================================================
+
+一句话结论
+--------------------------------------------------------------------
+ClassIsland 2.1 **有官方分组 API**（`ActionInfo` 的第 5 个参数 `defaultGroupToMenu`），
+所以按用户设想的「调用此插件 = 一个大分支，里面挂几个小分支」做成了：
+五个自动化行动全部挂在「添加行动」菜单的同一个组「课件续页」下面。
+三个新行动都已实现、注册、编译通过（0 error），并通过 72 条反射断言（含真发一条托盘气泡）。
+
+
+一、分组 / 大分支 API 结论
+--------------------------------------------------------------------
+结论：**有，能用，而且不需要自己造轮子。**
+
+1) 程序集里的真实签名（ILSpy 反编译
+   classisland\app-2.1.0.1-0\ClassIsland.Core.dll，
+   ClassIsland.Core.Attributes.ActionInfo）：
+
+       public ActionInfo(string id, string name, string? iconGlyph = null,
+                         bool addDefaultToMenu = true, string defaultGroupToMenu = "")
+
+2) 注册链路（ClassIsland.Core.Extensions.Registry.ActionRegistryExtensions）：
+
+       AddAction<TAction>()          → RegisterActionInfo(typeof(TAction)) → ProcessAddToGroup(info)
+       ProcessAddToGroup(info)       → info.AddDefaultToMenu 为 false 直接 return；
+                                        info.DefaultGroupToMenu 非空时，在 IActionService.ActionMenuTree
+                                        里按名字找 ActionMenuTreeGroup；
+                                        找不到就 new ActionMenuTreeGroup(name, null) 加到根集合；
+                                        最后把 new ActionMenuTreeItem(info.Id, info.Name, info.IconGlyph)
+                                        塞进该组的 Children。
+
+   也就是说：**只要给 [ActionInfo] 的第 5 个参数写一个组名，插件自己就出现在「添加行动」菜单的
+   那个组里；组不存在时 ClassIsland 会自动建一个根组**，下一次注册同名的行动会并进同一个组。
+
+3) 官方文档情况：
+   - 开发文档 https://docs.classisland.tech/dev/automation/ **HTTP 404**（页面正文「页面不存在」），
+     官方没有自动化开发文档，只能以程序集签名为准；
+   - API 文档 https://api.docs.classisland.tech/api/ClassIsland.Core.Attributes.ActionInfo.html 有
+     构造函数说明，`defaultGroupToMenu` 原文：「在「添加行动」菜单添加默认项的根菜单组。
+     如果找不到该组会添加该组。默认为根菜单。」——与本插件用到的行为一致。
+
+4) 实际用法（本插件）：
+       [ActionInfo(Id, Name, Glyph, true, AutomationGroups.Plugin)]
+   `AutomationGroups.Plugin` = "课件续页"（Automation\UtilityActions.cs:17-21）。
+   五个行动共用这个常量，组名只有一处定义。
+
+   注意点（写在这里备查）：
+   - 第 4 个参数 `addDefaultToMenu` 必须是 true，否则压根不进「添加行动」菜单（只进代码注册表）；
+   - 组名是全局的（挂在宿主的 IActionService.ActionMenuTree 上），如果别的插件也用「课件续页」
+     会并进同一个组，所以名字取了插件中文名；
+   - 组内顺序 = 注册顺序（Plugin.Initialize 里 AddAction 的调用顺序）。
+
+
+二、三个新行动
+--------------------------------------------------------------------
+文件：Automation\UtilityActions.cs（新文件，215 行，仓库
+C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\Automation\UtilityActions.cs）
+
+  1) NotifyAction —— 「发一条 Windows 提示」（UtilityActions.cs:31-79）
+     Id          = "ClassSlideSync.Plugin.Notify"
+     Name        = "发一条 Windows 提示"
+     Description = "弹出一条 Windows 托盘气泡，标题与正文由行动属性决定；用来把「该换页了」「下课了」之类的话直接推到屏幕上。"
+     Glyph       = "\uE8BD"（Segoe Fluent Icons: Message）
+     属性：
+       public string Title   { get; set; } = "课件续页";
+       public string Message { get; set; } = "来自自动化";
+       public bool LastShowSucceeded { get; private set; }   // TrayNotifier.Show 的返回值，便于日志/诊断
+     执行：TrayNotifier.Show(title, message)（Core\TrayNotifier.cs 已有，15 秒后自己摘托盘图标），
+           成功/失败都往台账写一行 "automation notify: ..."。
+     为什么不用 ToastNotifier：托盘气泡在教室机器上比系统 Toast 稳（不依赖通知开关/聚焦助手），
+     而且 TrayNotifier 是插件里已经用了一学期的现成实现，不需要任何 NuGet。
+
+  2) OpenPanelAction —— 「打开课件续页控制面板」（UtilityActions.cs:88-126）
+     Id          = "ClassSlideSync.Plugin.OpenControlPanel"
+     Name        = "打开课件续页控制面板"
+     Description = "把插件自己的控制面板叫到前台：里面有课件台账、跳页、设置入口。上课没开始（服务未 Arm）时不动作，只记日志。"
+     Glyph       = "\uE8A7"（OpenPane）
+     执行：SlideSyncService.OpenPanelForAutomation("自动化：打开控制面板")。
+     为什么加方法：面板原本只有「点托盘图标 → OnPanelRequested()」这一条创建链路，而且
+     OnPanelRequested 是 private；自动化需要一个公开入口，所以只加了这一个最小公开方法
+     （Services\SlideSyncService.cs:1239-1256），内部就是「记日志 + 转调既有 OnPanelRequested()」，
+     不复制任何面板创建/线程切换逻辑。没 Arm 时主动 return 并记
+     "automation panel: 没在上课（未 Arm），跳过：..."，让日志能区分「跳过」和「失败」。
+
+  3) JumpLastPageAction —— 「跳到上次停的那一页」（UtilityActions.cs:136-214）
+     Id          = "ClassSlideSync.Plugin.JumpLastPage"
+     Name        = "跳到上次停的那一页"
+     Description = "在当前正在放映的课件里，跳回台账记录的最后一页；没有在放映或没有记录时安静跳过，只记日志。"
+     Glyph       = "\uE7C3"（Page）
+     执行：engine.Last（当前放映的那份）→ ledger.Last(filePath) → UnfinishedDecks.JumpPage(record)
+           → service.RequestJump(page)。
+     为什么这么绕：不能拿「台账里最近一条记录」的路径直接去 RequestJumpTo(filePath, page)——
+     引擎在桥（PptBridge）没挂上时会 PptBridge.Launch(jumpPath)，等于在教室里凭空拉起一个
+     PowerPoint。所以只传页码（service.RequestJump(page) → engine.RequestJumpTo(null, page)），
+     文件路径由引擎自己用当前记录解析，目标永远是「正在放映的这份」。
+
+三个行动的公共形状（与既有 ToggleCardAction 一致）：
+  - 都是 `public sealed class ... : ActionBase`；
+  - 都是 `protected override Task OnInvoke()`，首行 `base.OnInvoke()`，返回 Task.CompletedTask；
+  - 都没用 ActionBase<TSettings>：Notify 只有两个短字符串，另两个无属性，为它们各配一个设置类型 +
+    设置界面不划算（ClassIsland 的 ActionSettingsControlBase 还得自己写 UserControl）。
+    反射测试专门断言了 OpenPanelAction / JumpLastPageAction 没有多余公开设置属性。
+
+
+三、注册与服务改动（改了哪些行）
+--------------------------------------------------------------------
+1) Plugin.cs（只加注册行）
+   :64  services.AddAction<OpenUnfinishedDeckAction>();     ← 既有
+   :65  services.AddAction<ToggleCardAction>();             ← 既有
+   :68  services.AddAction<NotifyAction>();                 ← 新增
+   :69  services.AddAction<OpenPanelAction>();              ← 新增
+   :70  services.AddAction<JumpLastPageAction>();           ← 新增
+
+2) Automation\Actions.cs（既有两个行动，只把特性补上组名，让五个行动同组）
+   :21   [ActionInfo(Id, Name, Glyph, true, AutomationGroups.Plugin)]   （OpenUnfinishedDeckAction）
+   :162  [ActionInfo(Id, Name, Glyph, true, AutomationGroups.Plugin)]   （ToggleCardAction）
+
+3) Services\SlideSyncService.cs（只两处，且都与自动化入口有关）
+   :982   void RequestJump(int slide)  →  public void RequestJump(int slide)   （只改访问修饰符 + 注释）
+   :1239  public void OpenPanelForAutomation(string reason)                    （新增，唯一新增公开方法）
+
+4) 没有动 Core\* / Ui\* / Views\*；没有加 NuGet；没有碰 git / 没有部署 / 没有启动
+   ClassIsland、WPS、PowerPoint、希沃。
+
+
+四、Invoke 的失败路径（都安静失败，不把异常抛回 ClassIsland）
+--------------------------------------------------------------------
+NotifyAction
+  - Title/Message 为 null → 统一成 ""；TrayNotifier.Show 正文为空时返回 false
+    （Core\TrayNotifier.cs:106 起：text 空白直接 false）；
+  - Win32 Shell_NotifyIcon 失败（没托盘、系统拒绝）→ 返回 false；
+  - 以上两种都会把 LastShowSucceeded=false 并记 "automation notify: 气泡没发出去（标题或正文为空，或系统拒绝）"；
+  - TrayNotifier 内部异常被它自己 catch（返回 false）；外层再包一层 catch，记 "automation notify failed: ..."。
+
+OpenPanelAction
+  - IAppHost 还没起来 / 服务没注册 → TryService() 返回 null → 记 "automation panel: 服务还没起来，忽略"；
+  - 没 Arm（没开始上课）→ OpenPanelForAutomation 记 "没在上课（未 Arm），跳过：..." 后 return；
+  - 面板已存在 → OnPanelRequested 走 Show / 还原最小化 / Activate（不新建）；
+  - 面板构造或 Show 抛异常 → OnPanelRequested 自己记 "panel open failed: ..." /
+    "panel dispatch failed: ..."；OpenPanelForAutomation 外层 catch 兜底记 "automation panel failed: ..."。
+
+JumpLastPageAction
+  - 服务为 null → "automation jump: 服务还没起来，忽略"；
+  - engine 为 null（没开始放映）→ "automation jump: 还没开始放映，没有可跳的页"；
+  - engine.Last 为 null / AppFound=false / FilePath 为空 → "automation jump: 当前没有正在放映的课件，跳过"；
+  - ledger 为 null 或 ledger.Last(filePath) 为 null → JumpPage 返回 0 → "台账里没有「xxx.pptx」的有效页码，跳过"；
+  - JumpPage 只在 EndSlide > 0 时返回页码（Automation\UnfinishedDecks.cs），所以「没讲到过第几页」也算跳过；
+  - service.RequestJump 抛异常 → "automation jump failed: ..."。
+  以上日志全部通过 Ledger.Log 落到插件台账（和既有 "automation hide card" / "jump ignored" 同一套前缀），
+  在控制面板的日志里能直接看到是跳过还是失败。
+
+
+五、反射测试
+--------------------------------------------------------------------
+工程：C:\Users\xzq\AppData\Local\Temp\automation-actions\（net8.0-windows，直接引用装机目录里的
+      ClassIsland.Core.dll / ClassIsland.Shared.dll / Microsoft.Extensions.DependencyInjection*.dll，
+      不引用 NuGet；先 Assembly.LoadFrom 插件 Release DLL，再 AssemblyResolve 从插件目录捞依赖）
+
+运行方式（必须这么跑，dotnet run 会因为宿主 STJ 9.0 与 .NET 8 冲突起不来）：
+      $env:DOTNET_ROLL_FORWARD='LatestMajor'
+      & "$env:TEMP\automation-actions\bin\Release\net8.0-windows\AutomationActionsTest.exe"
+
+结果：**72 passed, 0 failed（退出码 0）**，覆盖：
+  - 三个类型存在、都派生自 ActionBase；
+  - Id / Name / Description / Glyph 四个常量都非空、三个互相不重复、Id 不与既有两个行动冲突；
+  - [ActionInfo] 特性里的 Id / Name / IconGlyph 与常量一致，AddDefaultToMenu=true，
+    DefaultGroupToMenu == "课件续页"；
+  - NotifyAction.Title 默认值「课件续页」、Message 默认「来自自动化」、LastShowSucceeded 初始 false、
+    Title/Message 可写；另两个行动没有多余公开设置属性；
+  - **走真实的 ActionRegistryExtensions.AddAction<TAction>() 注册五个行动**（不是只读特性）：
+    ServiceCollection 里正好 5 个 keyed transient；IActionService.ActionInfos 里 5 个 Id 都在；
+    三个新行动 IsRevertable == false（没重写 OnRevert）；
+    菜单树里存在 ActionMenuTreeGroup「课件续页」，Children 正好 5 项，顺序为
+      ClassSlideSync.Plugin.Notify, ClassSlideSync.Plugin.OpenControlPanel,
+      ClassSlideSync.Plugin.JumpLastPage, ClassSlideSync.Plugin.OpenUnfinishedDeck,
+      ClassSlideSync.Plugin.ToggleCard；
+    该组还能按名字 TryGetValue 索引到；
+  - 无宿主（IAppHost 没起来）状态下直接反射调 protected OnInvoke：三个行动都不抛；
+  - **通知行动真的把一条气泡发出去了**：调用后 LastShowSucceeded == true（系统已接收，
+    气泡约 15 秒后自动消失；这一条按约定允许真发一次）；
+  - 服务公开面：SlideSyncService.OpenPanelForAutomation(string) 是 public、
+    RequestJump(int) 是 public，CardVisible / ShowCardForAutomation 仍然在。
+
+测试脚本自己踩过的坑（记录一下，避免下次重复）：
+  - ActionRegistryExtensions 有 **两个** 单参数的泛型 AddAction 重载
+    （AddAction<TAction>() 与 AddAction<TAction,TSettingsControl>()），反射选方法时只按
+    Parameters.Length==1 会抛 "Sequence contains more than one matching element"，
+    必须再加上 GetGenericArguments().Length == 1 才唯一。
+
+
+六、构建
+--------------------------------------------------------------------
+命令：
+  & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build
+    "C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\ClassSlideSync.Plugin.csproj"
+    -c Release -t:Rebuild
+
+结果：**0 个错误**；警告 198 条，其中 Automation\*.cs（含新文件 UtilityActions.cs）**0 条**。
+对比：上一轮（只有两个行动时）同一命令是 201 条警告；本轮 197~198 条之间的浮动全部来自既有文件
+（PptBridge.cs、SlideSyncService.cs、SessionEngine.cs、Ledger.cs、NativeOverlayCard.cs 等的 CS8618/CS8604），
+没有新增警告。最终 DLL 时间 23:20:41。
+
+（过程备注：本轮构建期间，工作区的 Ui\ControlPanel.axaml / .axaml.cs 被另一个进程反复重写，
+出现过乱码、反编译器输出、以及文件被换成旧快照等中间状态，导致 Rebuild 一度报 100+ 个语法错误。
+这些错误全部落在 Ui\ControlPanel.axaml.cs（不在本次任务的文件范围内），与自动化改动无关。
+为了在没有 Ui 干扰的前提下验证本次代码，我把整个插件复制到 %TEMP%\shadow-build，
+只把 Ui\ControlPanel.axaml(.cs) 换成 %TEMP%\audit-card\baseline 里的一致快照，Rebuild 得到
+**0 error**；随后真实工作区的 Ui 也恢复，真实 Rebuild 同样 0 error / 197 warnings。）
+
+
+七、未验证项（需要真机）
+--------------------------------------------------------------------
+1. 没有启动 ClassIsland，所以没有在真实「添加行动」菜单里肉眼确认「课件续页」组的显示位置和图标
+   ——分组树是按真实注册代码构出来的（反射测过），但菜单渲染属于 UI 层。
+2. Windows 托盘气泡在教室机器上的实际可见性：如果系统开了「专注助手/勿扰」或被组策略关掉
+   Shell_NotifyIcon，气泡可能不显示（此时 LastShowSucceeded 仍是 true，因为系统接收了请求）。
+   本次只验证了「交给系统的这一刻返回 true」。
+3. 「打开控制面板」只在无宿主（服务为 null）与未 Arm 两条失败路径上验证过不崩；
+   面板在真实上课（Arm）状态下能否正常前置、最小化还原，需要真机点一次。
+4. 「跳到上次停的那一页」只验证了不抛异常与各跳过分支；真实 PowerPoint/希沃放映中的跳页效果、
+   以及「引擎把 null 路径解析成当前记录」的行为，需要真机跑一轮。
+5. 行动属性（Title/Message）在 ClassIsland 设置界面里的持久化：本插件没给这两个行动写
+   ActionSettingsControlBase，宿主会用默认的属性编辑界面/或只保留在 ActionItem.Settings 里；
+   这一点没有在真机确认（默认值已测）。
+
+
+八、复现命令
+--------------------------------------------------------------------
+构建：
+  & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build "C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\ClassSlideSync.Plugin.csproj" -c Release -t:Rebuild
+
+测试：
+  & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build "%TEMP%\automation-actions\AutomationActionsTest.csproj" -c Release
+  $env:DOTNET_ROLL_FORWARD='LatestMajor'
+  & "%TEMP%\automation-actions\bin\Release\net8.0-windows\AutomationActionsTest.exe"
+
+反编译取证（可选）：
+  $env:DOTNET_ROLL_FORWARD='LatestMajor'
+  & 'C:\Users\xzq\.dotnet\tools\ilspycmd.exe' --type "ClassIsland.Core.Extensions.Registry.ActionRegistryExtensions" "C:\Users\xzq\Desktop\github\ClassSlideSync\classisland\app-2.1.0.1-0\ClassIsland.Core.dll"

@@ -1,0 +1,283 @@
+课件续页（ClassSlideSync.Plugin 1.2.2.0）Linux 可加载性改造报告
+================================================================
+
+日期：2026-10-31
+范围：只改「能不能在 Linux 上装/加载/不崩」和「明确告知本平台不可用」；Windows 侧功能一行不减。
+版本号 manifest.yml: 仍是 1.2.2.0（未动）；supportedOSPlatforms: 仍是 [Windows]（未动）。
+
+结论（先说答案）
+----------------------------------------------------------------
+1. 插件 dll 现在是纯 net8.0：deps.json 只列 Microsoft.NETCore.App / .NETCoreApp,Version=v8.0，
+   没有 WindowsDesktop、没有 net8.0-windows、没有 WinRT 引用 —— 这是「Linux 上 Assembly.LoadFrom
+   能过」的硬条件。
+2. Linux 上 Plugin.Initialize 第一行就分流：只写一行日志、注册一个只读设置页（标题「课件续页」，
+   正文「本插件依赖 Windows 的窗口与 COM 自动化，当前平台不可用」），然后 return。
+   卡片/组件/行动/规则/触发器/教程一个都不注册，SlideSyncService 根本不会 new，
+   NativeOverlayCard / PptBridge / TrayNotifier 连构造都不会发生。
+3. 四个 Windows 专属入口另加了 16 处运行时护栏（OperatingSystem.IsWindows 派生的
+   PlatformGuard.IsWindows）。就算有人绕过闸门直接调 Arm / Step / Show / Start，也只是记一行
+   `platform: skipped (non-windows) <what>` 然后返回，不抛。
+4. Windows 侧：所有护栏都是 `if (!IsWindows) { …; return; }` 的提前返回，Windows 上
+   PlatformGuard.IsWindows 恒为 true ⇒ 这些 return 不可达，函数体后半段与改动前逐行相同。
+5. 构建与打包：Rebuild 0 error；`-p:CreateCipx=true` 打包成功（14 项，含 ToastHelper）。
+   模拟 Linux（$(OS)=Unix、输出目录无 ToastHelper）打包也 0 error、7 项、无 ToastHelper。
+6. 离屏断言 120 条全绿（0 失败）。
+7. 边界：没有 Linux 实机、没有 WSL，所以「Linux 上真的能装/能显示」属于静态+结构证据，
+   不是在 Linux 桌面上跑出来的结论，详见最后一节。
+
+一、TFM 改动
+----------------------------------------------------------------
+文件：ClassSlideSync.Plugin/ClassSlideSync.Plugin.csproj
+
+  - <TargetFramework>net8.0-windows</TargetFramework>
+  + <TargetFramework>net8.0</TargetFramework>
+
+改完后的客观证据（bin/Release/net8.0）：
+  - ClassSlideSync.Plugin.runtimeconfig.json:
+      "tfm": "net8.0"
+      "framework": { "name": "Microsoft.NETCore.App", "version": "8.0.0" }
+  - ClassSlideSync.Plugin.deps.json:
+      "name": ".NETCoreApp,Version=v8.0"
+      全文无 WindowsDesktop / net8.0-windows / WinRT / Microsoft.Windows 字样
+  - 输出目录里没有 Avalonia/ClassIsland 的 dll：它们由宿主进程提供（与原设计一致）。
+
+没有用编译期开关：全仓 .cs 里没有一行 `#if WINDOWS` 预处理指令
+（Core/PlatformGuard.cs 的注释里提到过这个词，被断言按「注释不算」处理）。
+两端拿到的是同一个二进制，判断全在运行时。
+
+CA1416（调用 Windows 专属 API）没有用 pragma 压：新增的
+[SupportedOSPlatformGuard("windows")] PlatformGuard.IsWindows 让 Roslyn 把
+`if (!PlatformGuard.IsWindows) { …; return; }` 认成平台分支，后面的 COM/user32 调用自动不再告警。
+Build 里 CA1416 数量：0。
+
+二、新增文件
+----------------------------------------------------------------
+1) Core/PlatformGuard.cs（新，81 行）
+   - `[SupportedOSPlatformGuard("windows")] public static bool IsWindows => OperatingSystem.IsWindows();`
+     （第 33-37 行）—— 属性而不是缓存字段，每次实时查询；IL 里直接 call
+     System.OperatingSystem::IsWindows()（断言用 IL token 解析验证过）。
+   - `public static void Announce(string what, Action<string>? log = null)`（第 50 行）
+     固定文案 `platform: skipped (non-windows) <what>`（第 61 行），同一个 what 只记一次
+     （HashSet + lock），log 为 null 退回 stderr；Windows 上不会被调用。
+   - ResetAnnouncements() / AnnouncementCount 仅测试用。
+
+2) Views/SettingsPages/PlatformUnavailablePage.cs（新）
+   - `[SettingsPageInfo("classslidesync.unavailable", "课件续页", "\uE7C3", "\uE7C3")]`
+   - `public sealed class PlatformUnavailablePage : SettingsPageBase`，无参构造，不用 XAML：
+     StackPanel(Spacing=12, Margin=24) 里两个 TextBlock：
+       标题「课件续页」(FontSize=22, SemiBold)
+       正文「本插件依赖 Windows 的窗口与 COM 自动化，当前平台不可用。」(TextWrapping=Wrap)
+   - 页面里没有任何可交互控件，「只读」是字面意思。
+
+三、平台闸门（要求 3）
+----------------------------------------------------------------
+文件：Plugin.cs:47-56
+
+    if (!OperatingSystem.IsWindows())
+    {
+        new Ledger(PluginConfigFolder).Log(
+            "platform: non-windows — only the read-only settings page is registered; " +
+            "cards / components / automations / triggers / tutorial are skipped");
+        services.AddSettingsPage<PlatformUnavailablePage>();
+        return;
+    }
+
+- 位置：Initialize 的第一条语句之前（DataFolder / LoadConfig / new SlideSyncService 全在它后面）。
+- 闸门里刻意不调 PlatformGuard.Announce：闸门不是「跳过」，Linux 上这就是唯一会走的路，
+  所以文案写清楚「只注册了只读设置页」。
+- Windows 上这个分支恒不成立，第 58 行之后与改动前完全一致。
+
+四、运行时护栏清单（要求 4；绕过闸门也不抛）
+----------------------------------------------------------------
+序号 | 入口 | 文件:行 | 非 Windows 行为 | 日志 what
+-----|------|---------|-----------------|----------
+ 0 | Plugin.Initialize | Plugin.cs:47-56 | 只注册只读页后 return | platform: non-windows — ...
+ 1 | PptBridge.Connect | Core/PptBridge.cs:201 | return null | ppt-bridge:connect
+ 2 | PptBridge.Launch | Core/PptBridge.cs:387 | return null | ppt-bridge:launch
+ 3 | PptBridge.TryFindBestInstance | Core/PptBridge.cs:595 | return false | ppt-bridge:find-instance
+ 4 | PptBridge.DumpRot | Core/PptBridge.cs:700 | 返回状态字符串 | ppt-bridge:dump-rot
+ 5 | PptBridge.Dispose | Core/PptBridge.cs:1207 | return | ppt-bridge:dispose
+ 6 | PptBridge.DropCandidate | Core/PptBridge.cs:1246 | return | ppt-bridge:drop-candidate
+ 7 | PptBridge.Release | Core/PptBridge.cs:1254 | o=null; return | ppt-bridge:release
+ 8 | SessionEngine.Start | Core/SessionEngine.cs:380 | 不起 COM 线程 | session-engine:start
+ 9 | SessionEngine.Step | Core/SessionEngine.cs:411 | 不建桥、不轮询 | session-engine:step
+10 | SlideSyncService.Arm | Services/SlideSyncService.cs:694 | 不建卡片/引擎 | slide-sync:arm
+11 | SlideSyncService.Disarm | Services/SlideSyncService.cs:795 | armed=false; engine=null; card=null; return | slide-sync:disarm
+12 | NativeOverlayCard 构造 | Ui/NativeOverlayCard.cs:284 | 不调 SetApartmentState(STA)（Linux 上会抛 PlatformNotSupportedException） | —
+13 | NativeOverlayCard.Start | Ui/NativeOverlayCard.cs:321-326 | lastError=platform: skipped (non-windows) overlay-card; 不启线程 | overlay-card:start
+14 | TrayNotifier.Show | Core/TrayNotifier.cs:114 | return false | tray-notifier:show
+15 | ToastNotifier.InstallOnce | Core/ToastNotifier.cs:69 | return（不启动 helper 进程） | toast-helper:install
+16 | ToastNotifier.Show | Core/ToastNotifier.cs:122 | return false（走托盘/静默回退） | toast-helper:show
+
+说明：
+- 全部是「提前 return」形式，没有把原有代码包进 else，也没有删任何 Windows 分支。
+- PptBridge 的 11 处 DllImport + COM 接口、NativeOverlayCard 的 50 处 DllImport、
+  TrayNotifier 的 user32/shell32/kernel32 声明都原样保留。
+- Ui/ControlPanel.axaml.cs 里启动 explorer.exe 的那条路径在 Linux 上不可达（面板只由卡片交互打开，
+  卡片在 Linux 上不创建）。
+
+五、Linux 上到底会执行到什么（调用链）
+----------------------------------------------------------------
+宿主（ClassIsland Linux）加载插件 dll
+  → 反射找到 [PluginEntrance] ClassSlideSync.Plugin.Plugin
+  → new Plugin()（只跑字段初始化，无 IO、无窗口）
+  → Plugin.Initialize(context, services)
+      → Plugin.cs:47  OperatingSystem.IsWindows() == false
+      → Plugin.cs:51  new Ledger(PluginConfigFolder).Log("platform: non-windows — ...")
+           （Ledger.Log 内部 CreateDirectory + try/catch，目录不可写也不会抛）
+      → Plugin.cs:55  services.AddSettingsPage<PlatformUnavailablePage>()
+           （读 [SettingsPageInfo]，登记 SettingsWindowRegistryService.Registered，
+             注册 keyed transient <SettingsPageBase, PlatformUnavailablePage>）
+      → Plugin.cs:56  return
+  → 宿主继续启动；设置窗打开时按 id `classslidesync.unavailable` 解析该页面
+      → PlatformUnavailablePage 构造：new StackPanel + 2×TextBlock，Content=panel
+  → 之后：没有 AppStarted/AppStopping 订阅、没有 SlideSyncService、没有 Ledger 轮询、
+    没有 NativeOverlayCard / PptBridge / TrayNotifier 实例、没有 COM、没有 user32 窗口、
+    没有 ToastHelper 子进程。
+
+即：Linux 上的插件「装上→被识别→设置里看到一个说明页→不崩」，没有任何一条代码路径会碰 Windows API。
+
+六、Windows 上为什么零回退（证据）
+----------------------------------------------------------------
+1) 闸门与护栏的判据是运行时真值，不是常量：断言解析了 PlatformGuard.get_IsWindows 的 IL，
+   确认里面是对 System.OperatingSystem::IsWindows() 的 call，且类里没有缓存 bool 字段。
+   本机 Windows 上 IsWindows == true ⇒ 第三节的闸门不成立、16 处护栏的 return 全部不可达。
+2) 闸门之后（Plugin.cs:58-134）与改动前逐行相同：
+   LoadConfig(SyncSettings.json)、new SlideSyncService、ToastNotifier.InstallOnce、
+   AddSingleton(Settings/Service)、AddSettingsPage<SlideSyncSettingsPage>()、
+   8 个 AddAction（OpenUnfinishedDeck / ToggleCard / Notify / OpenPanel / JumpLastPage /
+   JumpToPage / OpenDeckFolder / ClearDeckHistory）、AddRule(UnfinishedDeckRule)、
+   AddTrigger(SlidePageReached)、AddComponent(DeckProgressComponent)、TutorialGuide.Register()、
+   AppStarted→Service.Start()、AppStopping→Service.Stop()。
+3) 功能源码未删：PptBridge 11 处 DllImport + [ComImport] 接口、NativeOverlayCard 50 处
+   DllImport（分层窗口/GDI/消息循环）、TrayNotifier 的 Shell_NotifyIconW 全部在位。
+4) 纯函数回归断言（TFM 切换不改逻辑）：
+   PptBridge.LooksLikePath(路径/非路径)、NativeOverlayCard.ProgressRatio(5,10)=0.5、
+   ProgressFillWidth(100,3,10)>0 等全部通过。
+5) 版本与清单：
+   - manifest.yml: version: 1.2.2.0（未动）
+   - manifest.yml: supportedOSPlatforms: [Windows]（未动，市场里 Linux 会标灰）
+   - Assembly.LoadFrom 加载的仍是同一个 ClassSlideSync.Plugin.dll（1 个二进制两端通用）
+6) 构建：`dotnet build ClassSlideSync.Plugin.csproj -c Release -t:Rebuild --nologo`
+   → 0 error，218 warning（全是改动前就有的 CS860x/CS0414/CS8618 与 2 条 AVLN3001，
+   与本次改动无关；CA1416 = 0）。
+
+七、打包（含 Linux 上不会因为缺 ToastHelper 而断）
+----------------------------------------------------------------
+Windows（本机真实）：
+  dotnet build ClassSlideSync.Plugin.csproj -c Release -t:Rebuild -p:CreateCipx=true
+  → 0 error；cipx/ClassSlideSync.Plugin.cipx 共 14 项，含 ToastHelper/（exe + WinRT 依赖）。
+
+Linux 模拟（同一台机器，把 MSBuild 的 $(OS) 覆盖成 Unix，并先删掉输出目录里的 ToastHelper）：
+  dotnet build ClassSlideSync.Plugin.csproj -c Release -t:Rebuild -p:OS=Unix -p:CreateCipx=true
+  → 0 error；cipx 共 7 项：deps.json/dll/runtimeconfig/icon.png/manifest.yml/README.md/
+    test/纯页码课件.pptx —— 没有 ToastHelper，CreateCipx 照样成功。
+  说明：BuildToastHelper / CopyToastHelper 的条件是
+    Condition="'$(OS)' == 'Windows_NT' And Exists(...)"（csproj:84 与 csproj:100），
+  在 Linux 上 $(OS)=Unix，两个 target 整体跳过，插件的 Core/ToastNotifier.cs 找不到 helper 时
+  自动退回托盘气泡/静默（原有 fallback，未改）。
+  局限：这是 MSBuild 属性模拟，不是真的 Linux dotnet 进程；见第八节。
+
+八、断言（离屏、无窗口）
+----------------------------------------------------------------
+执行位置：%TEMP%\slidesync-stability\linux-run-<时间戳>\（每次运行一个新目录）
+harness：%TEMP%\slidesync-linux-harness\LinuxHarness.csproj（.NET 8，PackageReference
+仅 ClassIsland.Core 2.1.0.1，以取得 SettingsPageBase / SettingsPageInfo / Avalonia 类型）
+
+只看：Assembly.LoadFrom + 反射 + Measure/Arrange + RenderTargetBitmap。
+没有 Window.Show()、没有 SetForegroundWindow、没有 Start-Process、没有截图，
+也没有启动 ClassIsland / PowerPoint / WPS / 希沃。
+
+**断言总数：120；失败：0。**（分组合计 116 条 + 4 条前置检查：Avalonia 初始化、dll 存在、
+dll 可 LoadFrom、manifest version 仍是 1.2.2.0）
+
+分组与代表断言：
+A 装配与 TFM（9）
+  - TargetFrameworkAttribute = .NETCoreApp,Version=v8.0 且不含 Windows
+  - csproj 里 <TargetFramework>net8.0</TargetFramework>，没有 net8.0-windows
+  - 两个 ToastHelper target 都带 '$(OS)' == 'Windows_NT'
+  - 全仓 .cs 无 `#if WINDOWS` 预处理指令
+B PlatformGuard（16）
+  - IsWindows 属性存在、带 SupportedOSPlatformGuard、本机为 true
+  - IL：getter 直接 call OperatingSystem.IsWindows()；类中无缓存 bool 字段
+  - Announce 文案精确等于 "platform: skipped (non-windows) <what>"
+  - 去重：同一 what 连调 3 次只落 1 行；不同 what 各 1 行；AnnouncementCount=2；
+    ResetAnnouncements() 清零（用真实 Ledger 写 app.log 验证）
+C 护栏落点（18）
+  - 15 个入口的 what 字符串逐条存在（见第四节表格）
+  - 6 个文件里 PlatformGuard.IsWindows / OperatingSystem.IsWindows() 判断共 18 处
+  - NativeOverlayCard 构造的 SetApartmentState 被平台条件包裹
+  - NativeOverlayCard.Start 的 lastError 文案存在
+D Initialize 闸门（15）
+  - 闸门在源码里先于 AddAction/AddSettingsPage<SlideSyncSettingsPage>/AddComponent/
+    AddRule/AddTrigger/TutorialGuide.Register/Service.Start/ToastNotifier.InstallOnce
+  - 闸门内注册 PlatformUnavailablePage 且随后 return
+  - Initialize 的 IL 里同时出现 AddSettingsPage<PlatformUnavailablePage> 与
+    AddSettingsPage<SlideSyncSettingsPage>（证明没删原页面）
+D2 只读页注册（7，真调宿主 API）
+  - 用真实 ServiceCollection 调 ClassIsland.Core 的 AddSettingsPage<PlatformUnavailablePage>()：
+    不抛（说明 [SettingsPageInfo] 合格、Id 未被占用）
+  - SettingsWindowRegistryService.Registered 里出现 classslidesync.unavailable
+  - BuildServiceProvider 后按 keyed<SettingsPageBase>("classslidesync.unavailable") 能解析出实例
+E 清单/打包（6）
+  - manifest 仍 supportedOSPlatforms: - Windows，且没有 - Linux
+  - Pack-Cipx.ps1 走 CreateCipx=true
+  - bin/Release/net8.0 有插件 dll 且没有 ToastHelper.exe（Linux 打包缺它是预期）
+F 不可用设置页（16，含离屏渲染）
+  - 继承 SettingsPageBase、有无参构造、[SettingsPageInfo] Id=classslidesync.unavailable / 标题=课件续页
+  - Content 是 StackPanel，两个 TextBlock 的 Text 精确匹配（标题「课件续页」、
+    正文「本插件依赖 Windows 的窗口与 COM 自动化，当前平台不可用。」）
+  - Measure/Arrange 后 DesiredSize > 0
+  - RenderTargetBitmap 480×360 渲染并保存 PNG；解码后非透明像素 > 0、颜色数 ≥2（文字已绘制）
+G Windows 侧行为不变（29）
+  - PptBridge.Connect/Launch/DumpRot/Dispose、TrayNotifier.Show(bool)、SessionEngine.Start、
+    SlideSyncService.Arm/Disarm、NativeOverlayCard.ctor/Start、ToastNotifier.InstallOnce/Show
+    签名全部还在
+  - PptBridge DllImport ≥11、NativeOverlayCard DllImport ≥50、Shell_NotifyIconW 仍在
+  - COM 绑定代码（GetActiveObject / Type.GetTypeFromProgID）未被删
+  - LooksLikePath / ProgressRatio / ProgressFillWidth 结果正确
+
+复跑：
+  & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' run --project "$env:TEMP\slidesync-linux-harness\LinuxHarness.csproj" -c Release
+  预期最后一行：ASSERTIONS=120 FAILED=0
+
+九、未验证的边界（必读）
+----------------------------------------------------------------
+1) **没有 Linux 实机验证。** 这台机器没装 WSL（`wsl --status` 返回「未安装用于 Linux 的
+   Windows 子系统」），也没有 Linux 桌面。所以「Linux 上能装、能加载、不崩」的依据是：
+   - TFM/依赖层面：dll 是 net8.0，runtimeconfig/deps 只依赖 Microsoft.NETCore.App；
+   - 代码层面：Initialize 第一行分流 + 16 处提前返回，静态与 IL 断言覆盖；
+   - Windows 上同一份 dll 的完整加载、反射调用、离屏渲染都通过（证明程序集自洽）。
+   真机验证仍需：在 Linux 桌面装 ClassIsland 2.x → 安装 cipx → 看插件列表出现「课件续页」
+   → 打开设置看到说明页 → 不崩。这一步没做。
+2) OS=Unix 打包是 MSBuild 属性模拟，不是真 Linux dotnet。真实 Linux 上：
+   $(OS)=Unix，两个 ToastHelper target 会跳过（条件已在断言里固定）；但 Linux SDK 的
+   path/zip 行为未实测（CreateCipx 用 ZipDirectory，理论无平台差异）。
+3) 宿主侧风险不在本插件控制范围：ClassIsland 的 Linux 平台是否会在 Initialize 之外调用
+   插件的其它入口（例如组件/行动的反射构造）。我们已保证这些类型在 Linux 上不会被注册，
+   但如果宿主强行扫描程序集并对每个类型做 Activator.CreateInstance，仍可能构造
+   NativeOverlayCard（它的构造函数已加护栏，不会抛）或带参类型（无参构造不存在，会抛异常，
+   那是宿主行为）。这一点无法在没有 Linux 实机的情况下证否。
+4) 设置页离屏渲染的字体来自本机；页面内容已用 TextBlock.Text 断言逐字校验，截图仅作辅证
+   （随报告存档：ClassSlideSync.Plugin/stability-linux-page-render.png；每次运行为 %TEMP%\slidesync-stability\linux-run-<时间戳>\platform-unavailable-page.png），字形栅格化在裸 Application 下
+   与宿主主题字体不完全一致，不代表页面在 ClassIsland 里的最终外观。
+5) 未部署、未动 git、未加任何 NuGet 包；主工程依赖仍是原来的 ClassIsland.PluginSdk 2.1.0.1。
+
+十、改动文件总表
+----------------------------------------------------------------
+修改：
+  ClassSlideSync.Plugin.csproj        TFM net8.0；ToastHelper 两 target 加 '$(OS)' == 'Windows_NT'
+  Plugin.cs                           Initialize 最前面加平台闸门（47-56）
+  Core/PptBridge.cs                   7 处护栏（201/387/595/700/1207/1246/1254）
+  Core/SessionEngine.cs               2 处护栏（380/411）
+  Core/TrayNotifier.cs                1 处护栏（114）
+  Core/ToastNotifier.cs               2 处护栏（69/122）
+  Services/SlideSyncService.cs        2 处护栏（694/795）
+  Ui/NativeOverlayCard.cs             2 处护栏（284/321-326）
+新增：
+  Core/PlatformGuard.cs
+  Views/SettingsPages/PlatformUnavailablePage.cs
+未动：
+  manifest.yml（version 1.2.2.0、supportedOSPlatforms [Windows]）
+  Tools/ToastHelper/**（只在 Windows 构建）
+  其它所有业务代码与 Windows 专属 P/Invoke/COM 代码

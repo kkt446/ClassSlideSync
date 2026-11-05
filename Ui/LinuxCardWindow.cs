@@ -305,8 +305,15 @@ namespace ClassSlideSync.Plugin.Ui
                 CanResize = false,
                 TransparencyLevelHint = new[] { WindowTransparencyLevel.Transparent },
                 Background = Brushes.Transparent,
+                // ShowActivated=false：卡片因页码变化被 Show 一次时不能把键盘焦点从 Impress 全屏放映
+                // 抢走（Windows 侧早就用 WS_EX_NOACTIVATE 规避同一件事，Linux 这边漏了）。
+                ShowActivated = false,
                 Width = Math.Max(120, look.CardWidth > 0 ? look.CardWidth : BaseWidth),
-                Height = Math.Max(80, look.CardHeight > 0 ? look.CardHeight : BaseHeight),
+                // 版式是写死的（按钮 y=94、进度条 y=134、脚行 y=146，见 BuildStructure），
+                // 而 EstimatedHeight 会按"显示开关"把 CardHeight 减到 158 —— 直接采用就会被
+                // ClipToBounds 裁掉进度条和页码。取两者较大值，与 Windows 侧的 max() 保持一致。
+                Height = Math.Max(Math.Max(80, look.CardHeight > 0 ? look.CardHeight : BaseHeight),
+                                  (int)Math.Ceiling(176 * (look.CardWidth > 0 ? look.CardWidth / 236.0 : 1.0))),
             };
             w.Opened += (_, _) =>
             {

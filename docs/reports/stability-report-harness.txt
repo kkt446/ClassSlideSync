@@ -1,0 +1,128 @@
+ClassSlideSync.Plugin 稳定性测试报告（第二轮：修复 + 复测）
+（未部署、未启动 ClassIsland / WPS / PowerPoint；台账与设置只写 %TEMP%；被测 dll 由本轮源码 Release 构建）
+
+测试环境
+  时间: 2026-10-24 16:42:22 (Asia/Shanghai)
+  dotnet SDK: 8.0.419 / 运行时: 8.0.21 / TFM: net8.0-windows / 当前区域性: zh-CN
+  被测程序集: C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\bin\Release\net8.0-windows\ClassSlideSync.Plugin.dll
+  构建: dotnet build -c Release -t:Rebuild 通过（0 error / 181 warning）
+  测试方式: 独立 console harness（C:\Users\xzq\AppData\Local\Temp\slidesync-stability\harness，
+  run 目录 C:\Users\xzq\AppData\Local\Temp\slidesync-stability\run-20261024-164222）直接引用程序集，
+  内部方法用反射调用；台账/设置全部写 %TEMP% 临时目录
+  mock: 临时 .pptx 文件（只当文件，不用 COM 打开）；TcpListener 假 MCP 端点 127.0.0.1:7916 返回 HTTP 500 + 非 JSON
+  未触碰: C:\Users\xzq\Desktop\github\ClassSlideSync\classisland\data 全程未写入
+
+一、上一轮 6 条问题的现状（FIXED / WONTFIX）
+
+  F1  FIXED   中  Core/SyncSettings.cs:403 Normalize
+      以前 #RRGGBBAA 一律截成 6 位；现在 3/6/8 位都接受：3 位按 CSS 简写展开（#FFF→#FFFFFF），
+      8 位原样保留并大写，6 位行为不变。另改 Core/Appearance.cs:294 Resolve：解析自定义底色时若
+      显式给了 alpha（新增 HasExplicitAlpha）就直接用它，不再被 CardOpacityPercent 的
+      pct*255/100 覆盖（只改 Normalize 不足以让 BgAlpha=128 生效）。
+
+  F2  FIXED   低  Core/SyncSettings.cs:348 FindSubjectFolder / SplitSubject / SegmentOverlap
+      查询侧和配置条目侧都按 / ／ \ 、 | ｜ + ＋ 拆段求交集，存「劳动/英语」时用「劳动」「英语」
+      都能命中，反向亦然。多个条目同时命中时按配置顺序取第一个，并写一条
+      "ambiguous subject folder: ..." 日志（新增 SyncSettings.LogSink，SlideSyncService.Start()
+      里接到 ledger.Log）。原私有 MatchFolder 已删除。
+
+  F3  FIXED   低  Core/SessionEngine.cs:668 BeginSession + Core/Ledger.cs 新增 Adopt
+      BeginSession 发现当前键在台账里没有记录时，用 Ledger.Fingerprint 找内容相同的旧记录；
+      找到且不是同一桶就 ledger.Adopt(old, new) 把旧记录整体迁到新键下（FilePath 同步改写），
+      再 Save + 记一条 "renamed deck adopted: ... (was at page N)"。PickRecord 的指纹兜底未改。
+
+  F4  FIXED   低  Core/SessionEngine.cs:788 Commit
+      EndSlide==StartSlide 且该键此前已有记录时跳过（保留旧进度）；该键此前完全没有记录时仍写
+      一条基线。关键点：这条噪音判定必须排在"同 StartedAt 就地更新"之前 —— StartedAt 只有秒
+      精度，上一堂课刚结束、一秒内又打开一次时旧顺序会把「上次停在第 5 页」就地改写成第 3 页
+      且条数不变（本轮 harness 第一次跑就复现了这个假阴性，改顺序后通过）。
+
+  B01 WONTFIX 中  Core/Ledger.cs:91-104 多实例并发写同一 ledger.json 整文件覆盖
+      生产里插件只有一个 Ledger 实例，要复现得同时跑两个 ClassIsland；改成跨进程锁/合并写的
+      代价和回归风险远大于收益。按用户指示不修改代码，记为已知限制：同目录多实例并发写时
+      后写者覆盖先写者（本轮仍能稳定复现：6 线程 × 40 次 Add+Save 只剩 40 条）。
+
+  B03 WONTFIX(改用例) SeewoBridge.DisplayName
+      它只负责剥「希沃:」前缀，路径→文件名归 FileLabel，SessionEngine.cs:1189 只在 IsSeewoKey
+      为真时调它。上一轮该用例期望写错（把 FileLabel 的职责算到 DisplayName 头上），本轮按
+      用户指示改用例、不改插件。
+
+二、用例总数与通过数
+
+  共 7 组 / 157 个用例：通过 156 个，失败 1 个（失败即 B01，已 WONTFIX）。
+  基线为 144 / 138（上一轮 6 个失败），本轮新增 13 个验收用例。
+  - Ledger:         用例 23 个，失败 1（B01）
+  - SessionEngine:  用例 16 个，失败 0
+  - SeewoBridge:    用例 13 个，失败 0
+  - CardFileList:   用例 14 个，失败 0
+  - SyncSettings:   用例 41 个，失败 0
+  - CardAppearance: 用例 34 个，失败 0
+  - Robustness:     用例 16 个，失败 0
+
+三、本轮新增验收用例（逐条结果，全部 PASS）
+
+  F1 颜色 8 位往返（Core/SyncSettings.cs:403，Core/Appearance.cs:294）
+    PASS  F1 8 位色规范化               Normalize("#10203080") == "#10203080"
+    PASS  F1 8 位色再 Normalize 不变形  对结果再 Normalize 一次仍 == "#10203080"（幂等）
+    PASS  F1 属性 setter 保留 8 位      CardBackgroundColor = "#10203080" 后读回仍是 8 位
+    PASS  F1 3 位色展开为 6 位          Normalize("#FFF") == "#FFFFFF"（确认没被带坏）
+    PASS  F1 3 位色小写展开             Normalize("abc") == "#AABBCC"
+    PASS  F1 8 位底色 RGB+alpha 生效    Resolve(#10203080) → Bg=(16,32,48)、BgAlpha=128
+    PASS  F1 6 位底色仍按不透明度滑块   #102030 + pct=90 → BgAlpha=229（无显式 alpha 时行为不变）
+
+  F2 科目文件夹双向匹配（Core/SyncSettings.cs:348）
+    分别用 4 种分隔符存：劳动/英语、劳动、数学、劳动|科学、劳动+信息
+    PASS  F2 四种分隔符单科名都命中     分别查 劳动 / 英语 / 数学 / 科学 / 信息，全部命中对应文件夹
+    PASS  F2 复合名整体仍命中           FindSubjectFolder("劳动/英语") 仍取第一条（整体与拆段均命中）
+    PASS  F2 歧义按配置顺序取第一个      再补一条「劳动」后查「劳动」，取配置顺序第一条，不出现"两个都命中"的分叉
+    PASS  F2 歧义写 ambiguous 日志      多候选时恰好 1 条含 "ambiguous subject folder" 的日志
+
+  F3 课件改名续接（Core/SessionEngine.cs:668，Core/Ledger.cs Adopt）
+    PASS  F3 改名后沿用旧进度（第 5 页）  A.pptx 讲到 5 页 → End → 改名 B.pptx → Begin(3)：Last(B).EndSlide==5
+    PASS  F3 改名后旧键已迁移、不出现两条各自为战  旧键 0 条、新键 1 条
+    PASS  F3 改名后一页没翻不再新增       续接后 Begin(3)/End(3) 台账仍只有 1 条
+
+  F4 只打开不翻页（Core/SessionEngine.cs:788）
+    PASS  F4 只打开不翻页不顶掉旧进度     已有第 5 页记录 → Begin(3)/End(3)：仍 1 条且 EndSlide==5
+    PASS  一页没翻不写台账（噪音守卫，回归） 同一文件连续两次 Begin(1)/End(1) 仍 1 条基线
+    （新键首次打开保留 1 条基线，按用户要求，不再报"首次即写台账"）
+
+四、最终构建结果
+
+  & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build 'C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\ClassSlideSync.Plugin.csproj' -c Release -t:Rebuild
+  → 181 个警告 / 0 个错误（warning 均为原有的可空性与 Avalonia XAML 提示）
+
+五、被测 dll 指纹
+
+  路径: C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\bin\Release\net8.0-windows\ClassSlideSync.Plugin.dll
+  大小: 200704 bytes
+  SHA256: D042F020B3535404BE4B46780C183684B9F01DDAF951C0416B1E9CD0AA69300A
+  写入时间: 2026-10-24 16:42:22（本地时间）
+  说明: 本轮复测就是把这份 dll 拷进 harness\bin\Release\net8.0-windows\ 后运行的，报告数据与之一一对应。
+  （.NET 构建会把 PDB 路径/时间戳写进产物，同样源码两次 Rebuild 的 SHA256 也会不同；部署对不上时
+   以"大小 200704 + 时间 16:42:22"这一份为准，或按源码重新构建后比对本轮测试结论。）
+
+六、已知限制与留给 Lead 决策的点
+
+  1. B01 多实例并发写台账：不改代码（理由见上）。若以后真出现双开 ClassIsland 的用户，建议
+     在插件启动时对 data 目录加单实例互斥（命名 Mutex），成本比跨进程锁低。
+  2. F3 的改名续接按"内容指纹相同"认亲：同一份课件的副本（复制/改名）会被合并到最新那个键下，
+     这正是需求；但两份内容完全相同的不同课件也会被当成同一份。如果老师习惯保留同名副本，
+     历史可能被合并。若 Lead 认为风险高，可加"仅当旧记录最近 N 天内有更新才迁移"。
+  3. 新增了两个公开面：Ledger.Adopt(oldPath,newPath) 和 SyncSettings.LogSink（Action<string>）。
+     前者目前只有 BeginSession 调用，后者只有 SlideSyncService.Start() 赋值，不影响原有 API。
+  4. harness 侧事故说明：本轮给 harness 追加用例后，用 PowerShell 回写 Program.cs 时发生编码
+     破坏（UTF-8 被按 GBK 往返，中文丢失）。已用上一版 StabilityHarness.dll 反编译恢复
+     Program.cs（补回 Finding.cs），恢复后重新构建、重新跑完 157 个用例，结论与破坏前一致
+     （157/1，唯一失败仍是 B01）。恢复后的 harness 源码可编译、可继续扩展，但个别注释措辞
+     与原始手写版可能略有差异；插件工程未受影响。
+
+七、未测到（与上一轮一致，原因不变）
+
+  - SyncSettings 磁盘读写层（settings.json 缺失/损坏时的默认值）：读写发生在 Services/Plugin 启动路径。
+  - SessionEngine.Start()/Stop() 轮询线程、COM 熔断、COM↔希沃切换：会真的启动 PowerPoint/WPS。
+  - PptBridge 全组：需要真实 PowerPoint/WPS COM。
+  - SeewoBridge 正常 MCP 路径：需要真实 MCP 工具名与 schema；只验证了端点 500/非 JSON 时降级。
+  - Ui/NativeOverlayCard、Views/*.axaml 浮窗渲染：需要 Avalonia 窗口与 ClassIsland 宿主。
+  - ClassIslandTheme.Load：需读取真实 ClassIsland 主题文件。
+  - 真实希沃白板 / 真实课件 / 用户真实台账：铁律禁止。

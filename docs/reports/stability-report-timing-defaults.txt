@@ -1,0 +1,358 @@
+课件续页（ClassSlideSync.Plugin）1.2.2.0
+stability-report-timing-defaults.txt
+2026-10-31  任务A（打开学科文件夹的时机可配置）+ 任务B（默认值在界面上可见）
+================================================================================
+
+0. 一句话结论
+--------------------------------------------------------------------------------
+  任务A：新增「打开时机」三档（上课开始时 / 上课前 N 分钟 / 下课后 N 分钟，N=2、0–30，
+         只在对应档位显示），判定放在 50ms~2s 心跳里，同一节课只触发一次；两个界面都加了，
+         且绑的是同一个 SyncSettings 实例。
+  任务B：8 条滑条各叠了一条 2px 的主题强调色默认值刻度（按滑条实际宽度 + min/max 换算，
+         不写死像素）；两个下拉框（打开时机、贴哪一边）的默认项显示成「选项文字（推荐）」，
+         「（推荐）」是 DataTemplate 里的一个 TextBlock（主题强调色），数据本身没改。
+  构建：Rebuild 0 error（下面第 6 节有命令与结果）。
+  自测：离屏 213 条断言，213 通过 / 0 失败（全程无窗口，见第 6 节）。
+
+
+1. 改了哪些文件、哪些行
+--------------------------------------------------------------------------------
+只动了被允许的 6 个文件（版本号、csproj、manifest.yml、git 一律没碰；
+Ui\ControlPanel.axaml.cs 一行没改 —— 里面「立即跳转 / 打开文件夹」那段是别人刚改的）。
+
+1.1 Core\SyncSettings.cs
+    5      新增 using System.Globalization;（DefaultMarkGeometry 解析参数用不变文化）
+    79-84  新增三个字段（唯一默认值来源）：
+             82  SubjectFolderMoment subjectFolderMoment = SubjectFolderMoment.LessonStart;
+             83  int beforeClassOpenMinutes = 2;
+             84  int afterClassOpenMinutes = 2;
+    420-430 AutoOpenSubjectFolder：setter 补 Raise(ShowBeforeClassOpenMinutes / ShowAfterClassOpenMinutes)
+            （总开关一变，两行「N 分钟」的可见性跟着变）
+    436-449 SubjectFolderMoment 属性：Enum.IsDefined 兜底（配置文件里有旧版本没见过的值时落回默认档），
+            并通知 SubjectFolderMomentIndex + 两个 Show*
+    455-460 [JsonIgnore] SubjectFolderMomentIndex（ComboBox 的 SelectedIndex，int ↔ 枚举）
+    462-474 BeforeClassOpenMinutes / AfterClassOpenMinutes（Clamp(value, 0, 30)）
+    476-488 [JsonIgnore] ShowBeforeClassOpenMinutes / ShowAfterClassOpenMinutes
+            （= autoOpenSubjectFolder && 对应档位）
+    490-523 [JsonIgnore] SubjectFolderMomentOptions / CardSideOptions（静态缓存，见下）
+    998-1006 public enum SubjectFolderMoment { LessonStart = 0, BeforeClass = 1, AfterClass = 2 }
+    1012-1027 public sealed class ChoiceOption { Label, IsDefault }（下拉项只负责显示）
+    1030-1047 public sealed class LessonPeriod { Period, Start, End }（喂给判定函数的"一节课"）
+    1050-1069 public sealed class FolderMomentHit { Hit, Moment, Period, Key, Reason }
+    1076-1169 public static class SubjectFolderTiming
+             1079 MaxOpenMinutes = 30
+             1093 Evaluate(moment, now, periods, beforeMinutes, afterMinutes) → FolderMomentHit
+             1165 ShouldFire(lastKey, hit)（同一节课只开一次的判据）
+    1177-1235 public static class DefaultMarkGeometry（滑条默认刻度的位置换算，纯数学、不碰 Avalonia）
+             1189 Offset(width, min, max, value)
+             1212 Percent(min, max, value)
+             1222 TryParseParameter("最小,最大,默认值", ...)
+
+    为什么选项表缓存成 static 数组：ComboBox 每次读 ItemsSource 都会重新拿一次，
+    如果每次 new 一个新数组，「已经选中的那一项」会被顶掉（Avalonia 按引用认项）。
+
+1.2 Services\SlideSyncService.cs
+    63-66  新增 string subjectFolderMomentKey = "";（课前/课后两档的去重键；
+            原来的 lastLessonKey 只管默认档，两者互不干扰）
+    219-234 心跳里的分派：
+              if (settings.SubjectFolderMoment == SubjectFolderMoment.LessonStart) { 原来的逻辑，原样 }
+              else { TickSubjectFolderMoment(); }
+    536    TryOpenSubjectFolder() → TryOpenSubjectFolder(string subjectOverride = null)
+            （科目名可由调用方指定；传 null 时仍走 CurrentSubjectName()，默认档行为不变）
+    587-615 void TickSubjectFolderMoment()
+    621-650 List<LessonPeriod> ReadLessonPeriods()
+    652-667 string NextSubjectName()
+
+1.3 Views\SettingsPages\SlideSyncSettingsPage.axaml（官方设置页）
+    20     <local:DefaultMarkConverter x:Key="DefaultMark" />
+    211-250 新增三行设置（插在「上课时自动打开本科目的课件文件夹」之后）：
+              215 「什么时候打开」          → ComboBox SubjectFolderMomentCombo（ItemTemplate + 推荐标记）
+              242 「上课前多少分钟」        → NumericUpDown 0–30，IsVisible 绑 ShowBeforeClassOpenMinutes
+              257 「下课后多少分钟」        → NumericUpDown 0–30，IsVisible 绑 ShowAfterClassOpenMinutes
+    66 / 361 / 379 / 399 / 416 / 457 / 474 / 503
+           8 条滑条各包进一个 Grid，并在滑条后面叠一条默认值刻度 Border
+           （ElementName 分别是 AutoHideSecondsSlider、CardOpacitySlider、CornerRadiusSlider、
+             CardScaleSlider、CardFontSizeSlider、CardVerticalSlider、CollapsedTabWidthSlider、
+             CollapsedTabOpacitySlider）
+    424-440 「贴哪一边」：SelectedIndex="{Binding Appearance.SideIndex}" +
+            ItemsSource="{Binding Settings.CardSideOptions}" + 同样的推荐 ItemTemplate
+            （原来直接写在 ComboBox 里的两个 ciControls:IconText 去掉了）
+
+1.4 Views\SettingsPages\SlideSyncSettingsPage.xaml.cs
+    346-... public sealed class DefaultMarkConverter : IValueConverter
+            （把 "滑条实际宽度 + min,max,默认值" 换成 Thickness(left,0,0,0)；
+              重活全在 Core 的 DefaultMarkGeometry 里，这里只是薄封装，方便离屏测）
+
+1.5 Ui\ControlPanel.axaml（控制面板「设置」页签）
+    38      <pages:DefaultMarkConverter x:Key="DefaultMark" />
+    583-630 同样的三行设置（586 什么时候打开 / 612 上课前多少分钟 / 622 下课后多少分钟）
+    451 / 719 / 736 / 755 / 771 / 812 / 828 / 857
+            8 条滑条的默认值刻度（面板里不透明度那条叫 OpacitySlider，其余同名）
+    779-795 「贴哪一边」SideCombo 同样改成数据驱动 + 推荐 ItemTemplate
+            （原来两个 ComboBoxItem 去掉了）
+
+    说明：Ui\ControlPanel.axaml.cs 没有改动；XAML 里新增的控件只靠绑定工作
+          （面板的 DataContext 一直是它自己，Settings 就是构造函数传进来的那个实例）。
+
+
+2. 任务A：时机判定
+--------------------------------------------------------------------------------
+2.1 三档与默认值
+      LessonStart = 0  「上课开始时」        默认，等于 1.2.2 之前的行为（正课一开始就打开）
+      BeforeClass = 1  「上课前 N 分钟」     N = BeforeClassOpenMinutes，默认 2，范围 0–30
+      AfterClass  = 2  「下课后 N 分钟」     N = AfterClassOpenMinutes，默认 2，范围 0–30
+    N 的两个数字框用 IsVisible 绑 ShowBeforeClassOpenMinutes / ShowAfterClassOpenMinutes，
+    即「总开关打开 且 处于对应档位」才可见、可编辑；两个界面同一套规则。
+
+2.2 判定伪代码（Core\SyncSettings.cs 的 SubjectFolderTiming.Evaluate）
+    输入：moment（档位）、now（当前时刻，由调用方传入，函数自己不读系统时间）、
+          periods（今天的课表，只含 TimeType==0 的上课项）、n（分钟数，已夹到 0–30）
+    对每一节课 p（第几节 + 起止时间）：
+        LessonStart : p.Start <= now <= p.End
+        BeforeClass : n > 0 → p.Start - n分钟 <= now <  p.Start        （左闭右开）
+                      n = 0 → p.Start         <= now <  p.Start + 1分钟（退化成"打铃那一刻"）
+        AfterClass  : n > 0 → p.End < now <= p.End + n分钟             （左开右闭）
+                      n = 0 → p.End < now <= p.End + 1分钟
+        命中就返回 { Hit=true, Period, Key="日期|start/before/after|第几节|HH:MM-HH:MM",
+                     Reason="上课前 2 分钟 · 第3节 09:40 开始" 这样的中文说明 }
+    都不命中 → { Hit=false, Key="", Reason="" }
+
+    为什么窗口一边开一边闭：相邻两节之间只有几分钟时，"上一节的下课窗口"和"下一节的课前窗口"
+    可能在时间上重叠；左闭右开/左开右闭保证同一时刻只落在一个窗口里，去重键也不会互相顶掉。
+
+2.3 心跳里怎么用（Services\SlideSyncService.cs）
+    每拍（Timer 间隔 2000ms，见第 5 节）：
+        if (档位 == 上课开始时)  { 原来的 if (inClass && lessonKey 变了) { lastLessonKey = …; TryOpenSubjectFolder(); } }
+        else                     { TickSubjectFolderMoment(); }
+
+        TickSubjectFolderMoment():
+            if (!AutoOpenSubjectFolder) return;             // 总开关
+            periods = ReadLessonPeriods();                  // 课表：TimeType == 0
+            if (periods.Count == 0) return;                 // 今天没排课 / 读不到
+            hit = SubjectFolderTiming.Evaluate(档位, DateTime.Now, periods, 课前N, 课后N);
+            if (!ShouldFire(subjectFolderMomentKey, hit)) return;   // 键相同 = 这节已经开过
+            subjectFolderMomentKey = hit.Key;               // 先记账再开门（开门失败也不反复重试）
+            科目 = (档位 == 下课后) ? lastClassSubject     // 课间 CurrentSubject 是"课间"，只能用上课时记下的
+                                     : NextSubjectName();    // 课前用课表的下一节
+            log("subject folder timing: " + hit.Reason + (" · " + 科目 或 " · 科目名未知"));
+            TryOpenSubjectFolder(科目);                     // 真正打开（宿主 IUriNavigationService 优先）
+
+    同一节课只触发一次：键 = 日期 + 档位 + 第几节 + 起止时间。
+      * 窗口里心跳会打十几拍，只有第一拍 ShouldFire 为 true；
+      * 键里带日期，第二天同一节课照样能开；
+      * 默认档保持原来的 lastLessonKey 一套，不去动它。
+
+    实际会写进 app.log 的两种时机日志行样例（前缀是 ledger.Log 加的时间戳）：
+      subject folder timing: 上课前 2 分钟 · 第3节 09:40 开始 · 数学
+      subject folder timing: 下课后 2 分钟 · 第3节 09:40 下课 · 数学
+      （上课开始时那一档沿用老日志：subject folder: opened D:\课件\数学 for 数学）
+
+
+3. 任务B：默认值在界面上可见
+--------------------------------------------------------------------------------
+3.1 滑条：默认值刻度
+    结构（两个界面一样，16 处）：
+        <Grid VerticalAlignment="Center">
+            <Slider x:Name="AutoHideSecondsSlider" Width="170" Minimum="5" Maximum="120" ... />
+            <Border Width="2" Height="10" HorizontalAlignment="Left" VerticalAlignment="Center"
+                    IsHitTestVisible="False"
+                    Background="{DynamicResource AccentTextFillColorPrimaryBrush}"
+                    Margin="{Binding Bounds.Width, ElementName=AutoHideSecondsSlider,
+                                     Converter={StaticResource DefaultMark},
+                                     ConverterParameter='5,120,15'}" />
+        </Grid>
+    位置换算（Core\SyncSettings.cs:1189 DefaultMarkGeometry.Offset）：
+        百分比     = (默认值 - 最小) / (最大 - 最小)        // 夹到 0–1
+        可走长度   = 滑条宽度 - 2 × 10px                    // Fluent 拇指约 20px 宽，两端各让 10
+        左边距     = 10 + 百分比 × 可走长度 - 2/2            // 再夹到 [0, 宽度-2]
+    为什么这样：宽度来自绑定的 Bounds.Width（随窗口缩放实时变），最小/最大/默认值来自
+    ConverterParameter，所以换宽度、改范围都不会偏。宽度还是 0（还没布局）时返回 0，
+    不会出现负边距或越界。刻度 2px、IsHitTestVisible=False，点它等于点滑条，不挡拖拽。
+    例子（宽度 180、范围 20–100、默认 90）：10 + 0.875 × 160 - 1 = 149。
+
+3.2 选择类：「选项文字（推荐）」
+    数据侧只加了 IsDefault（Core\SyncSettings.cs:1012 ChoiceOption），选项文字本身没改。
+    界面侧（两个界面同一套 ItemTemplate）：
+        <ComboBox ItemsSource="{Binding Settings.SubjectFolderMomentOptions}"
+                  SelectedIndex="{Binding Settings.SubjectFolderMomentIndex, Mode=TwoWay}">
+          <ComboBox.ItemTemplate>
+            <DataTemplate x:DataType="core:ChoiceOption">
+              <StackPanel Orientation="Horizontal">
+                <TextBlock Text="{Binding Label}" />
+                <TextBlock Text="（推荐）" VerticalAlignment="Center"
+                           IsVisible="{Binding IsDefault}"
+                           Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}" />
+              </StackPanel>
+            </DataTemplate>
+          </ComboBox.ItemTemplate>
+        </ComboBox>
+    「（推荐）」只在默认项上出现，颜色取 Fluent 的主题强调色笔刷（浅色主题下就是蓝），
+    跟随 ClassIsland 主题变色；文字仍是原来的「上课开始时 / 上课前 N 分钟 / 下课后 N 分钟」，
+    「贴哪一边」同理（右边 = 推荐）。
+    设置页和面板这两条现在都是纯 TextBlock（原来的 ciControls:IconText / ComboBoxItem 已去掉），显示完全由数据驱动。
+
+3.3 两条实现约定
+    * 默认值只在 Core\SyncSettings.cs 的字段初始值里写一份，界面不重复写数字
+      （下拉项的 IsDefault、滑条刻度的 ConverterParameter 都只是"抄"这个值）。
+    * 两个界面绑同一个 SyncSettings 实例：
+        官方设置页  Views\SettingsPages\SlideSyncSettingsPage.xaml.cs:30
+                    public SyncSettings Settings { get { return Plugin.Settings; } }
+        控制面板    Ui\ControlPanel.axaml.cs:44 / 67 / 86 / 99
+                    readonly SyncSettings settings; → Settings => settings; → DataContext = this;
+        Plugin.cs:28 只有一份 new SyncSettings()，:38 从 SyncSettings.json 读，:48 交给服务，
+                    :57 services.AddSingleton(Settings)，:59 注册设置页。
+      所以两边改一处、另一处立刻跟着变。
+
+
+3.4 两处顺带加固（这次改动引入的交互风险，已在同一批里修掉）
+    * Ui\ControlPanel.axaml:781-785 「贴哪一边」的 ComboBox 现在先写 ItemsSource、后写
+      SelectedIndex。反过来写的话，ItemsSource 就位的那一刻 ComboBox 会先把选中项清成 -1，
+      TwoWay 绑定就把 -1 写回 Appearance.SideIndex，把用户选的「左边」悄悄改回右边
+      （Appearance.SideIndex 的 setter 是 `value == 1`，-1 等于 false）。设置页那条本来就是
+      ItemsSource 在前，所以没动。
+    * Core\SyncSettings.cs:456 SubjectFolderMomentIndex 的 setter 加了 `if (value < 0) return;`，
+      同样的"临时没选中"不该把用户选的档位冲回「上课开始时」（越界正数仍然落回默认，见 A17）。
+      对应断言 A24。
+
+4. 每个滑条的默认值来自哪一行
+--------------------------------------------------------------------------------
+  序号  界面上的滑条            范围      默认值   来源（默认值真正生效的位置）
+  ----  ----------------------  --------  -------  ----------------------------------------------
+   1    无人操作时自动贴边     5–120     15       Core\SyncSettings.cs:20  int autoHideSeconds = 15;
+        （AutoHideSecondsSlider）
+   2    卡片不透明度           20–100    90       Core\SyncSettings.cs:44  int cardOpacityPercent = 90;
+        （设置页 CardOpacitySlider / 面板 OpacitySlider，同一条设置）
+   3    圆角                   0–24      10       **不在 SyncSettings 里**：Core\SyncSettings.cs:45
+                                                  int cardCornerRadius = -1;（-1 = 跟随主题）
+                                                  生效值在 Core\Appearance.cs:448-450
+                                                  a.Radius = s.CardCornerRadius >= 0 ? s.CardCornerRadius
+                                                          : (follow ? Math.Max(theme.Radius, 10) : 10);
+                                                  即"跟随主题时下限 10" —— 刻度画在 10 上
+   4    卡片大小               0.6–2     1.0      Core\SyncSettings.cs:46  double cardScale = 1.0;
+        （CardScaleSlider）
+   5    字号微调               -4–12     0        Core\SyncSettings.cs:47  int cardFontSizeDelta = 0;
+        （CardFontSizeSlider）
+   6    垂直位置               0–100     50       Core\SyncSettings.cs:50  int cardVerticalPercent = 50;
+        （CardVerticalSlider）
+   7    收起标签宽度           16–96     32       Core\SyncSettings.cs:51  int collapsedTabWidth = 32;
+        （CollapsedTabWidthSlider）
+   8    收起药丸透明度         30–100    80       Core\SyncSettings.cs:56  int collapsedTabOpacityPercent = 80;
+        （CollapsedTabOpacitySlider）
+
+  另外「（推荐）」标记的依据（同一份字段初始值）：
+        打开时机默认档   Core\SyncSettings.cs:82  SubjectFolderMoment subjectFolderMoment = LessonStart;
+        课前 / 课后分钟  Core\SyncSettings.cs:83-84  beforeClassOpenMinutes = 2; afterClassOpenMinutes = 2;
+        贴哪一边默认值   Core\SyncSettings.cs:49  bool cardOnLeft = false;（= 右边）
+        对应 ChoiceOption 的 IsDefault 写在 :505-510（时机）和 :519-523（贴边）。
+
+
+5. 未实现项与需要说明的地方
+--------------------------------------------------------------------------------
+5.1 「收到通知时」这一档：**没做，ClassIsland 2.1 未暴露该事件**
+    在 ClassIsland.Core / ClassIsland.Shared 2.1.0.1（本插件引的 PluginSdk 2.1.0.1）里查过：
+      * ILessonsService 的公开事件只有 PreMainTimerTicked、PostMainTimerTicked、OnClass、
+        OnBreakingTime、OnAfterSchool、CurrentTimeStateChanged —— 没有任何"收到通知/收到广播"事件。
+      * INotificationHostService 里和"发通知"有关的方法（ShowNotification / ShowNotificationAsync 等）
+        全是 internal；公开的只有 RegisterNotificationProvider / GetNotificationProviderSettings /
+        RegisterNotificationConsumer / PullNotificationRequests —— 是"提醒 UI 去拉"的模型，
+        不是"收到通知时给我回调"。
+      * Core 2.1.0.1 里全部公开事件（NotificationRequest.Canceled/Completed、
+        IPluginMarketService.RestartRequested、IRulesetService.ForegroundWindowChanged/StatusUpdated、
+        ISplashService.ProgressChanged/SplashEnded、IThemeService.ThemeUpdated、
+        ITutorialService.TutorialStateChanged、IWindowRuleService.ForegroundWindowChanged、
+        IXamlThemeService.RestartRequested）里也没有通知/广播类的。
+    结论：按用户要求"找不到就不要硬造"，保持三档。将来 SDK 暴露了通知事件，只需在
+    SubjectFolderMoment 枚举加一档 + SubjectFolderTiming.Evaluate 加一个分支 + 一处订阅。
+
+5.2 心跳不是 50ms，是 2000ms
+    任务书写的是"已有的 50ms 定时心跳（ScheduleTick）"，但仓库里 ScheduleTick 的实际间隔是
+    2000ms（Services\SlideSyncService.cs:160 `new System.Threading.Timer(ScheduleTick, null, 300, 2000)`；
+    全仓没有 50ms 的定时器）。判定就放在这个已有心跳里，所以：
+      * 触发时刻与课表时刻的误差 ≤ 2 秒（对"提前 2 分钟"这种粒度足够）；
+      * 没有为了这次改动去改心跳频率，避免影响别的功能（也没必要：判定是纯计算）。
+    如果以后要求秒级准点，把这一处间隔调小即可，判定函数不用改。
+
+5.3 默认档不受 AutoStartBeforeClass 影响
+    「上课开始时」这一档仍走原来的 inClass/lessonKey 判定；课前/课后两档用课表时间与当前时间判定，
+    不依赖 AutoStartBeforeClass（那是"卡片要不要提前待命"的开关）。三者互不干扰。
+    总开关 AutoOpenSubjectFolder=false 时，三档都不会打开任何文件夹（判定入口先 return）。
+
+5.4 其它
+    * 科目名：课前用课表里的下一节（NextClassSubject），下课后用上课时记下的 lastClassSubject
+      —— 因为课间里 ILessonsService.CurrentSubject 是"课间"，直接取会拿到"课间"三个字。
+    * 找不到对应科目的文件夹时，沿用原来的行为（记 subject folder: no folder for …，不弹任何窗）。
+    * 打开失败只记一行日志，不重试（去重键已经记下，避免每 2 秒刷屏）。
+
+
+6. 离屏自测（无窗口）
+--------------------------------------------------------------------------------
+6.1 怎么保证"完全无窗口"
+    测试工程在 _lab\TimingDefaultsTest\（插件目录之外，不参与打包）：
+      * 只做三件事：链接插件的纯计算源码（Core\SyncSettings.cs、Core\LessonWindow.cs）跑断言；
+        把两个 .axaml 当 XML 解析，检查控件与绑定；读 .cs 文本核对"同一个实例"的接线。
+      * 没有 Window、没有 Show()、没有 SetForegroundWindow、没有 Start-Process、
+        没有截图、没有启动 ClassIsland/WPS/希沃，也没有加载任何 ClassIsland 程序集、
+        没有加任何 NuGet 包。
+      * 因为不建窗口，所以没有用 Measure/Arrange + RenderTargetBitmap；"刻度位置对不对"
+        改成对换算函数 Offset 的直接断言 + 用 XAML 里真实的 Minimum/Maximum/ConverterParameter
+        喂它（换算函数是唯一决定位置的代码，converter 只是薄封装）。
+
+6.2 怎么跑
+    cd C:\Users\xzq\Documents\deepseek-harness\default-workspace\_lab\TimingDefaultsTest
+    & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' run --project TimingDefaultsTest.csproj -c Release -v q --nologo
+    退出码 0 = 全通过；1 = 有失败（失败行以 FAIL 开头并带实际值）。
+    最近一次运行：断言合计 213 条，通过 213，失败 0，退出码 0
+    （完整输出另存为 _lab\timing-defaults-test-output.txt）。
+
+6.3 断言覆盖（对应任务书要求的每一条）
+    A. 默认值与下拉选项（24 条，A01–A24）
+       默认档 = 上课开始时、N 默认 2、上下界夹到 0/30、SelectedIndex 与枚举双向、
+       两行分钟数只在对应档位且受总开关控制、非法档位落回默认、
+       时机下拉 3 项且只有第 0 项带 IsDefault、选项表缓存、贴边两项且右边默认。
+        ComboBox 临时清空选中（SelectedIndex = -1）不会冲掉用户选的档位（A24）。
+
+    B. 时机判定（30 条，B01–B30）
+       * 三档各触发一次且只一次：命中后 ShouldFire 第一次 true、同 key 第二次 false（B10/B11），
+         第二天同节课再 true（B12）；
+       * 时间未到不触发：打铃前 121 秒不命中（B07）、下课那一刻不算课后（B16）、
+         超过窗口不命中（B18）、窗口右边界命中（B09/B17）；
+       * 边界语义：上课开始时左闭右闭（B04）、课前右开（B08）、课后左开（B16）；
+       * 相邻两节课的课前/课后窗口键不同（B23–B25）；课表为空不命中（B26/B27）；
+       * N 越界按 0/30 处理（B28/B29）；第 2 节只认第 2 节（B30）。
+
+    C. 滑条默认刻度的位置换算（16 条，C01–C16）
+       Offset(180,20,100,90) = 149、Offset(170,5,120,15)、Offset(180,0.6,2,1)（小数范围）、
+       默认值 = 最小值 → 9、= 最大值 → 169、宽度 0 / NaN → 0、范围非法 → 0、
+       当前值 NaN 按最小值、超出范围被夹住、超窄滑条不越界、Percent 87.5%、
+       ConverterParameter 解析（含小数、空格、垃圾值）。
+
+    D. 两个界面（140 条，D01–D32 + 每条滑条 6 项）
+       两边各有 8 条滑条的默认刻度：能对上同名 Slider、参数与 Minimum/Maximum 一致、
+       默认值与第 4 节的来源一致、是 2px 强调色且不吃鼠标、按真实宽度算出的位置在轨道内；
+       两边各有 2 个「（推荐）」：IsVisible 绑 IsDefault、主题强调色、位于 ChoiceOption 的
+       DataTemplate 内、同一模板里有 {Binding Label}；
+       两边都绑了 Settings.SubjectFolderMomentOptions / SubjectFolderMomentIndex /
+       ShowBeforeClassOpenMinutes / ShowAfterClassOpenMinutes / BeforeClassOpenMinutes /
+       AfterClassOpenMinutes / AutoOpenSubjectFolder / CardSideOptions，都声明了 DefaultMark 资源；
+       另外核对了两个默认值的"来源行"（Appearance.cs 的 Math.Max(theme.Radius, 10)、
+       SyncSettings.cs 的字段初始值）。
+
+    E. 两界面读同一实例（6 条，E01–E06）
+       面板的 Settings 就是构造参数传进来的那个实例、面板构造函数收 SyncSettings、
+       设置页 Settings => Plugin.Settings、Plugin 只 new 一份并交给服务与 DI、
+       两边都没有自己 new 一份。
+
+6.4 插件构建
+    cd C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin
+    & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build ClassSlideSync.Plugin.csproj -c Release -t:Rebuild --nologo -v q
+    结果：0 error（-t:Rebuild 必须带，增量构建不会重编 XAML，会报 No precompiled XAML found）。
+
+
+7. 明确没做的事
+--------------------------------------------------------------------------------
+    * 没部署、没启动 ClassIsland、没启动 WPS/希沃、没跑任何会抢焦点的程序；
+    * 没改版本号（仍是 1.2.2.0）、没改 manifest.yml、没改任何 .csproj、没加 NuGet；
+    * 没动 git；
+    * 没改 Ui\NativeOverlayCard.cs、Core\SessionEngine.cs、Automation\*、
+      Ui\ControlPanel.axaml.cs（尤其「立即跳转 / 打开文件夹」那两段按钮代码）。
+================================================================================

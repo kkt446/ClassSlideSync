@@ -1,0 +1,289 @@
+========================================================================
+控制面板（独立 Avalonia 窗口）审查与修复报告
+ClassSlideSync.Plugin · Ui\ControlPanel.axaml / Ui\ControlPanel.axaml.cs
+日期：2026-10-24
+========================================================================
+
+范围：只审只改「卡片右上角齿轮打开的那个独立窗口」。
+      可改文件：Ui\ControlPanel.axaml、Ui\ControlPanel.axaml.cs（本报告全部改动都在这两个文件里）。
+      数据层 Core\PanelData.cs、Ui\PanelRows.cs 由别的 agent 负责，本报告只列“需要别人改”。
+
+环境：Avalonia 11.3.17（StorageProvider / TopLevel / Screens / DispatcherTimer 按官方 API），
+      .NET 8 SDK 8.x（C:\Users\xzq\.dotnet-sdk8\dotnet.exe），ClassIsland 插件 SDK 2.1.0.1。
+      构建：dotnet build ClassSlideSync.Plugin.csproj -c Release -t:Rebuild
+            → 0 error；200 warning（= 基线，零新增）。中途别的 agent 改 PptBridge.cs /
+              NativeOverlayCard.cs / SlideSyncService.cs 时一度涨到 204~206，他们收手后回落。
+              本文件只有一条既有的 AVLN3001（没有 public 无参构造，设计使然），见“发现但没改的”。
+
+验收方式：离屏 harness（真实 Avalonia 窗口 + RenderTargetBitmap 出图，不启动 ClassIsland）
+      %TEMP%\audit-panel\PanelTests.csproj + Program.cs
+      结果：51 条断言全部通过（含 3 张截图），见第 4 节。
+
+========================================================================
+1. 修掉的 bug（现象 → 根因 → 修法 → 证明）
+========================================================================
+
+B1  第一次装插件后，窗口位置永远记不住，每次打开都回到屏幕正中
+现象：拖好窗口、关掉、再点齿轮，窗口又出现在屏幕中央；只有“曾经保存过坐标”的机器才正常。
+根因：SaveGeometry 只有在 WindowStartupLocation == Manual 时才写 PanelLeft/PanelTop，
+      而首次运行 ApplySavedGeometry 因为没有坐标，从不把 WindowStartupLocation 改成 Manual
+      （它本来就是 CenterScreen），于是 Position 这个“可信坐标”永远不落盘。
+      Ui\ControlPanel.axaml.cs:876-892（修前是 if (WindowStartupLocation == Manual)）。
+修法：新增字段 bool geometryLive（:55），OnOpened 里窗口真正摆到屏幕上之后置 true（:132），
+      SaveGeometry 改成 if (geometryLive) 就写坐标——“窗口显示过”比“启动位置是手动”更接近事实。
+证明：harness「首次运行也会记录坐标」→ 首次关窗写入 1000×680 @ 519,226；
+      另「合法坐标原样恢复」→ 160,120 原样恢复；「第二次打开按记忆坐标恢复」→ 首次写入 519,226 后按该坐标打开。
+
+B2  副屏拔掉后，窗口开在屏幕外，老师再也看不见（只能改配置文件）
+现象：上次在副屏上关的窗口，第二天教室没有副屏，点齿轮什么也没出现（窗口在 -3000,-2000）。
+根因：ApplySavedGeometry（:764-784）只做了 PanelLeft/Top > -20000 的粗筛，没有任何
+      “这块屏还在不在”的校验，也没有把尺寸夹进当前工作区。
+修法：新增 ClampToVisibleScreen（:791-860）：
+      · 先 ScreenFromPoint(Position) → ScreenFromWindow(this) → 与窗口矩形相交的屏 → Primary 逐级兜底；
+      · 尺寸按目标屏 Scaling 换算成像素后夹进 WorkingArea，且不低于 MinWidth/MinHeight，再换回 DIP；
+      · 位置把整窗夹进工作区（不是只留一条边），副屏没了就直接摆回主屏可见处；
+      · 构造函数末尾（:119）和 OnOpened（:131）各调一次（构造时屏幕信息可能还没准备好）。
+证明：harness「存下来的坐标落在屏幕外时被拉回工作区」→ ClampToVisibleScreen 之后 0,0 900×600；
+      「超屏尺寸被夹进工作区」→ 5000×4000（DIP）被夹进 2560×1528 像素的工作区，且仍 ≥ MinWidth/MinHeight；
+      「超屏时位置仍在屏幕内」通过。
+
+B3  1.25/1.5 倍缩放的笔记本上，窗口会被莫名其妙缩成最小尺寸（720×480）
+现象：在 150% 缩放的屏幕上，900×600 的窗口保存后重开变成 720×480（正好 MinWidth/MinHeight）。
+根因：ClampToVisibleScreen 第一版里 w/h 用 1.0 倍算成 900，而 minW/minH 用 1.5 倍算成 1080，
+      Math.Max(900,1080)=1080 再除 1.5 就变成 720 DIP。像素和 DIP 混着算。
+修法：先只用 Primary.Scaling 估矩形做“和哪块屏相交”的探测，等目标屏定下来（target.Scaling）
+      再统一换算 w/h/minW/minH（:787-849），并以 wantW / scale 换回 DIP 赋给 Width/Height。
+证明：harness 屏幕 2560×1600 / 工作区 2560×1528 / Scaling=1.5：
+      「合法尺寸原样恢复」900×600 仍为 900×600；「夹过之后仍不小于 MinWidth/MinHeight」通过。
+
+B4  从最大化按 F11 进全屏，再按 Esc 只回到普通窗口，最大化状态丢了
+现象：老师习惯最大化使用，按 F11 看全屏，Esc 退出后窗口变成 1000×680 悬浮窗。
+根因：ToggleFullScreen 退出时一律 WindowState = Normal（修前 :744 附近）。
+修法：新增字段 beforeFullScreen，进全屏前记住当时的 WindowState（Maximized/Normal），
+      退出时恢复它（:744-761）；Esc 走同一条路径（:706-736），先退全屏，普通窗口再按才 Close()。
+证明：harness「从最大化按 F11 进全屏」→「全屏按 Esc 先退全屏」→「Esc 退出全屏后回到最大化」
+      →「Esc 退全屏不关窗口」；另有「再按 F11 回普通窗口」「普通窗口按 Esc 关窗」。
+      全屏覆盖整屏（含任务栏）：窗口 Bounds 与 screen.Bounds/Scaling 相差 ≤2 DIP 断言通过。
+
+B5  台账每秒都在变，但右侧详情/历史停在打开那一刻
+现象：面板开着，课件又讲了几页，右栏“上次停在第 N 页”和历史列表不动；只有点刷新才更新。
+根因：面板没有任何台账变化通知，只有 Opened/搜索/刷新按钮三条路径会读台账。
+修法：StartLiveRefresh（:144-158）起一个 2 秒 DispatcherTimer，OnLiveTick 整段 try/catch；
+      RefreshLive（:169-195）只在「窗口可见 + 课件库页签 + 记录数或份数真的变了」时动手：
+      · 份数变了 → Reload()（Rebuild 会按 key 保住选中项）；
+      · 只是同一份又记了一节 → RefreshSelectedDetail()（:197-226）只改右侧文案，
+        历史列表内容完全相同就不重新赋值 ItemsSource，避免把老师的滚动位置顶回顶部；
+      再 UpdateStatus/UpdateAbout。
+证明：harness「增量刷新后选中项还是同一行」「详情页跟着变（第 25 页）」「历史多一条」
+      「新课件出现后整栏重建」「整栏重建后选中项还是原课件」。
+
+B6  停在设置页时来了新记录，切回课件库要等最多 2 秒才刷新
+根因：OnTabSelectionChanged（:250）只处理“进设置页”，切回 index 0 什么都不做。
+修法：切回课件库时先调一次 RefreshLive（:252-258，异常兜住）。
+证明：harness「从设置页切回课件库立刻补刷新（不用等两秒定时器）」→ 切回后详情页马上是第 20 页，
+      「切回来选中项还是同一份」通过。
+
+B7  窗口关掉后定时器还在跑，事件订阅也不摘
+现象：反复开关面板，每次关掉的窗口仍每 2 秒被 Tick 叫一次；订阅只增不减。
+根因：没有任何关闭清理（修前只有 Closing→SaveGeometry）。
+修法：OnClosedDetach（:228-245）：closed=true、liveTimer.Stop() + Tick -= + 置 null，
+      SearchBox.TextChanged / Tabs.SelectionChanged / Opened / Closing / Closed / KeyDown 全部退订。
+证明：harness「关窗后定时器已摘掉」「关窗后 closed 标记已置位」；
+      另 3 次开关后 WeakReference 三个窗口里 2 个已回收（第 3 个是 JIT 局部变量，不作结论）。
+
+B8  「立即跳转」对已删除的课件、希沃伪键、离线窗口都是静默失败
+现象：课件被移走/删除后点“立即跳转”，面板毫无反应；引擎只在卡片上挂一句“正在跳转…”然后什么也不做。
+      希沃台账键是「希沃:课件名」，没有磁盘文件也没有 shellId，同样点了没反应。
+根因：OnJumpClick（修前 :488-495）直接 handler(path, page)，没有文件校验、没有 try/catch、
+      没有失败反馈；handler == null 时直接 return，按钮看起来像坏了。
+修法：OnJumpClick（:664-704）重写为四路：
+      · 希沃伪键（SeewoBridge.KeyPrefix 前缀）→ 提示“这份是希沃白板课件，台账里只有课件名，没法自动跳页”；
+      · 文件不存在 → 提示“找不到课件文件了，可能已被移动或删除：xxx”；
+      · 没有跳页链路（离线预览）→ 提示“这个窗口没接上跳页链路……”；
+      · 正常 → try/catch 调 handler，成功提示“已请求跳到第 N 页”，异常提示“跳页失败：…”。
+证明：harness 9 条跳页断言（不调用/给提示/路径页码正确/成功提示）+「没有跳页链路时也给出提示」。
+
+B9  「打开文件夹」目录不存在时只会打开“我的电脑”，没有一句反馈
+根因：OnOpenFolderClick（:643）直接 openFolder(folder)，异常吞掉。
+修法：先判 Directory.Exists → 提示“文件夹不在了，可能已被移动或删除：…”；异常 → 提示“打开文件夹失败：…”（:643-661）。
+证明：走查 + 与 B8 同一套 ShowHint 机制（harness 覆盖了 ShowHint 的显示/隐藏状态机）。
+
+B10 导出/选文件夹的异步回调可能打到已经关掉的窗口
+现象（潜在）：点导出 → 系统保存对话框还开着 → 老师把面板关掉 → 回调里继续摸已关闭窗口的控件。
+根因：async void 里的 await 之后没有“窗口是否还活着/这一行是否还在”的检查；
+      OnPickSubjectFolder 还会把路径写回一条已经被删掉的 SubjectFolder（写进没人看的孤儿配置）。
+修法：OnPickSubjectFolder（:965-993）await 之后加 if (closed || !settings.SubjectFolders.Contains(folder)) return；
+      导出 OnExportClick（:434-515）保留整段 try/catch/finally（先拍 LedgerCsv.Collect 快照再 await，
+      file == null 直接 return，finally 里恢复 exporting 并刷新按钮状态），
+      异步路径全部有兜底，不会出现未观察异常。
+证明：走查（导出路径无法在无宿主的 harness 里真的弹系统对话框）；
+      harness 断言了 HintText 的显示/隐藏状态机与“还没有记录”提示不被操作结果覆盖。
+
+B11 设置页漏搬了「下课时弹一条系统通知」
+现象：官方设置页能关这条通知，控制面板里找不到，老师以为面板设置是“全的”。
+根因：ControlPanel.axaml 的设置页是照抄 SlideSyncSettingsPage.axaml 的，但漏了 ClassEndNotification
+      （官方 :58-66，位于“记录每节课的进度台账”之后、“在卡片上显示控制面板按钮”之前）。
+修法：ControlPanel.axaml:381-389 补一个 SettingsExpander，同样绑
+      Settings.ClassEndNotification、同样的说明文字、Mode=TwoWay。
+证明：harness 抽取两个 axaml 里全部 Settings.* 绑定路径比对：面板 30 条、官方 30 条，
+      排序后完全相同；另有「设置页里有开关」「新加的开关双向绑定」断言。
+
+B12 状态条把“导出结果/跳页提示”和台账路径挤在同一行，长路径会把提示挤没
+根因：修前状态条只有一行，ExportStatusText 与 StatusText 同格。
+修法：ControlPanel.axaml:294-326 改成两行：第一行台账路径 + 全屏按钮，第二行 HintText
+      （原来的 ExportStatusText 改名，注释同步说明“导出结果、已请求跳到第 N 页”都写这里）。
+证明：截图 panel-library.png 底部能看到“找不到课件文件了，可能已被移动或删除：三角函数.pptx”。
+
+B13 async void OnOpened 里任何一步抛异常都会直接崩宿主
+根因：Avalonia 的 Opened 回调没有额外兜底，Reload/夹屏幕/起定时器/抢焦点任一步抛异常都是 UI 线程未捕获异常。
+修法：OnOpened（:122-138）整段 try/catch，失败只写日志。
+证明：走查；harness 里窗口反复开关不崩（51 条断言跑完进程正常退出）。
+
+B14 离线/未接服务时「预览卡片」按钮可点但什么都不做
+根因：PreviewCardButton 只绑了 Click，没有按 service 是否存在禁用。
+修法：构造函数里 PreviewCardButton.IsEnabled = service != null（:99）。
+证明：走查（harness 用 service=null 构造，按钮为禁用态，未触发异常）。
+
+B15 设置页绑定项与官方“完全一致”这件事之前没有证据
+修法：把“逐项对照”做成 harness 断言（读两个 axaml 文本，正则抽 Settings.XXX 去重排序后比较），
+      并顺手把 axaml 顶部注释改成“29 个绑定路径 + 补的 1 个 = 30 条全部一致”，
+      同时写明“30 条 = 原本 29 条 + 补的 1 条”和“新手引导没搬”的原因，避免下一个人再来回找。
+证明：harness「设置页绑定项与官方设置页完全一致」。
+
+========================================================================
+2. 生命周期 / 几何 / 刷新的结论（重点关注的几项）
+========================================================================
+
+生命周期
+· 反复开关窗口：OnClosedDetach 已摘掉自己挂的全部事件与定时器；窗口对象能被 GC（2/3 回收，剩余一个是
+  JIT 局部变量，不能当泄漏证据）。
+· 唯一真实的泄漏在别的文件：SlideSyncAppearanceViewModel 构造里
+  `_settings.PropertyChanged += (_, _) => Refresh();` 是 lambda，没有退订 API。
+  实测：同一个 SyncSettings 上订阅数 0 → 2 → 3 → 4（每开一次面板 +1）。见第 5 节。
+· 关闭时未完成的异步操作：导出/文件夹选择器都做了“回来时窗口已关/行已删”的守卫（B10）。
+
+几何记忆
+· 最大化/全屏关窗：SaveGeometry 在 WindowState != Normal 时直接 return，不会把屏幕尺寸存成窗口尺寸
+  （harness「最大化关窗不把屏幕尺寸存成窗口尺寸」「全屏关窗也不…」均通过）。
+· 多屏：存下的坐标不在任何屏 → 拉回工作区（B2）；尺寸超工作区 → 夹到工作区且不低于最小值（B2）。
+· MinWidth/MinHeight 与 DPI：像素/DIP 统一换算（B3），1.5 缩放屏上 900×600 不被缩水。
+· 窗口可缩放/最小化/最大化：axaml 的 CanResize/CanMinimize/CanMaximize 未改；全屏按钮与 F11 同路径。
+
+数据刷新
+· 台账每秒追加：2 秒增量刷新（B5）；同一份课件只动右栏、历史内容相同不重赋值（保住滚动位置）。
+· 搜索/筛选后选中项消失：Rebuild 里 keepKey 找不到时 ClearSelection，然后自动选第一份，
+  右侧不会空白（:327-335）；新课件导致整栏重建时按 key 恢复选中（harness 覆盖）。
+· 「立即跳转」的三种坏输入：已删除文件 / 希沃伪键 / 没有链路，全部给中文提示（B8）。
+
+设置页
+· 与官方逐项对照：30 条绑定完全一致（B11/B15）；学科文件夹增删走同一个 ObservableCollection，
+  RefreshSubjectsSafe 只在“进设置页/加一行”时刷新 ComboBox 选项，且只增不删
+  （清空 Options 会把 ComboBox 的 SelectedItem 置空，等于把 SubjectFolder.Subject 写没——这是官方页的注释，面板照抄）。
+· 开关即时生效并落盘：绑定的是同一个 SyncSettings 实例，宿主 Plugin.cs:37-45 的
+  PropertyChanged → ConfigureFileHelper.SaveConfig 钩子负责存盘；harness 验证双向绑定。
+
+异常
+· 全部 async void（OnExportClick、OnPickSubjectFolder、OnOpened）都是整段 try/catch；
+  StorageProvider/TopLevel 返回 null、TryGetLocalPath() 返回 null 都有分支。
+· 定时器回调、键处理、页签切换、跳转、开文件夹均有兜底。
+
+========================================================================
+3. 改动清单（只列行为变化，方便 review）
+========================================================================
+Ui\ControlPanel.axaml
+  · :381-389 新增“下课时弹一条系统通知”开关（ClassEndNotification）。
+  · :294-326 状态条拆两行；ExportStatusText 改名 HintText。
+  · :329-340 顶部注释：绑定项 30 条一致的由来 + 新手引导不搬的原因。
+Ui\ControlPanel.axaml.cs
+  · using Avalonia / Avalonia.Platform / Avalonia.Threading。
+  · 字段：hintShown、shownCount、liveRecords、liveFiles、liveTimer、beforeFullScreen、geometryLive、closed。
+  · 新增：StartLiveRefresh / OnLiveTick / RefreshLive / RefreshSelectedDetail / OnClosedDetach /
+    ClampToVisibleScreen / ToPixels / FileCount。
+  · 重写：OnJumpClick（四路提示）、OnOpenFolderClick（存在性校验）、ToggleFullScreen（记住并恢复最大化）、
+    SaveGeometry（geometryLive）、OnTabSelectionChanged（index 2 刷关于、index 0 补刷新）、
+    OnExportClick 的提示函数改名（ShowHint/ShowEmptyHint）、OnPickSubjectFolder（await 后守卫）。
+  · 构造函数末尾 ClampToVisibleScreen；Opened 整段 try/catch。
+
+========================================================================
+4. 离屏 harness 与 3 张截图
+========================================================================
+位置：%TEMP%\audit-panel\
+  PanelTests.csproj   net8.0-windows，Avalonia 11.3.17 + Avalonia.Desktop + FluentAvaloniaUI 2.4.1
+                      + System.Text.Json 9.0.2（全部来自本机 NuGet 缓存，离线可 restore）
+  Program.cs          反射加载 bin\Release\net8.0-windows\ClassSlideSync.Plugin.dll，
+                      AppBuilder.Configure<TestApp>().UsePlatformDetect().SetupWithoutStarting()，
+                      构造 5 参 ControlPanel(ledger, settings, stateProvider, openFolder=null, service=null)，
+                      真实 Show()（挪到 -4000,-4000 或留在主屏），Dispatcher.UIThread.RunJobs() 泵消息，
+                      RenderTargetBitmap 出 PNG。
+运行：dotnet build '...\ClassSlideSync.Plugin.csproj' -c Release
+      cd %TEMP%\audit-panel
+      dotnet run --project PanelTests.csproj -c Release
+结果：断言总数 51，失败 0（ALL PASS）。
+
+截图（1000×680，均已人工查看）：
+  shots\panel-library.png   课件库：分组列表、右侧详情（第 12 页 / 共 30 页）、历史两行，
+                            底部两行状态条 + “找不到课件文件了，可能已被移动或删除：三角函数.pptx”。
+  shots\panel-settings.png  设置页顶部：基本组，含新补的“下课时弹一条系统通知”（开）。
+  shots\panel-about.png     关于页：版本、仓库链接、数据目录、台账 4 条。
+
+覆盖的用例（51 条断言）：
+  几何 13：合法坐标/尺寸原样恢复、屏幕外坐标拉回、超屏尺寸夹取、仍 ≥MinWidth/MinHeight、
+           首次关窗写坐标、二次打开恢复、最大化/全屏关窗不覆盖。
+  全屏/Esc 8：F11 进/退、从最大化进、Esc 退且回最大化、Esc 不关窗、全屏覆盖整屏（含任务栏）、普通窗口 Esc 关窗。
+  跳转 9：缺文件不调用+提示、希沃伪键不调用+提示、正常文件调用一次+路径页码+成功提示、无链路提示。
+  增量刷新 11：同课件更新只动右栏、选中项不变、历史 +1、新课件整列重建仍保选中、切页补刷新、
+           关窗后定时器摘除、closed 置位。
+  设置 7：绑定集合与官方完全一致、ClassEndNotification 存在/双向、改设置回勾、关窗后订阅单调 +1（泄漏实测）。
+  出图 3：3 张 PNG 存在且 >2KB。
+
+========================================================================
+5. 需要别人改的（不在我的可改范围）
+========================================================================
+1) 【真实泄漏】Views\SettingsPages\SlideSyncAppearanceViewModel.cs 构造函数：
+   `_settings.PropertyChanged += (_, _) => Refresh();` 是 lambda，无法退订、也没有 Dispose。
+   SyncSettings 活得比窗口长 → 每打开一次控制面板就永久多一个 VM + 一个订阅（实测 0→2→3→4），
+   每次设置变化都会叫醒这些死 VM。建议：改成 WeakEventManager / 具名方法 + IDisposable，
+   面板 OnClosedDetach 里调用（面板可以持有 Appearance，但需要 VM 提供退订入口）。
+2) Services\SlideSyncService.cs:806-832 OnPanelRequested：
+   `var p = new ControlPanel(...); panel = p; p.Show();` 若 Show() 抛异常，panel 已被赋值而 Closed 永远不触发，
+   此后点齿轮只会反复失败且日志只有一句。建议 catch 里 `if (ReferenceEquals(panel,p) && !p.IsVisible) panel = null;`
+   或在 Closed 之外用 try/finally 兜底。
+3) 同处：窗口被最小化时只 `panel.Activate()`，Win32 的 SetForegroundWindow 不会还原最小化窗口，
+   老师点齿轮看不到任何东西。建议先 `if (panel.WindowState == WindowState.Minimized) panel.WindowState = WindowState.Normal;`
+   再 Show()/Activate()。
+4) Core\TutorialGuide.cs:84 Start() 只在
+   ClassIsland.Views.SettingsWindowNew / TutorialCenterWindow / MainWindow 里挑宿主窗口，
+   控制面板（独立 ControlPanel 窗口）不在名单里，所以新手引导没法搬进面板。若要搬，
+   需要在 TutorialGuide.PickHostClassName 里支持 ControlPanel，或面板单独提供入口（Core 改动）。
+5) Core\PanelData.cs / Ui\PanelRows.cs（别的 agent 范围）：
+   本轮没有发现面板侧能修的数据层 bug。补两条给数据层 agent 的线索：
+   · Ledger.Recent 按 StartedAt 字符串排序（'/' 会排到 '-' 后面），PanelData.History 已按解析后的
+     DateTime 重排兜住；如果别处直接用 Ledger.Recent，同样要重排。
+   · CardFileList.Build 的 FilePath 对“只有希沃伪键”的课件会返回「希沃:课件名」，
+     任何“打开文件夹/文件存在性”判断都要先排除这个前缀（面板已按此处理）。
+
+========================================================================
+6. 发现但没改的（有意为之，或属于外观/低风险）
+========================================================================
+· 运行时 DPI 变化（把窗口从 150% 屏拖到 100% 屏）没有重新换算尺寸：系统会自己缩放窗口，
+  ClampToVisibleScreen 只在打开/显示时跑。要做得更细需要监听 Screens 变化并重排，收益低、风险高，没动。
+· TransparencyLevelHint="AcrylicBlur, Transparent" 在 Win10 上可能退化成纯色（Avalonia 的平台差异），
+  纯外观问题，没改。
+· AVLN3001：Ui\ControlPanel.axaml 没有 public 无参构造函数（面板必须拿 ledger/settings/service），
+  Avalonia 因此警告“运行时加载器够不到这个资源”。这是设计使然，改成无参构造反而会给出一个不能用的窗口。
+  该警告在基线里就有，本轮没有新增。
+· 搜索框每次 TextChanged 就 Rebuild（无防抖）：台账 ≤500 份时开销可以忽略（`PanelData.Search` 是纯函数），
+  没有加防抖，避免引入定时器竞争。
+· Esc 在 TextBox 里也会关窗口：这是“对话框式窗口”的常见行为；如果老师希望在输入框里 Esc 只清焦点，
+  需要按 FocusManager 判断，属于交互偏好，没改。
+· 「打开文件夹」优先走服务的 openFolder（IUriNavigationService），失败才回退 explorer.exe；
+  面板自己不再重复探测 URI，避免和宿主行为打架。
+
+========================================================================
+7. 结论
+========================================================================
+控制面板窗口里能确认的 15 类问题（几何 4、全屏/Esc 1、刷新 2、生命周期 1、跳转/文件夹 2、异步回调 1、
+设置页漏项 1、状态条 1、异常兜底 1、离线禁用 1、对照证据 1）已修复并逐条有离屏断言或截图证明；
+构建 0 error，ControlPanel 无新增警告；另有 1 个真实泄漏（VM lambda）和 2 个服务侧开关窗口的缺陷
+不在可改文件内，已写在“需要别人改的”。
+========================================================================

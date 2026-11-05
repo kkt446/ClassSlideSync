@@ -1,0 +1,99 @@
+ClassSlideSync.Plugin 稳定性测试报告
+（只读测试：未修改被测代码、未部署、未启动 ClassIsland / WPS / PowerPoint、未写入用户 data 目录）
+
+测试环境
+  时间: 2026-10-24 16:33 (Asia/Shanghai)
+  OS / 运行时: Windows / dotnet SDK 8.0.419，运行时 8.0.21，TFM net8.0-windows，当前区域性 zh-CN
+  被测程序集: C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\bin\Release\net8.0-windows\ClassSlideSync.Plugin.dll
+  构建: dotnet build -c Release 通过（0 error / 178 warning）
+  测试方式: 独立 console harness（C:\Users\xzq\AppData\Local\Temp\slidesync-stability\run-20261024-163344）直接引用程序集，
+            私有方法用反射调用；台账/设置全部写到 %TEMP% 临时目录，用例间用独立子目录隔离
+  mock:
+    - 临时 .pptx 文件（只作为路径存在，不用 COM 打开）
+    - TcpListener 假 MCP 端点 127.0.0.1:7916，返回 HTTP 500 + 非 JSON，用于验证希沃降级
+    - 假时钟：直接构造 SessionRecord 的 StartedAt/EndedAt 字符串（yyyy-MM-dd HH:mm:ss）
+  环境说明: 插件引用了 System.Text.Json 9（框架自带 8），harness 通过显式引用 STJ 9.0.2 及
+            System.Text.Encodings.Web / System.IO.Pipelines 9.0.2 解决，否则 Load/Save 会被
+            catch{} 静默吞成「空台账」。这是 harness 侧问题，不算被测 bug（已在早期版本中排除）。
+  未触碰: C:\Users\xzq\Desktop\github\ClassSlideSync\classisland\data 全程只读
+
+== Ledger ==
+[B01] 中 | Core/Ledger.cs:91-104 | 现象: [并发 Save 不丢记录] 多个 Ledger 实例写同一目录时后写覆盖先写：6 个线程各 new Ledger(同目录)、各 Add 40 条不同键并 Save 40 次，最终 ledger.json 只剩最后落盘那一个实例的 40 条（应共 240 条） | 复现步骤: 6 个线程各自 new Ledger(dir)，每个线程 Add 40 条（键互不相同）并循环 Save 40 次，结束后 Load 统计记录数 | 期望: 不丢记录（跨实例也应合并，或至少文件层面串行化） | 建议修法: Save 已用静态 lock 串行化写文件，但每个实例的 ByFile 是独立快照，仍然整文件覆盖；应在 Save 内基于磁盘现状做合并，或让进程内只存在一个 Ledger 单例，并对外提供统一入口
+     补充: 同一个 Ledger 实例被多线程同时 Add/Save 的用例通过（JSON 未写坏），问题只在「多实例」场景
+
+[B02] 低 | Core/SessionEngine.cs:788 | 现象: [首次即写台账] 首次打开一份新课件、一页没翻就退出，也会落一条「第 1 页」记录（Commit 的噪音守卫要求 same != null，首次没有旧记录所以放行）；卡片此后会提示「上次停在第 1 页」 | 复现步骤: 反射 BeginSession(Snap(file,1,10)) 后立即 EndSession(1)，再 Load 台账查看 | 期望: 一页未翻不写台账（与用户预期一致） | 建议修法: 噪音判定改成 EndSlide <= StartSlide 且无有效翻页（例如只记 highest > startSlide 或 Seconds 达标且翻过页）
+
+[B03] 低 | Core/SessionEngine.cs:668 | 现象: [改名续接] 课件改名后引擎另起一条记录，不与旧记录合并；Ledger.FindByFingerprint 已能按内容指纹认出同一文件，但 BeginSession 只按路径建新记录，台账里同一份课件出现两条，卡片上也变成两张 | 复现步骤: 改名前 Begin/Advance(5)/End；把文件改名后 Begin/Advance(4)/End；Load 后统计 | 期望: 续接为同一条（或卡片按指纹合并展示） | 建议修法: BeginSession 先按 currentFp 调 FindByFingerprint，命中则沿用旧记录的 StartedAt/StartSlide 做续接
+
+（本组用例 23 个，失败 1 个）
+
+== SessionEngine ==
+[B02] 低 | Core/SessionEngine.cs:788 | 现象: 见上（首次打开即写第 1 页） | 复现步骤: 见上 | 期望: 不写 | 建议修法: 见上
+[B03] 低 | Core/SessionEngine.cs:668 | 现象: 见上（改名不续接） | 复现步骤: 见上 | 期望: 续接 | 建议修法: 见上
+（本组用例 14 个，失败 2 个；未被 Ledger 组重复计入的用例：4→9→4 页码语义、噪音守卫、跨课件换桶、换桶后页码、空闲超时、重复 End、Settings 关闭记录等均通过）
+
+== SeewoBridge ==
+[PASS-SeewoBridge] 全部通过（用例 13 个）
+
+== CardFileList ==
+[PASS-CardFileList] 全部通过（用例 14 个）
+
+== SyncSettings ==
+[B04] 低 | Core/SyncSettings.cs:348-365 | 现象: [科目拆段匹配] 存储的科目名是复合名「劳动/英语」时，用单段「劳动」查不到对应文件夹（返回空串）；反过来查询「劳动/英语」能匹配到科目名「劳动」的条目，匹配是单向的 | 复现步骤: SubjectFolders 设为 {Subject="劳动/英语", Folder="D:\我的 课件\劳动 英语"}，调用 FindSubjectFolder("劳动") / ("英语") | 期望: 单段也能命中复合名（课表里两种写法都可能出现） | 建议修法: 拆段逻辑同时作用于「查询」和「已存条目」两侧，任一段相等即算命中（注意保留整体精确匹配优先）
+
+[B05] 低 | Core/SyncSettings.cs:348-365 | 现象: [科目拆段匹配] 同上，FindSubjectFolder("英语") 返回空串 | 复现步骤: 见 B04 | 期望: 命中 D:\我的 课件\劳动 英语 | 建议修法: 见 B04
+
+[B06] 中 | Core/SyncSettings.cs:403 | 现象: [颜色规范化保留 8 位 alpha] Normalize("#11223344") 返回 "#112233"，透明通道被静默丢弃；而 ClassIslandTheme.TryParseColor 明确支持 #RRGGBBAA，用户填 8 位自定义底色时 alpha 永远不生效，且无任何提示 | 复现步骤: 反射调用 SyncSettings.Normalize("#11223344")，再设 CardBackgroundColor 观察 CardAppearance.Resolve 的 BgAlpha | 期望: 保留 8 位（#RRGGBBAA 原样大写）或在 UI 上明确拒绝/提示 | 建议修法: 长度 6/8 都接受，长度 8 时返回 "#" + s.ToUpperInvariant()；TryParseColor 已支持，无需改
+
+（本组用例 32 个，失败 3 个）
+
+== CardAppearance ==
+[PASS-CardAppearance] 全部通过（用例 32 个）
+
+== Robustness ==
+[PASS-Robustness] 全部通过（用例 16 个）
+
+覆盖情况统计
+  共 7 组 / 144 个用例: 通过 138 个，失败 6 个；发现 bug 6 个（高 0 / 中 2 / 低 4）
+  - Ledger: 用例 23 个，失败 1 个（B01）
+  - SessionEngine: 用例 14 个，失败 2 个（B02/B03，与 Ledger 组记录的是同两条）
+  - SeewoBridge: 用例 13 个，失败 0 个
+  - CardFileList: 用例 14 个，失败 0 个
+  - SyncSettings: 用例 32 个，失败 3 个（B04/B05/B06）
+  - CardAppearance: 用例 32 个，失败 0 个
+  - Robustness: 用例 16 个，失败 0 个
+  归并后不重复计数: Ledger/引擎相关 3 条 + 设置相关 3 条 = 6 条（中 2 / 低 4）
+
+  通过项里覆盖到的关键行为（摘要）:
+  - Ledger: 21 天过期边界 20.9 天保留 / 21.1 天清理、希沃伪键不被 GetFullPath 污染、Bucket 归并旧污染桶、
+    相对名回退、FindByFingerprint 认得出改名文件、损坏 JSON 降级为空台账并改名为 .corrupt-*、目录不存在、
+    空文件、非 JSON、UTF-8 BOM、200 条上限、Recent/Count/Newest/FindByName、ar-SA（UmAlQura）区域性下 Prune 不误删
+  - SessionEngine: 4→9→4 时 EndSlide=9、噪音守卫（有旧记录时一页没翻不写）、换课件不混桶、EndSession 后重启可恢复、
+    End(0)、连续两次 End、RecordLedger=false 不落盘
+  - SeewoBridge: 端口 7916 有假端点返回 500/非 JSON 时 GetState 不抛异常、快速失败并给出 Diag，
+    没有服务时同样不卡；GotoSlide(0) 返回「页码无效」；KeyFor/IsSeewoKey/DisplayName/KeyPrefix
+  - CardFileList: 空台账、同名不同目录归并、历史倒序、最多 8 行截断、坏记录（EndSlide<=0）、希沃键归并、
+    currentKey 标记、null 台账
+  - SyncSettings: 全字段 JSON 往返（含 SubjectFolders / AutoOpenSubjectFolder）、中文与空格路径、
+    各属性夹取边界（AutoHideSeconds 5..600、MinSessionSeconds 0..3600、CardOpacityPercent 20..100、
+    CardCornerRadius -1..48、CardScale 0.6..2.0、CardFontSizeDelta -4..12、CollapsedTabWidth 16..96 等）
+  - CardAppearance: 跟随主题底色/alpha（90%→229，50%→127）、自定义底色、圆角与缩放夹取、
+    TabWidth/VerticalPercent 边界、深/浅底文字色反转、卡宽高估算、8 位色解析
+
+  未测到（及原因）:
+   - SyncSettings/Services 的磁盘读写层（settings.json 缺失/损坏/无权限时的默认值与备份）：读写发生在
+     Plugin 启动路径，纯 console harness 未触发，且需要 ClassIsland 宿主注入 DataFolder
+   - SessionEngine.Start()/Stop() 轮询线程、COM 熔断、COM↔希沃切换、跨进程「杀进程后重启」：
+     会真的启动 PowerPoint/WPS，违反铁律；本次只验证了「EndSession 落盘后新实例 Load 能恢复」
+   - PptBridge 全组（Snapshot/GotoSlide/EditingSlide/Launch）：需要真实 PowerPoint/WPS COM，铁律禁止
+   - SeewoBridge 正常 MCP 路径（initialize→notifications/initialized→tools/list→tools/call）、
+     isError:true、shellId 为空、畸形 JSON 响应：需要真实 MCP 工具名与 schema，本机无希沃；
+     只用假端点验证了「端点返回 500/非 JSON 时降级」
+   - Ui/NativeOverlayCard、Views/*.axaml 的浮窗渲染/点击/缩放/透明度：需要 Avalonia 窗口与 ClassIsland 宿主
+   - ClassIslandTheme.Load：需读取真实 ClassIsland 主题文件
+   - 真实希沃白板 / 真实课件 / 用户真实台账：铁律禁止
+
+备注
+  - 自定义 8 位底色 #10203080 → Bg=16/32/48、BgAlpha=255（说明 alpha=128 没有被应用，与 B06 同源）
+  - 测试期间该仓库目录出现过并行构建活动（Core/*.cs 与 bin 下 dll 的时间戳在 16:32 更新）；本报告的结果
+    对应 bin\Release\net8.0-windows\ClassSlideSync.Plugin.dll（16:32:14 版本）。若之后源码再变动，需重跑 harness 复核。

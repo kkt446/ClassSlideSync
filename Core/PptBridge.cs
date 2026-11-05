@@ -420,7 +420,14 @@ namespace ClassSlideSync.Plugin.Core
                         }
                         catch { return false; }
                     }, 60000, 500);
-                    if (!ready) continue;
+                    if (!ready)
+                    {
+                        // 60 秒都没就绪：这个应用对象是刚 CreateInstance 出来、已经被设成 Visible 的
+                        // 真实例，放在这里直接 continue 就是漏一组 RCW + 一个空进程（老师会看到
+                        // "PowerPoint 打开了却什么都没有"，而且关不掉）。必须走 Dispose 收干净。
+                        try { b.Dispose(); } catch { }
+                        continue;
+                    }
 
                     // 顺手把课件打开：老师点的是“从第 N 页开始放映”，早一点打开就少一次往返。
                     // Office 刚起来时会拒绝调用（0x80010001 之类），所以重试几轮。

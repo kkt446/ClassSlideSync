@@ -1,0 +1,280 @@
+课件续页 · Core 层缺陷审查与修复报告
+=====================================
+范围：Core\SessionEngine.cs / Ledger.cs / LessonWindow.cs / LessonClock.cs /
+      CardFileList.cs / CardFileGroups.cs / PagePace.cs / HistoryLine.cs /
+      LedgerCsv.cs / SyncSettings.cs / Appearance.cs
+版本：ClassIsland 2.x 插件，net8.0-windows；只改上述 11 个文件，未改任何公开签名。
+日期：2026-10-24
+
+--------------------------------------------------------------------------------
+一、结论摘要
+--------------------------------------------------------------------------------
+修掉 11 处能说清后果的缺陷，其中 4 处会造成「记录丢失 / 卡片点击抛异常」这类
+用户可感知的故障，其余是排序错误、半张课表、内存泄漏、无谓磁盘 IO 与过时注释。
+
+实测对比（同一份反射测试工程，同一批用例，只换插件 DLL；共 111 条断言）：
+  修复前（回退版 DLL）：pass=103 fail=8
+  修复后（本次构建 DLL）：pass=111 fail=0 skip=0（连跑两次结果一致）
+
+关键证据（修复前）：
+  · 并发 2.5 秒、写入 24950 条记录，3 个 reader 线程各抛一次
+    InvalidOperationException: Collection was modified; enumeration operation may not execute.
+  · 同一轮里 app.log 出现 62 条 "ledger save failed"
+  · 同一秒两场会话被并成一条；上一场的「第 9 页」被改写成这一场的「第 3 页」
+  · 导出的 CSV 第 2 行与台账顺序不一致（first-diff=@1 expected=2 got=128）
+  · 换掉科目文件夹集合后，旧行改字段仍触发 PropertyChanged（应 0 次，实际 1 次）
+  · LessonWindow 的 All 只有「第1节 08:00-08:45」，没有整天课表
+关键证据（修复后）：
+  · 0 异常、0 条 save failed、落盘条数 == 写入条数、Load 回读条数一致
+  · 上述 8 项全部通过；指纹校验 60 次缓存命中 0.20ms vs 60 次重算 48.17ms
+
+--------------------------------------------------------------------------------
+二、构建与验证方式（重要：为什么不是直接构建仓库根目录）
+--------------------------------------------------------------------------------
+1) 仓库根目录当时构建不起来，原因不在我的文件：
+   ClassSlideSync.Plugin.csproj 用默认 **/*.cs 通配，会把并行 agent 当轮新建的
+   嵌套工程 tools\ToastHelper\*.cs（含它自己的 obj\...\AssemblyInfo.cs）一起编译
+   → 7 个 CS0579（特性重复）+ CS0234（Windows.Data / Windows.UI 不存在）。
+   尝试过 -p:DefaultItemExcludes=... 覆盖，-getProperty 显示生效但 Compile 项
+   仍包含 42 个 ToastHelper 文件，命令行覆盖无效；按要求不动别人的 csproj/tools\。
+2) 因此用「等价镜像构建」验证：
+   robocopy 仓库 -> %TEMP%\audit-core\src /MIR /XD bin obj tools cipx .github .vs
+   dotnet build %TEMP%\audit-core\src\ClassSlideSync.Plugin.csproj -c Release -t:Rebuild
+   结果：0 error。warning 208，其中基线 200，+8 全部来自并行 agent 当轮改的
+   Ui\NativeOverlayCard.cs / Services\SlideSyncService.cs；我的 11 个文件的 47 条
+   warning 行号全部是既有代码（无一条落在新增行）。
+   仓库源码行号与镜像一致，本报告引用行号以仓库文件为准。
+3) 测试工程：%TEMP%\audit-core\harness（audit.csproj + Program.cs）
+   · 反射加载插件 DLL（不引用工程），用例 A–N：台账并发、Commit 同秒、CSV 稳定排序、
+     换集合解订阅、集合事件挂解、Normalize/夹取、PagePace、LessonWindow、HistoryLine、
+     CardFileList 归并/同名/分页、Prune、Key/Adopt/Fingerprint、Save/Load/坏文件、
+     指纹缓存。每条断言都打印实际值。
+   · 运行：cd %TEMP%\audit-core\harness\bin\Release\net8.0-windows
+           dotnet audit.dll <被测插件 dll> <标签>
+   · 前后对比用的「回退版」是另一份镜像 %TEMP%\audit-core\before：在副本上把本次
+     7 处修改逐个还原（仓库本身未回退），构建后跑同一套用例。
+   · 注：harness 需要 System.Text.Json 9（插件经 ClassIsland.PluginSdk 依赖 9.0.0.0），
+     仅在测试工程的 csproj 里加了 PackageReference 9.0.2（本机 NuGet 缓存已有，不联网），
+     插件工程未加任何包。
+
+--------------------------------------------------------------------------------
+三、修掉的缺陷
+--------------------------------------------------------------------------------
+【F1】台账内存结构完全没有锁，UI/服务线程枚举时撞上引擎线程写 → 抛异常、落盘静默丢失
+  现象：卡片面板每 2 秒刷新、点卡片跳页时偶尔整张卡片不更新甚至抛异常（异常从
+        SetStatus→Push→BuildState 直接抛进 UI 事件处理器）；更隐蔽的是那次 Save 失败
+        被吞掉，内存里有、ledger.json 里没有，重启后那节课从历史里消失。
+  根因：Core\Ledger.cs（原 85 行附近无任何锁）ByFile 是裸 Dictionary<string,List<…>>；
+        写方是引擎线程（Commit→Add/Adopt），读方有三条别的线程：
+          Services\SlideSyncService.cs 的 PushCheapState()（每 2 秒）→SessionEngine.Push
+            →BuildState→PickRecord/Count/Recent/CardFileList.Build
+          卡片点击的 UI 线程 RequestJump→SetStatus→Push（同一条路径）
+          Prune() 在服务线程里 RemoveAll + Save
+        另有仓库外部三处直接 foreach (var kv in ledger.ByFile)：
+          Automation\UnfinishedDecks.cs:65、Services\SlideSyncService.cs:465、
+          Ui\ControlPanel.axaml.cs:257（这三处不在我的修改范围，所以不能靠「调用方加锁」解决）。
+        SessionEngine.cs 原 1278 行注释自称「台账只在引擎线程读」，与实现不符。
+  修法：Core\Ledger.cs
+        · 新增 internal readonly object Sync（第 85 行；internal 不扩公开契约）；
+        · 私有字段 byFile + ByFile 属性 getter/setter 都在 lock(Sync) 内（第 97 行起），
+          属性名与类型不变；取到的字典是「某一瞬间的整本」快照。
+        · Add/Adopt/Prune 改为 copy-on-write：先在局部 next 字典上改，最后一次性
+          byFile = next（第 438/484/522 行）。这样即使外部代码拿到旧字典正在枚举，
+          也不会被就地改结构——这正是那三处不归我管的 foreach 能同时安全的原因。
+        · 所有读方法（Bucket/Last/Recent/Count/Newest/FindByName/FindByFingerprint/
+          LastUnfinishedForSubject）整段包 lock(Sync)；FindByFingerprint 把指纹计算
+          放在锁外，避免持锁做磁盘 IO。
+        · Prune 在 lock 内只改内存并记下待删键，出了锁才 Save()，保持
+          saveLock→Sync 的固定顺序，不会与 Save 互等死锁（第 494 行起）。
+  证明：用例 A。修复前同一段代码抛 3 次 Collection was modified、app.log 62 条
+        save failed；修复后 0 异常、0 条失败、落盘条数==写入条数（24950）。
+
+【F2】Save() 失败完全静默
+  现象：落盘失败时用户和日志都拿不到任何信息（与 F1 叠加时尤其致命）。
+  根因：Core\Ledger.cs 原 Save() = lock(saveLock) { try { …全部… } catch { } }，空 catch。
+  修法：分两段 try/catch，分别写 app.log：
+        "ledger save failed (serialize): …"（第 150 行，序列化被并发改结构撞坏）
+        "ledger save failed (write): …"（第 165 行，目录只读/磁盘满/文件被占用）
+        序列化在 lock(Sync) 内做快照式序列化（第 132 行起），写文件仍在 saveLock 内、
+        在 Sync 外，避免长时间持锁。
+  证明：用例 A 的「app.log 里 0 条 save failed」；回退版该计数为 62。
+
+【F3】Commit 的同秒就地更新条件用 StartedAt 字符串，把两场不同会话并成一条
+  现象：同一秒内「上一场刚下课、下一场立刻开始」（换课件/连点两节课件）时，第二条
+        记录不会新增，而是把上一条的 EndSlide/EndedAt 改成新会话的 → 上一场的页码
+        永久丢失，历史里看起来「这节课只上了 3 页」。
+  根因：Core\SessionEngine.cs 原 Commit 判据 same.StartedAt == r.StartedAt；
+        StartedAt 只精确到秒，两场会话可以同秒（BeginSession 用 DateTime.Now 格式化）。
+  修法：第 918 行改成 ReferenceEquals(same, r)——只有「同一场放映把自己的同一对象
+        再提交一次」才就地更新，任何新会话都走 Add。噪音守卫（无翻页不记账）保持在
+        它前面不变。
+  证明：用例 B。修复前 expected=2 actual=1、上一场第 9 页被改写成 3；修复后两场各留
+        一条且页码各自保留；「同一场会话重复提交只留一条」也通过。
+
+【F4】放映中每 350ms 重算一次课件指纹（每帧读课件头尾各 64KB）
+  现象：一节课 40 分钟约 6800 次 Push × 128KB ≈ 870MB 读取 + 每 0.35 秒一次
+        打开/关闭文件句柄；机械盘/网络盘上会拖慢 PowerPoint 自身保存与缩略图。
+  根因：Core\SessionEngine.cs BuildState 的 PreviousTrusted 分支对每条非希沃记录都
+        调 Ledger.Fingerprint(r.FilePath)，而放映中 r 就是当前会话记录（指纹早就写过），
+        属于纯重复计算。
+  修法：新增 FingerprintCacheSeconds = 10（第 1462 行）与
+        bool TrustedFingerprint(SessionRecord r)（第 1475 行）：同路径 + 同指纹且
+        10 秒内直接命中缓存；文件读取在锁外做，只把结果写回缓存。
+        BuildState 第 1370 行改为 st.PreviousTrusted = TrustedFingerprint(r)。
+        为什么 10 秒够用：这条标志只用于提示「课件在记录之后被改过」，文件改动的
+        提示晚 10 秒出现对老师没有影响，且不改变任何记录内容。
+  证明：用例 N。修复后 60 次取状态 0.20ms，同样 60 次强制重算 48.17ms（约 240 倍），
+        回退版首次 91.14ms（含冷启动）；PreviousTrusted 的真/假判定在 12 个用例里一致。
+
+【F5】RefreshPace 在非引擎线程枚举 ByFile + 与 Add 竞态
+  现象：与服务线程每 2 秒的 Push 同时发生时，可能读到「一半的台账」（DeckCount 与
+        TotalCount 来自不同瞬间），或抛 Collection was modified。
+  根因：Core\SessionEngine.cs RefreshPace 里 `foreach (var kv in byFile)` 与
+        Add 并发，且 DeckCount/TotalCount 两次读取之间没有一致性保证。
+  修法：第 1247 行把整个刷新过程包进 lock (ledger.Sync)（含两份快照的读取与平均值
+        计算；内部无磁盘 IO，持锁时间可忽略）。
+  证明：用例 A/J（并发 + 卡片快照）修复后 0 异常；另用 G 用例确认 PagePace 平均
+        值不因并发读取变成 0。
+
+【F6】CardFileList.Build 无锁枚举台账
+  现象：卡片面板刷新时抛 Collection was modified（异常落在 UI 线程的刷新调用栈里）。
+  根因：Core\CardFileList.cs 原 Build 直接 foreach (var kv in ledger.ByFile) 抄记录。
+  修法：第 113 行用 lock (ledger.Sync) 只包住「抄内存快照」这一段；File.Exists 与
+        指纹等磁盘 IO 全部留在锁外（不能持锁做 IO）。
+  证明：用例 J（归并/同名/分页）+ 用例 A 的 builder 线程（修复后 0 异常）。
+
+【F7】CSV 导出的「稳定排序」不是稳定排序
+  现象：导出的 CSV 与台账/卡片历史行序不一致，同一秒的两条会对调，老师按时间核对时
+        会以为记录错了。
+  根因：Core\LedgerCsv.cs Collect 注释写「OrderBy 是稳定排序，同一时间点保持台账顺序」，
+        实现却是 all.Sort(delegate …)——List<T>.Sort 是内省排序，不稳定；StartedAt
+        解析失败时比较器返回 0，顺序完全由排序算法决定。
+  修法：第 55–72 行改成「带原下标的有序对」排序：给每条记录配上它在台账里的下标，
+        比较器先比时间（都有→倒序；一方缺失→有时间的在前；都没有→0），
+        相等时用原下标升序做 tiebreaker，最后按下标对重建 List。签名不变。
+  证明：用例 C。修复前 first-diff=@1 expected=2 got=128（第 2 行就错位）；修复后 40 条
+        同秒记录行序与台账完全一致。
+
+【F8】SyncSettings.SubjectFolders 换集合时不解除旧行的 PropertyChanged 订阅
+  现象：设置页每换一次科目文件夹集合，旧集合里的行仍挂在事件上——旧对象改字段会把
+        PropertyChanged(SubjectFolders) 抛到新设置对象上（触发无意义保存），且旧集合
+        与旧行永远不释放（泄漏）。
+  根因：Core\SyncSettings.cs 原 setter 只 subjectFolders.CollectionChanged -= …，
+        没有对旧集合里每个 SubjectFolder 解订阅（构造时 Hook 过）。
+  修法：第 405 行赋值前 `foreach (SubjectFolder old in subjectFolders) Hook(old, false);`
+        （Hook 第 485 行，本来就成对存在）。
+  证明：用例 D/E。修复前旧行改字段仍触发 1 次，修复后 0 次；同时验证新集合往里加行
+        仍会触发（CollectionChanged 还挂着）、同一集合重复赋值不会重复挂。
+
+【F9】CardBackgroundOpacity 的设置说明与实现相反（100% 不是「跟随主界面」）
+  现象：老师把不透明度拉到 100%，以为会跟 ClassIsland 主界面一样透，实际是整卡不透明。
+  根因：Core\SyncSettings.cs 的字段注释与属性注释仍写「跟随主题时 100% = 主界面透明度」，
+        而 Core\Appearance.cs Resolve 里 BgAlpha = pct*255/100 是**绝对** alpha，且注释
+        明确写了不再乘宿主 0.5（乘上去彩色幻灯片上整块发雾，用户反馈过）。
+  修法：只改两处注释（第 596/620 行附近），写清「绝对整窗不透明度：100 完全不透、
+        90 只留一点点、<20 夹到 20；跟随主题也不乘宿主 Opacity；自定义底色带 8 位
+        alpha 时以 alpha 为准」。代码行为、公开成员、默认值都没动（避免与正在改 UI
+        文案的 agent 撞车，也避免改变既有用户观感）。
+  证明：注释与用例 F 的夹取结果（<20→20、>100→100）一致；Appearance 的 alpha 语义
+        由用例钉住（8 位 hex 的 alpha 优先、6 位走滑块、跟主题不乘 0.5）。
+
+【F10】LessonWindow 的 All 只拼到当前节，日志里是「半张课表」
+  现象：上课中 SlideSyncService 打出的「课表 …」只有到当前节为止的几节，排查
+        「今天到底有几节课」时被误导。
+  根因：Core\LessonWindow.cs Compute 的 all 是边循环边 append，命中当前时段就 return，
+        所以 All 永远只有 [0..当前节]；而 Services\SlideSyncService.cs:180 把它当整天课表。
+  修法：主循环之前先扫一遍拼出整天 allText（第 74 行），命中与结尾都 r.All = allText
+        （第 127/139 行）；主循环只保留 index++/periods++。Periods 语义未改（命中时=
+        当前节号，未命中=总节数），因为下游只用它 >0 判断有没有课表。
+  证明：用例 H。修复前 All 只有「第1节 08:00-08:45」，修复后含 08:55 与 09:40；
+        跨零点时段（end<=start）仍被跳过，Periods 仍为 1。
+
+【F11】FindByName 里只赋值不读的局部变量
+  现象：无行为影响，但它是 copy-paste 残留，掩盖了「取最新」的真实逻辑。
+  根因：Core\Ledger.cs 原 FindByName 里 string bestPath 只在循环里赋值。
+  修法：删除（第 331 行起的方法体内），行为不变（用例 M 覆盖同名取最新）。
+
+--------------------------------------------------------------------------------
+四、逐条核过、未发现缺陷的边界（已用测试钉住，不是为了修而修）
+--------------------------------------------------------------------------------
+· LessonWindow：跨零点时段（end<=start）跳过、课前窗口 now>=start-lead &&
+  now<start && start<preStart、宽限 end+grace、无排课、全部结束、单节课、
+  SecondsToStart 向上取整——用例 H 全过。
+· LessonClock：TimeType!=0（课间/分割线/行动）过滤、NextClassSubject 为 null、
+  GetClassPlanByDate 返回 null、服务缺失——用例 H2 全过；异常整体被 try/catch 吞掉，
+  不会把异常抛进 ClassIsland 主循环。
+· PagePace：空台账→60、全是 0 秒→60、Seconds<0、EndSlide<=StartSlide 跳过、
+  当前页>总页数→0、除零（pages<=0 返回 -1）、600 秒上限、8 秒下限——用例 G 全过。
+· CardFileGroups：空科目→「未标注科目」、按首次出现顺序成组、分页与筛选组合
+  （先筛后分页、页码越界夹取）、同名归并与 SameName 的交互——用例 J 全过。
+· HistoryLine：周几取模（7→周日）、节次<=0 不显示节次、同一页（start==end）不写成
+  区间、跨年用 yyyy-MM-dd、负/极大年龄走 ShortAge 的「刚刚」/「N 个月前」——用例 I 全过。
+· Appearance：8 位 hex 的 alpha 优先、6 位走滑块、跟主题不乘宿主 0.5、
+  CardScale 夹到 [0.6,2.0]、CornerRadius 夹到 [0,48]、luminance 0.55 阈值——用例 F 全过。
+· SessionEngine.RequestJumpTo 在 bridge==null 时不会双开 PowerPoint：DoJump 只在
+  引擎线程跑，jumpPending 是 0/1 标志不是计数器，第一次请求里 Launch 后立刻
+  bridge=b，第二次看到的 bridge!=null——用例 J2 验证两次请求只产生一次 Launch 计数。
+· Ledger.Prune 的 21 天边界：retentionDays<=0 直接返回 0；LastUsed < cutoff 严格小于，
+  正好第 21 天的记录保留；空桶删键；只有真删了才 Save——用例 K 全过。
+· Ledger.Key/Bucket/Adopt/Fingerprint：希沃伪键不过 GetFullPath、相对路径取全路径、
+  末尾反斜杠归一、大小写归一、改名续接（Adopt 迁桶并改写 FilePath）、
+  文件被占用/删除时指纹返回空串不抛——用例 L 全过。
+
+--------------------------------------------------------------------------------
+五、发现了但没改的（附原因）
+--------------------------------------------------------------------------------
+N1. 多实例并发写同一个 ledger.json（整文件覆盖，后写者赢）。
+    前几轮报告（stability-report.txt、-harness、-final）已判定 WONTFIX：生产里只有
+    一个 Ledger 实例，复现要双开 ClassIsland；改成文件锁/分片存储会动数据格式，
+    收益远小于回归风险。本次修的是**同进程内 SessionEngine/服务线程/UI 线程**并发，
+    与多进程覆盖不是同一问题（这一点前几轮报告没有覆盖）。
+    需要用户拍板才能做的方案：追加式日志 + 启动时合并；或每进程一个 ledger.<pid>.json。
+N2. SessionEngine.Age() 用 r.EndedAt ?? r.StartedAt。
+    EndedAt 是空串（不是 null）时不会退回 StartedAt，DateTime.TryParse("") 失败返回 -1，
+    提示变成「刚刚」而不是真实天数。只影响卡片上「上次停在这一页多久」的文案；
+    改它会动 Age 的语义口径（现在 ShortAge 的「刚刚」也用来表示「就是刚刚」），
+    需要和 UI 那边的文案一起定，暂不改。
+N3. Save() 失败现在只写 app.log，卡片/设置页看不到。
+    要显示给用户得改服务层与 UI（不在我的文件范围）；只加日志是低风险的一半修复。
+N4. 页面 `Services\SlideSyncService.cs:490-529` TryOpenSubjectFolder 在设置页并发
+    枚举 SubjectFolders 时可能抛异常，但整段包在 try/catch 里（494/526 行），
+    只写一条日志、不炸进程。不是我负责的文件，且行为已可接受，未动。
+N5. LessonWindow.Result.Periods 的含义是「命中时=第几节，未命中=总节数」，命名有歧义。
+    下游（SlideSyncService.cs:185）只用 >0，改语义风险大于收益；只在报告里记录。
+N6. 指纹缓存 TTL 是固定 10 秒，不做自适应。
+    长时间放映时每 10 秒仍会读一次 128KB（约 4 分钟 24 次），代价可接受；
+    自适应需要额外状态与更多测试，收益不明显，暂不做。
+N7. LedgerCsv 的 CSV 转义对以 = + - @ 开头的单元格没有做 Excel 注入防护。
+    插件是老师本地自用、导出文件只在本机打开，属安全加固而非 bug；
+    若要防注入，需要在 Escape 里加前缀单引号，会改变导出内容格式，需用户确认。
+
+--------------------------------------------------------------------------------
+六、构建警告归属
+--------------------------------------------------------------------------------
+镜像构建 -t:Rebuild：0 error / 200 warning（与基线持平）。
+我的 11 个文件没有新增 warning：新增代码行的编译诊断数为 0，既有 warning 行号
+（如 SyncSettings 68/72/404/407/488/489/533/535/596/618/620、
+SessionEngine 230/399/604/683/846/849/853/888/954/1030/1111/1258/1261/1273、
+Ledger 13-29/219/245/247/265/294/308/323/333/335/354/430/462/465/503、
+Appearance 144/186/187/206、CardFileList 462）在本次修改前后完全相同。
+注 1：仓库根目录构建在我工作期间两次被别人当轮的改动卡住（都是短暂状态）：
+  · tools\ToastHelper 嵌套工程被默认 **/*.cs 收进来（7×CS0579 + CS0234）；
+  · Ui\NativeOverlayCard.cs 引用未定义的 WM_CAPTURECHANGED（CS0103）；
+  · Ui\ControlPanel.axaml.cs 引用未定义的 PixelSize/PixelPoint（26×CS0246，21:59 仍在）。
+  这三处都不在我的修改范围内、我没有动过它们。
+注 2：最后一次 0 error / 0 fail 的验证，用的是「仓库 + 我的 11 个文件」的镜像，
+  其中只把 Ui\ControlPanel.axaml.cs 换成 21:54 那份能编译的旧副本（纯 UI 文件，
+  harness 完全不接触 UI 类型），以便在别人把 ControlPanel 改坏的时间窗内仍能验证
+  Core 层。合并时若根目录仍报 CS0246 CS0103 CS0579，请先修那两个 UI 文件与 tools\ 排除。
+
+--------------------------------------------------------------------------------
+七、复现方式
+--------------------------------------------------------------------------------
+1) 构建：dotnet build %TEMP%\audit-core\src\ClassSlideSync.Plugin.csproj -c Release -t:Rebuild
+2) 测试：cd %TEMP%\audit-core\harness\bin\Release\net8.0-windows
+        dotnet audit.dll %TEMP%\audit-core\src\bin\Release\net8.0-windows\ClassSlideSync.Plugin.dll after
+   期望：=== after 之后 pass=N fail=0 skip=0，退出码 0。
+3) 前后对比：把 1) 的产物换成 %TEMP%\audit-core\before\bin\Release\net8.0-windows\
+   ClassSlideSync.Plugin.dll（在副本上回退了本次 7 处修改），同一套用例会得到
+   pass=103 fail=8 并打印上面列的全部证据。
+未部署、未启动 ClassIsland/WPS/PowerPoint/希沃、未改 git、未加 NuGet 到插件工程。

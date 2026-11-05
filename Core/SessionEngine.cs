@@ -499,13 +499,24 @@ namespace ClassSlideSync.Plugin.Core
                         NoteComCost("Connect+DeckScore", swFresh.ElapsedMilliseconds);
                         if (fresh != null && theirs > mine)
                         {
+                            // 换掉旧 bridge 之前先收掉它，否则空闲重连每成功一次就漏一组
+                            // COM 应用对象（Com/keepAlive/keepAliveShow）—— 与"WPS 关不掉"
+                            // 是同一病灶：应用级 RCW 不释放，演示软件就退不出去。
+                            var old = bridge;
                             bridge = fresh;
+                            try { old?.Dispose(); } catch { }
                             ledger.Log("reattached: " + fresh.Label + " via " + fresh.ProgId + " [mode=" + fresh.AttachMode + "] (score " + mine + "→" + theirs + ")");
                         }
-                        else if (Diag)
+                        else
                         {
-                            ledger.Log("verified: " + bridge.Label + " score=" + mine
-                                + (fresh == null ? "（没找到别的实例）" : "（找到的 " + fresh.Label + " score=" + theirs + "，不比现在好）"));
+                            // fresh 不比现在好：它同样是 CreateInstance/GetActiveObject 出来的 RCW，
+                            // 不 Dispose 一样会拖住演示软件进程。
+                            if (fresh != null) { try { fresh.Dispose(); } catch { } }
+                            if (Diag)
+                            {
+                                ledger.Log("verified: " + bridge.Label + " score=" + mine
+                                    + (fresh == null ? "（没找到别的实例）" : "（找到的 " + fresh.Label + " score=" + theirs + "，不比现在好）"));
+                            }
                         }
                     }
                 }

@@ -1,0 +1,363 @@
+Linux 卡片按钮真翻页 — 稳定性报告
+==================================
+
+日期：2026-10-31（UTC 08:38–08:49，北京时间 16:38–16:49）
+仓库：C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin
+验证机：WSL2 发行版 UbuntuCi（root）；DISPLAY=:0（2560x1600，Weston/XWayland）；XDG_RUNTIME_DIR=/tmp/xdg-runtime
+放映软件：LibreOffice 24.2（Impress），UNO socket host=127.0.0.1 port=2002
+测试课件：/root/plugin/test/纯页码课件.pptx（10 页）
+宿主：/root/ci-linux（ClassIsland 2.1.0.1-0），插件 ClassSlideSync.Plugin 1.2.3.0
+
+
+一、结论
+--------
+
+Linux 上点卡片按钮现在会真的翻页，链路全程实测通过：
+
+    卡片按钮
+      → Ui/LinuxCardWindow.JumpRequestedPage(page)
+      → SlideSyncService.LinuxJump(...)
+      → LinuxSlideSource.TryWriteCommand(page)   写 command.json（原子）
+      → slidesync_lo.py 下一轮轮询读到 command.json
+      → UnoBridge.goto_slide() → controller.gotoSlide(pages.getByIndex(page-1))
+      → 立刻重读页码并重写 current.json（刷新 updated）
+      → 插件 500ms 轮询 current.json，卡片页码跟着变
+
+| 检查项 | 结果 | 证据 |
+| --- | --- | --- |
+| Windows Release 构建 | 0 错误 / 218 警告 | 第 4 节 |
+| Linux Release 构建 | 0 错误 / 218 警告 | 第 4 节 |
+| 适配器能按 command.json 跳页 | 通过 | 5.1 / 5.2 |
+| 越界/过期命令被拒 | 通过 | 5.2 |
+| 点卡片 → 插件日志「linux jump: 已下发第 N 页」 | 通过 | 5.3 |
+| 点卡片 → 放映页码真的变（9 → 6） | 通过 | 5.4 |
+| 新 dll 已装进宿主并加载 | 通过 | 5.6 |
+| WPS 适配器跳页 | 代码已写，未实测 | 第 6 节 |
+
+
+二、改动文件与行号
+------------------
+
+改动只涉及下面 7 个文件（6 组）；Ui/NativeOverlayCard.cs、Core/SessionEngine.cs 的 Windows 逻辑未动。
+
+1) Core/LinuxSlideSource.cs（541 行）
+   - 25 行：类注释补充「插件只读 current.json，跳页命令写 command.json」。
+   - 47 行：新增 `public static string CommandJsonPath`（排障用，暴露真实路径）。
+   - 54 行：`static readonly string commandPath = Path.Combine(dataDir, "command.json");`
+   - 233–261 行：新增 `public static bool TryWriteCommand(int page, out string error)`
+       · page<=0 → false，error=「页码必须从 1 开始（收到 N）」；
+       · ts = UTC「yyyy-MM-ddTHH:mm:ss.fffZ」；
+       · 内容 `{"page":N,"ts":"..."}`，UTF-8 无 BOM；
+       · 原子写：写 `command.json.tmp.<guid>` → `File.Move(tmp, commandPath, true)`；
+       · 任何异常 → false + `异常类型：消息`，并删临时文件，绝不抛。
+   - 458 行起：`BuildReadme()` 增加「反向通道：command.json（插件 → 适配器）」一节，
+     并在结尾注明「插件不写 current.json，只读（跳页命令写在 command.json）」。
+
+2) Services/SlideSyncService.cs（2007 行）
+   - 974–975 行：`BuildLinuxCard()` 订阅 `c.JumpRequested`（无页码时兜底）与
+     `c.JumpRequestedPage`（带页码的主路径）。
+   - 1017–1085 行：新增 `void LinuxJump(int page, string filePath, bool fromPanel)`：
+       · 读不到页码 → 卡片「还没读到页码」，日志「linux jump: 还没读到页码，忽略…」；
+       · page<=0 → 用当前页；page>total → 夹到 total（不写下注定被拒的命令）；
+       · 指定了别的课件 → 「Linux 上只能跳当前放映的课件」+ 日志拒绝，不跨课件；
+       · 成功 → 卡片「正在跳到第 N 页…」，日志 **「linux jump: 已下发第 N 页」**；
+       · 失败 → 卡片/面板「下发失败：<原因>」，日志 **「linux jump: 下发失败（<原因>）」**。
+   - 1088–1092 行：`OnLinuxJumpRequested()`（参数less 兜底事件）→ 用当前页调 LinuxJump。
+   - 1095–1098 行：`OnLinuxJumpPageRequested(int page)` → LinuxJump(page, null, false)。
+   - 1125–1126 行：`DisarmLinux` 退订两个事件。
+   - 1493–1504 行：`RequestJump(filePath, slide, fromPanel)` 的 try 开头插入
+     `if (!PlatformGuard.IsWindows) { LinuxJump(...); return; }`，
+     放在 `engine == null` 判断之前 —— 否则 Linux 上永远只回「没在上课」。
+     这样 `RequestJump(int)`、`RequestJumpTo(...)`、历史跳页、面板「立即跳转」全部走同一条 Linux 通路。
+
+3) Ui/LinuxCardWindow.cs（914 行）
+   - 70 行：新增字段 `DispatcherTimer? jumpWaitTimer;` 与 `volatile int pendingJumpPage;`。
+   - 105 行：新增 `public event Action<int>? JumpRequestedPage;`
+     （ICardSink.JumpRequested 是无参 Action，NativeOverlayCard 不能改，所以另开一个带页码的事件）。
+   - 191–211 行：`ApplyExternal` 记录 `prevPage`，页码真的变了（或跳到目标页）就
+     `FinishJumpWait()`，并清掉「正在跳…/已请求…」临时状态。
+   - 280–283 行：`Dispose()` 里停掉 jumpWaitTimer。
+   - 442–460 行：按钮 PointerReleased：page>0 → `ArmJumpWait(page)` 后发 `JumpRequestedPage(page)`；
+     page==0 → 仍发无参 `JumpRequested` 兜底。
+   - 780–801 行：`ArmJumpWait(int page)`：5 秒 DispatcherTimer；到点页码还没变就把状态行改成
+     「已请求跳到第 N 页，等放映软件响应…」，并记 `jump wait: 第 N 页 5 秒内没变化`。
+   - 803–819 行：`FinishJumpWait()` / `ClearTransientJumpStatus()`。
+
+4) tools/linux-adapters/libreoffice/slidesync_lo.py（546 行）
+   - 57–58 行：`COMMAND_NAME = "command.json"`、`COMMAND_MAX_AGE_SECONDS = 120`。
+   - 84–86 行：`command_path_for(out_path)`（与 current.json 同目录）。
+   - 89–102 行：`parse_ts(text)`，容错解析 ISO-8601（Z / 无时区 / 带毫秒）。
+   - 105–125 行：`read_command(path)`，坏 JSON / 缺字段只记日志、不崩。
+   - 341–381 行：`UnoBridge.goto_slide(doc, page)`：
+       · 1..total 边界检查；`target = pages.getByIndex(page - 1)`；
+       · 放映中 → `presentation2.getController().gotoSlide(target)`；
+       · 未放映 → `doc.getCurrentController().setCurrentPage(target)`（编辑视图也能跳）；
+       · **必须传 XDrawPage 对象**，传整数会抛 CannotConvertException。
+   - 383–430 行：`apply_command(...)`：按 (page, ts) 去重；超过 120s 视为历史命令跳过；
+       成功日志 `command: jump to N -> ok` 并立即重读页码；失败记 `command: jump to N -> fail (...)`。
+   - 492、519–520 行：watch 循环跨重连保留 `last_command_tag`，每轮先 apply_command 再写 current.json。
+
+5) tools/linux-adapters/wps/main.js
+   - 18 行：文档说明 `Application.SlideShowWindows.Item(1).View.GotoSlide(page)`（1 起，未实测）。
+   - 61–64 行：`ClassSlideSyncCommandPath()`。
+   - 201–228 行：`ClassSlideSyncReadCommand()`（Exists / readFileString / JSON.parse）。
+   - 230–296 行：`ClassSlideSyncApplyCommand(state)`：去重、120s 过期、未放映/越界给失败日志，
+       成功调用 `View.GotoSlide(page)` 并回读 `View.Slide.SlideIndex`。
+   - 311 行：`ClassSlideSyncTick()` 里先 apply_command 再算 key、写 current.json。
+
+6) README
+   - tools/linux-adapters/libreoffice/README.md：第 9 行流程图改为双向；
+     130–183 行新增「## 5. 跳页：command.json（插件 → 适配器）」；
+     196–197 行注明「跳页只在 watch 轮询模式生效，--once 不处理 command」。
+   - tools/linux-adapters/wps/README.md：18–22 行补跳页说明（标注未实测）；
+     141–143 行「已知限制」补「跳页未实测」。
+
+
+三、command.json 协议
+----------------------
+
+路径：$XDG_DATA_HOME/classslidesync/command.json，默认 ~/.local/share/classslidesync/command.json
+（和 current.json、README.txt 同目录；目录不存在时插件会建）
+
+内容（一行 JSON，UTF-8 无 BOM）：
+
+    {"page":3,"ts":"2026-10-31T08:44:21.745Z"}
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| page | int | 目标页，**从 1 开始**；1..total 之外适配器拒绝执行 |
+| ts | string | 插件写入时刻，UTC ISO-8601，带毫秒和 Z；适配器按它去重、判过期 |
+
+写入方式（插件侧，Core/LinuxSlideSource.cs:233-261）：
+    写临时文件 command.json.tmp.<guid> → File.Move(tmp, command.json, overwrite:true)
+    → 适配器任何时刻读到的都是完整文件，不会读到半个 JSON。
+    page<=0 直接拒绝；目录只读/磁盘满等写失败 → 返回 false + 原因，宿主只记日志，不影响上课。
+
+消费方式（适配器侧，slidesync_lo.py:383-430）：
+    1. 每轮轮询读 command.json；
+    2. (page, ts) 与本进程上次处理的相同 → 跳过（同一条命令只执行一次，跨重连也记得）；
+    3. ts 超过 120 秒 → 当成历史遗留，记 `command: ignore stale jump to N (X s old)`，不执行；
+    4. page 越界 → `command: jump to N -> fail (page out of range 1..total)`；
+    5. 放映中 gotoSlide(XDrawPage)，编辑视图 setCurrentPage(XDrawPage)；
+    6. 成功后**立刻**重读页码并重写 current.json（刷新 updated，避免卡片以为数据过期）；
+    7. 日志 `command: jump to N -> ok`；异常 `command: jump to N -> fail (异常: 消息)`，异常不外抛。
+
+配套的 current.json（适配器 → 插件，只读）不变：file/page/total/showing/updated/app，10 秒过期。
+两个文件互不依赖：没有 command.json 插件照常工作；没有适配器时插件写命令只会留下文件。
+
+
+四、构建
+--------
+
+Windows（仓库根目录）：
+    & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build ClassSlideSync.Plugin.csproj -c Release -t:Rebuild
+输出尾部：
+        218 个警告
+        0 个错误
+    已用时间 00:00:07.13
+（警告都是既有 nullable / Avalonia XAML 警告，本次改动没有新增警告类型。）
+
+Linux（源码同步到 /root/plugin 后）：
+    tar -C /mnt/c/Users/xzq/Documents/deepseek-harness/default-workspace/ClassSlideSync.Plugin \
+        --exclude=bin --exclude=obj -cf - . | tar -C /root/plugin -xf -
+    cd /root/plugin && dotnet build -c Release -t:Rebuild
+输出尾部：
+        218 Warning(s)
+        0 Error(s)
+    Time Elapsed 00:00:06.89
+产物：/root/plugin/bin/Release/net8.0/ClassSlideSync.Plugin.dll（487424 字节，
+md5 42445c46bc4c46094d6f53b2133c2d78）。
+
+Python 适配器：`python3 -m py_compile .../slidesync_lo.py` 通过（exit 0）。
+WPS main.js：本机与 WSL 都没有 node，只做了人工审查，未做语法/运行验证（见第 6 节）。
+
+
+五、WSL 端到端实测
+------------------
+
+环境准备（每次都要 export HOME，否则适配器默认路径会算到 Windows 的 HOME）：
+    export HOME=/root DISPLAY=:0 XDG_RUNTIME_DIR=/tmp/xdg-runtime
+    setsid soffice --impress --norestore --nologo \
+        --accept='socket,host=127.0.0.1,port=2002;urp;' \
+        /root/plugin/test/纯页码课件.pptx </dev/null >/tmp/soffice.log 2>&1 &
+    setsid /usr/bin/python3 /root/plugin/tools/linux-adapters/libreoffice/slidesync_lo.py \
+        --interval 0.5 </dev/null >/tmp/adapter.out 2>/tmp/adapter.log &
+
+适配器启动日志（第一行就确认了命令通道位置）：
+    [slidesync-lo 08:38:04] output: /root/.local/share/classslidesync/current.json
+    [slidesync-lo 08:38:04] connecting to uno:socket,host=127.0.0.1,port=2002 ...
+    [slidesync-lo 08:38:04] command in: /root/.local/share/classslidesync/command.json
+    [slidesync-lo 08:38:04] connected
+    [slidesync-lo 08:38:04] page 1/10 showing=False file=/root/plugin/test/纯页码课件.pptx
+
+5.1 用 python 把放映推到第 7 页（gotoSlide 前后 idx）
+    driver 输出：
+        before idx: 0 / 10
+        after  idx: 6 / 10          # gotoSlide(pages.getByIndex(6)) → 第 7 页
+    1 秒后适配器日志与 current.json：
+        [slidesync-lo 08:38:19] page 7/10 showing=True file=/root/plugin/test/纯页码课件.pptx
+        {"file":"/root/plugin/test/纯页码课件.pptx","page":7,"total":10,"showing":true,...}
+
+5.2 手写 command.json（page=3，ts=2026-10-31T08:38:33.991Z）→ 适配器真的翻页
+        [slidesync-lo 08:38:34] command: jump to 3 -> ok
+        [slidesync-lo 08:38:34] page 3/10 showing=True file=/root/plugin/test/纯页码课件.pptx
+    current.json 变 "page":3；独立 UNO 复查输出：
+        controller idx: 2 / 10      # 0 起索引 2 = 第 3 页；确实从第 7 页跳回第 3 页
+    边界（同一次会话）：
+        page=99 → [slidesync-lo 08:38:51] command: jump to 99 -> fail (page out of range 1..10)
+        ts=06:00:00Z page=5 →
+            [slidesync-lo 08:38:52] command: ignore stale jump to 5 (9533s old)
+        current.json 保持 page=3，没有被坏命令改掉。
+
+5.3 点卡片按钮 → 插件下发命令（新 dll 已装进宿主）
+    宿主日志（/root/ci-linux/data/Config/Plugins/ClassSlideSync.Plugin/app.log）：
+        2026-10-31 08:43:37 linux source: 纯页码课件.pptx 第 3/10 页（放映中，libreoffice）
+        2026-10-31 08:43:37 arm: Linux 页码源：检测到放映
+        2026-10-31 08:43:38 overlay: linux-avalonia window=yes created=True visible=yes scale=1 \
+            card=236x176 pos=2324,712 hidden=False side=right v=50% | \
+            deck=纯页码课件 page=3/10 showing=True hist=0
+        2026-10-31 08:44:21 linux jump: 已下发第 3 页
+        2026-10-31 08:44:26 card: [linux-card] jump wait: 第 3 页 5 秒内没变化
+    同时刻 command.json：
+        {"page":3,"ts":"2026-10-31T08:44:21.745Z"}
+    适配器执行（同一条命令幂等，因为放映本来就在第 3 页）：
+        [slidesync-lo 08:44:22] command: jump to 3 -> ok
+    08:44:26 那条 `jump wait` 是预期行为：页码本来就没变，5 秒后状态行改成「已请求跳到第 3 页，
+    等放映软件响应…」，而不是一直显示「正在跳…」。
+
+5.4 真实翻页：卡片显示第 6 页，放映已经被挪到第 9 页，点卡片 → 放映回到第 6 页
+    做法：先 SIGSTOP 适配器（让它不再刷新 current.json，卡片保持在 6），用 UNO 把放映挪到第 9 页，
+    再点卡片，然后 SIGCONT 适配器。
+    driver 输出：
+        adapter pid: 24282
+        adapter stopped; json: 6 / 10
+        show idx before card click: 5 / 10
+        show idx after uno goto index=8: 8 / 10      # 放映被人工挪到第 9 页
+        card wid: 0xc0001f
+        command.json: {'page': 6, 'ts': '2026-10-31T08:47:42.472Z'}   # 点卡片 → 插件写命令
+        adapter resumed
+        final show idx: 5 / 10                        # 放映真的被跳回第 6 页
+        final json: {... "page": 6, "total": 10, "showing": true, "updated": "2026-10-31T08:47:49Z" ...}
+    两侧日志：
+        2026-10-31 08:47:42 linux jump: 已下发第 6 页
+        2026-10-31 08:47:47 card: [linux-card] jump wait: 第 6 页 5 秒内没变化
+        [slidesync-lo 08:47:49] command: jump to 6 -> ok
+    这条是本次最关键的一条：**页码变化完全由卡片按钮触发**（9 → 6），不是手动写 json 造出来的。
+
+5.5 编辑视图（未放映）也能跳
+    结束放映后（showing=false）再点卡片：
+        [slidesync-lo 08:48:57] command: jump to 6 -> ok
+        [slidesync-lo 08:48:57] page 6/10 showing=False file=/root/plugin/test/纯页码课件.pptx
+    走的是 `setCurrentPage(XDrawPage)` 分支，同样生效。
+
+5.6 安装的 dll 与仓库构建产物一致
+    md5sum：
+        42445c46bc4c46094d6f53b2133c2d78  /root/plugin/bin/Release/net8.0/ClassSlideSync.Plugin.dll
+        42445c46bc4c46094d6f53b2133c2d78  /root/ci-linux/data/Plugins/ClassSlideSync.Plugin/ClassSlideSync.Plugin.dll
+    宿主（pid 24090）启动日志：
+        此次会话已加载插件:课件续页(ClassSlideSync.Plugin,1.2.3.0)
+    插件 app.log 里出现的是新行为（已下发第 N 页），旧版那句
+    「jump ignored (linux, read-only source)」不再出现。
+
+
+六、没做到的地方 / 已知限制
+---------------------------
+
+1) WPS 适配器跳页未实测。
+   tools/linux-adapters/wps/main.js 已按 PowerPoint 兼容对象模型加了 command.json 轮询
+   （View.GotoSlide(page)，1 起），但这台机器 Windows 侧和 WSL 侧都没有 node，也没有可用的
+   WPS Linux 环境，只做了人工审查；README 里已标注「跳页未实测」。
+   LibreOffice 那条路是实测过的。
+
+2) 适配器重启会重放最后一条命令（2 分钟内）。
+   去重状态在进程内存里（last_command_tag），进程重启后不落盘；只要 command.json 还在、
+   ts 不超过 120 秒，重启后的第一轮会再执行一次同样的跳页。对同一页来说是幂等的，
+   但如果老师重启适配器前手动翻到了别页，会被拉回命令里的那一页。取舍：不做落盘状态，
+   避免多一个需要清理的文件；120 秒窗口已经限制了影响面。
+
+3) 只能跳「当前放映的那份课件」。
+   Linux 适配器只认当前窗口里的演示文稿，换课件得老师自己打开；指定别份课件时插件直接拒绝
+   （日志「linux jump: 拒绝跨课件跳页 a.pptx -> b.pptx」，卡片提示「Linux 上只能跳当前放映的课件」）。
+
+4) 卡片自动隐藏后，页码变化不会自动把它弹回来（既有行为，本次未改）。
+   Hide() 之后 RenderNow() 只在 showOnStart && hasData && !hidden 时才 ShowWindow。
+   实测时为了在卡片还可见的窗口内点击，把 WSL 宿主里的 AutoHideSeconds 临时改成 600，
+   验证完已改回 15。
+
+5) XWayland 下卡片是否置顶取决于窗口管理器。
+   卡片自己设了 Topmost=true（Ui/LinuxCardWindow.cs:303、737），正常 GNOME/KDE 上应在全屏放映之上；
+   但在本次 WSL 的 Weston/XWayland 里，LibreOffice 全屏放映窗口有时压在卡片上，
+   合成点击会落到放映窗口（观测到幻灯片被点成下一页）。最终验证时先结束/移开放映窗口再点卡片。
+   这是测试环境的图层问题，不是插件逻辑问题，但说明「真机上卡片必须真的在最上层」这一点需要
+   在目标桌面环境里再确认一次。
+
+6) 宿主被 SIGKILL 会留下 .disabled，下次启动插件不加载。
+   本次排障时遇到：kill -9 之后 /root/ci-linux/data/Plugins/ClassSlideSync.Plugin/.disabled
+   被宿主写下，重启日志变成「此次会话没有加载插件。」；删掉 .disabled 后正常加载。
+   正常 SIGTERM 退出不会产生。这是 ClassIsland 的 AutoDisableCorruptPlugins 行为，不是插件 bug。
+
+7) 没有做的事（按要求）：没动 Ui/NativeOverlayCard.cs，没动 Core/SessionEngine.cs 的 Windows 逻辑，
+   没启动 Windows 上的 ClassIsland/WPS，没部署到 C:\Users\xzq\Desktop\github\ClassSlideSync\classisland\...，
+   没做任何 git 操作（该目录本身也不是 git 仓库）。
+
+
+七、复现步骤（WSL）
+-------------------
+
+    export HOME=/root DISPLAY=:0 XDG_RUNTIME_DIR=/tmp/xdg-runtime
+
+    # 1) 放映
+    setsid soffice --impress --norestore --nologo \
+        --accept='socket,host=127.0.0.1,port=2002;urp;' \
+        /root/plugin/test/纯页码课件.pptx </dev/null >/tmp/soffice.log 2>&1 &
+
+    # 2) 适配器（无参数 = watch 循环）
+    setsid /usr/bin/python3 /root/plugin/tools/linux-adapters/libreoffice/slidesync_lo.py \
+        </dev/null >/tmp/adapter.out 2>/tmp/adapter.log &
+
+    # 3) 用 UNO 把放映推到第 7 页
+    python3 - <<'PY'
+    import uno
+    local = uno.getComponentContext()
+    ctx = local.ServiceManager.createInstanceWithContext(
+        "com.sun.star.bridge.UnoUrlResolver", local).resolve(
+        "uno:socket,host=127.0.0.1,port=2002;urp;StarOffice.ComponentContext")
+    desktop = ctx.ServiceManager.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
+    doc = [c for c in desktop.Components if hasattr(c, "getDrawPages")][0]
+    pres = doc.getPresentation()
+    ctrl = pres.getController()
+    print("before idx:", ctrl.getCurrentSlideIndex())
+    ctrl.gotoSlide(doc.getDrawPages().getByIndex(6))
+    print("after idx:", ctrl.getCurrentSlideIndex())
+    PY
+
+    # 4) 手写一条命令，观察适配器日志与 current.json
+    python3 - <<'PY'
+    import json, os, datetime
+    d = os.path.expanduser("~/.local/share/classslidesync")
+    ts = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    p = os.path.join(d, "command.json.tmp")
+    open(p, "w").write(json.dumps({"page": 3, "ts": ts}))
+    os.replace(p, os.path.join(d, "command.json"))
+    print(ts)
+    PY
+    tail -n 3 /tmp/adapter.log      # 期望 command: jump to 3 -> ok
+    cat ~/.local/share/classslidesync/current.json   # 期望 "page":3
+
+    # 5) 插件侧：把新 dll 装进宿主
+    cp /root/plugin/bin/Release/net8.0/ClassSlideSync.Plugin.dll \
+       /root/ci-linux/data/Plugins/ClassSlideSync.Plugin/
+    # 宿主用 SIGTERM 正常退出再启动（别用 kill -9，否则会留 .disabled）：
+    cd /root/ci-linux && setsid ./app-2.1.0.1-0/ClassIsland.Desktop \
+        </dev/null >/tmp/host.out 2>&1 &
+    # 卡片出现后点按钮，日志里应出现：
+    grep 'linux jump' /root/ci-linux/data/Config/Plugins/ClassSlideSync.Plugin/app.log
+
+
+八、证据文件位置（WSL，重启后可能被覆盖）
+-----------------------------------------
+    /tmp/adapter.log      第一次适配器会话（含 08:38 手动跳页、越界、过期）
+    /tmp/adapter2.log     8 秒间隔会话（08:45、08:47 的两次点击）
+    /tmp/adapter3.log     恢复 1 秒间隔后的会话（编辑视图跳页）
+    /root/ci-linux/data/Config/Plugins/ClassSlideSync.Plugin/app.log   插件侧「已下发第 N 页」
+    /root/.local/share/classslidesync/current.json / command.json        桥文件

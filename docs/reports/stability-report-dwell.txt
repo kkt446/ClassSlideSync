@@ -1,0 +1,229 @@
+课件续页插件 · 稳定性报告（功能 1「每页停留时长」+ 功能 2「剩余时间用本次课实测速度」）
+日期：2026-10-25
+改动范围：新建 Core/PageDwell.cs；Core/PagePace.cs（只新增重载，旧签名/旧语义不动）；
+          Core/SessionEngine.cs（接线 9 处）
+未触碰：Core/Ledger.cs、Core/SyncSettings.cs、Ui/（含 NativeOverlayCard / ControlPanel.*）、
+        Automation/、Services/、ClassSlideSync.Plugin.csproj、git 历史
+操作约束遵守：未部署、未启动 ClassIsland / WPS / PPT / 希沃、未装 NuGet 包、注释全中文。
+源码备份 _backup-20261025-1232.zip 在开工前确认存在（Test-Path True）。
+
+结论
+--------------------------------------------------------------------
+1. 每页停留秒数已能按场记录、跨场累加，落盘到插件配置目录的 dwell.json，与 ledger.json 同级
+   （data\Config\Plugins\ClassSlideSync.Plugin\dwell.json）。桶键直接复用 Ledger.Key，和台账一一对应。
+2. 结构同时支持「按课件」和「按科目」聚合：DeckDwell（每份课件每页 Seconds/Visits）与
+   SubjectDwell（科目合计）。科目从台账记录里取（AddSession 的 subject 由引擎传 r.Subject）。
+3. 剩余时间改成优先用本课时实测速度（已翻页数 ÷ 已用时长），样本不足时按
+   「本次课 → 本课件历史 → 全库历史 → 60 秒/页」四级回退，并统一夹在 [8, 600] 秒/页。
+   卡片副标题「还剩 N 页 · 约 M 分钟」的公式一字未改（见断言 P43：200 组随机点与旧公式逐点一致）。
+4. 构建：dotnet build -c Release -t:Rebuild → 0 error（215 条 unique warning，全是仓库既有告警）。
+   PageDwell.cs / PagePace.cs 这次是 0 条告警；SessionEngine.cs 里剩下的 CS8618（构造函数里
+   thread/bridge/last/current/... 由 Start() 赋值）、917/930/934 的 CS8602 与 983 的 CS8625
+   都在改动前就有，不是本次接线引入的（本轮已把 tracker 改成可空、FlushDwell 改用局部快照，
+   把我自己引入的 CS8618/CS8602 消掉了）。
+5. 反射自测：209 条断言全部通过（要求 ≥40），退出码 0。
+6. 数据层没有 DPI 输入，96 / 144 两档跑同一场景输出逐字节一致（D01）。
+7. 需要别人接线的点集中在最后两节；引擎侧数据已经可以直接读（见「接线点」）。
+
+改动明细
+--------------------------------------------------------------------
+Core/PageDwell.cs（新建，779 行，namespace ClassSlideSync.Plugin.Core）
+  L19   public sealed class DwellPage            { int Seconds; int Visits; [JsonIgnore] double AverageSeconds }
+  L43   public sealed class DeckDwell            { Subject/Name/UpdatedAt/Sessions; Dictionary<int,DwellPage> Pages;
+                                                   [JsonIgnore] TotalSeconds/Visits/PageCount;
+                                                   SecondsAt(int) / VisitsAt(int) / AverageSecondsPerVisit;
+                                                   internal static int ClampInt(long) }
+  L131  public sealed class SubjectDwell         { Subject; TotalSeconds/Visits/PageCount/Decks/Sessions; List<DeckDwell> Items }
+  L173  public sealed class PageDwellTracker     // 一场课的累加器，时刻全由调用方传进来
+        L231  Begin(string key, string subject, int page, DateTime at)   // key 走 Ledger.Key 归一
+        L249  Enter(int pageNo, DateTime at)                             // 同页 no-op；换页结算上一页并 turns++
+        L271  Settle(DateTime at)                                        // 结算当前页（会话结束/中断）
+        L287  Pages / L303 PageVisits / SecondsAt(int) / CurrentSeconds(DateTime) / Turns / HasData
+  L364  public sealed class PageDwell            // 落盘层
+        L418  static PageDwell Load(string dataFolder, Action<string>? logger = null)
+        L447 / L457  AddSession(keyOrPath, subject, name, pageSeconds[, pageVisits], endedAt)   // 清洗后只改内存
+        L523  Save()        // 写 dwell.tmp → File.Replace / File.Move；失败只记 LastError + 日志，绝不抛
+        L556  Decks()       // 深拷贝，按 UpdatedAt 倒序
+        L568  Deck(keyOrPath) / L595 Subjects() / L607 static AggregateBySubject(...)
+        常量：Version=1、MaxDecks=500、MaxPagesPerDeck=1000、MaxPageSeconds=21600（6 小时）、MaxPageVisits=100000
+        落盘 JSON：camelCase、缩进、中文不转义（UnsafeRelaxedJsonEscaping，老师用记事本可读）、UTF-8 无 BOM
+        坏文件：读不动就改名 dwell.json.corrupt-yyyyMMdd-HHmmss 后空起，引擎不受影响
+
+Core/PagePace.cs（138 行，旧内容一字未改，只在后面加）
+  L38   public const int MinSessionPages = 3;      L39  public const int MinSessionSeconds = 60;
+  L45   public static double SecondsPerPage(IList<SessionRecord> deck, IList<SessionRecord> all)   // 旧签名，转调新重载
+  L58   public static double SecondsPerPage(IList<SessionRecord> deck, IList<SessionRecord> all,
+                                            int sessionPages, double sessionSeconds)               // 新：四级回退 + 夹取
+  L73   public static double SessionSecondsPerPage(int pages, double seconds)  // 样本可信才返回秒/页，否则 -1
+        L75 if (pages < MinSessionPages) return -1;
+        L77 if (seconds < MinSessionSeconds) return -1;      // 还有 NaN/Infinity/<=0 的守卫
+  L87   public static double ClampSecondsPerPage(double v)      // NaN/<=0 → 0；<8 → 8；>600 → 600
+  Remaining(bool,int,int,double,out int,out int) 与 Average(...) 未改动 —— 卡片显示口径由此保持不变。
+
+Core/SessionEngine.cs（1746 行，9 处；别的 agent 还在改此文件，合并后行号可能再漂）
+  L209  readonly PageDwell dwell;                  // 页停留落盘层，整个引擎一个
+  L215  PageDwellTracker? tracker;                 // 本场累加器；会话结束置 null
+  L223  volatile SessionSample sessionSample = SessionSample.Empty;   // 本场实测速度快照（跨线程读）
+  L266  this.dwell = PageDwell.Load(ledger.Root, ledger.Log);         // 与 ledger.json 同目录、同一个日志
+  L315  public PageDwell Dwell { get { return dwell; } }              // 对外只读入口（面板/卡片接线用）
+  L795  BeginSession：L873 tracker.Begin(current.FilePath, current.Subject, startSlide, startAt); sessionSample = Empty;
+  L898  Advance：L923 var now = DateTime.Now; L924 tracker.Enter(snap.Current, now); L926 UpdateSessionSample(now);
+                 同一拍的 EndedAt/Seconds 也改用 now（原来又取一次 DateTime.Now，两处会差几毫秒）
+  L942  EndSession：L964 FlushDwell(current, now)（在 Commit 之后，仍在 RecordLedger 条件内）
+                 L975-976 tracker = null; sessionSample = SessionSample.Empty;
+  L1036 void FlushDwell(SessionRecord r, DateTime now)（开头 L1038 var t = tracker; 之后全用 t）
+                 tracker.Settle(now) → pages.Count==0 就返回（不写空壳）→
+                 dwell.AddSession(r.FilePath, r.Subject, FileLabel(r.FilePath), pages, tracker.PageVisits, now) →
+                 dwell.Save()；成功 Log("dwell recorded: <文件> N pages Ns")，失败 Log("dwell save failed: ...")，
+                 整段 try/catch 兜住（Log("dwell flush failed: ...")），绝不影响台账落盘与引擎循环。
+  L1067 void UpdateSessionSample(DateTime now)
+                 elapsed = max(0, (now - startAt).TotalSeconds)；turns = tracker?.Turns ?? 0；
+                 sessionSample = new SessionSample { Turns, Seconds = elapsed, Sample = PagePace.SessionSecondsPerPage(turns, elapsed) }
+  L1387 sealed class SessionSample { Turns; Seconds; Sample = -1; static Empty }
+  L1445 double SecondsPerPage()
+                 v = sessionSample.Sample；v<=0 → pace.DeckSeconds；v<=0 → pace.AllSeconds；
+                 v<=0 → PagePace.DefaultSecondsPerPage；最后统一 PagePace.ClampSecondsPerPage(v)
+                 新增 SessionSecondsPerPage(turns, elapsed) 已经做过夹取，这里再夹一次是幂等的
+                 （历史均值分支原来没夹取，现在也一并夹住，避免脏台账把预计时间算成几小时）
+
+dwell.json 数据格式（真实样例，来自自测会话）
+--------------------------------------------------------------------
+{
+  "version": 1,
+  "decks": {
+    "c:\\users\\xzq\\documents\\课件\\第一课.pptx": {
+      "subject": "数学",
+      "name": "第一课.pptx",
+      "updatedAt": "2026-10-25 12:48:36",
+      "sessions": 3,
+      "pages": {
+        "1": { "seconds": 95,  "visits": 2 },
+        "2": { "seconds": 130, "visits": 1 },
+        "3": { "seconds": 40,  "visits": 3 }
+      }
+    }
+  }
+}
+字段说明
+  version    结构版本，将来改格式时用；读到更高版本也不会崩，按已有字段尽力解析
+  decks      键 = Ledger.Key(课件路径)：全路径、去尾反斜杠、全小写；希沃伪键（SeewoBridge.KeyPrefix）
+             原样小写。与 ledger.json 的桶键完全一致，所以两张表可以直接对 key 关联。
+  subject    最近一次记录的科目（空科目不覆盖旧值），用于「按科目聚合」
+  name       显示名，取台账的 FileLabel / 原始路径文件名（保留原大小写，不转小写）
+  updatedAt  "yyyy-MM-dd HH:mm:ss"，最近一次写入时间；Decks() 按它倒序
+  sessions   这份课件被记录过几场
+  pages      页码 → { seconds 累计停留秒数（四舍五入到整秒）, visits 结算次数 }
+             同一页来回翻，seconds 和 visits 都累加；95 秒 / 2 次 → 平均一次 47.5 秒
+聚合 API
+  PageDwell.Decks()            每份课件一行，带 Pages（深拷贝，随便改不影响内部）
+  PageDwell.Deck(pathOrKey)    单份课件；没有就 null
+  PageDwell.Subjects()         按科目聚合：TotalSeconds 降序、同秒按科目名；空科目归「未标注科目」
+                               （CardFileGroups.Unmarked，和课件库分组同一套叫法）
+  PageDwell.AggregateBySubject(IEnumerable<DeckDwell>)   纯函数版，便于面板自己组合
+上限与清洗（写入侧 + 读取侧各做一遍）
+  页号 <= 0、秒数 <= 0 直接丢；单页秒数夹到 21600；visits 夹到 100000；
+  单份课件最多 1000 页、最多 500 份课件（超了丢最久没用的那份）；
+  空科目不覆盖已有科目；空名字才用文件名兜底；坏 JSON 改名后空起。
+
+剩余时间：四级回退链（功能 2）
+--------------------------------------------------------------------
+1. 本次课实测：turns >= 3 且 elapsed >= 60 秒时，用 elapsed / turns。
+   turns 是「页面真的变了」的次数（同一页的重复快照不算），所以 2 → 30 的跳页只算 1 次，
+   不会把速度虚算成几秒/页；往回翻一页再翻回来算 2 次。
+2. 本课件历史均值：PagePace.Average(ledger.Recent(key, 200))，只统计 EndSlide > StartSlide 的记录。
+3. 全库历史均值：本课件没数据时才扫。
+4. 兜底 60 秒/页。
+四条路的结果最后都过 ClampSecondsPerPage：[8, 600]。
+卡片副标题仍走 PagePace.Remaining(isShowing, slideCount, current, secondsPerPage, out pages, out minutes)，
+公式（ceil(left*秒/60)，不足 1 分钟按 1 分钟）与改动前逐点一致。
+
+自测方法与证据链
+--------------------------------------------------------------------
+harness：C:\Users\xzq\AppData\Local\Temp\page-dwell\harness\（PageDwellHarness.csproj + Program.cs）
+  构建：& 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build "…\PageDwellHarness.csproj" -c Release
+  运行：& 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' "…\bin\Release\net8.0-windows\PageDwellHarness.dll"
+  结果同时写到 C:\Users\xzq\AppData\Local\Temp\page-dwell\result.txt（total=209 / failed=0）
+做法：强类型引用插件 dll + 反射读私有字段/调私有方法（Assembly.LoadFrom 后按名字 GetType，
+      不能 GetTypes() 全扫 —— 宿主提供的 ClassIsland.Core / Avalonia.* 不在插件输出目录）。
+      插件 deps.json 用来自建 AssemblyResolve，System.Text.Json / Encodings.Web / IO.Pipelines 9.0.2 随 harness 带上。
+      每个用例都在 %TEMP%\page-dwell\data\<随机> 下新建数据目录，互不干扰。
+分组（源码里 212 处断言，本次场景 209 条执行，3 条依赖前置数据的被跳过）
+  T 40 条 累加器：单页 / 多页 / 跳页 / 回翻 / 同一页来回 / Settle / 重复 Settle / 时钟回拨 /
+          负页号 / 页号 0 / Turns 语义 / HasData / 总量与逐页一致性
+  S 74 条 落盘：首写 / 重读 / 跨场累加 / 桶键归一（大小写、尾斜杠）/ 脏数据 / 上限 / 深拷贝 /
+          坏文件改名 / 原子写不留 tmp / camelCase / 不泄露绝对路径 / 按科目聚合（含空科目归组、排序）/
+          Save 失败只记 LastError 不抛
+  P 48 条 速度：四级回退链、夹取上下限、NaN/Infinity/负数/页数不足/时长不足、
+          旧签名等价于无样本、Average 只认真翻了页的记录、Remaining 与旧公式 200 组随机点一致
+  E 47 条 引擎接线：开课建累加器、翻页累计、本次课速度生效（E13/E14）、卡片剩余页/分钟、
+          停课 flush 落盘、台账与 dwell 同科目、停课后样本复位、历史回退（E33/E34）、
+          中断（EndSession(0)）也 flush、脏快照（页号 0）不写第 0 页、同页重复快照 Turns 仍 0、
+          换课件时旧课件先 flush 再开新场
+  D 3 条  96 / 144 DPI：同一场景两档输出逐字节相同
+关键证据（引擎日志，真实运行产物）
+  dwell recorded: 课件A.pptx 4 pages 4s
+  dwell recorded: 中断.pptx 2 pages 2s
+  dwell recorded: 旧.pptx 2 pages 2s
+  → 第 3/4/5/6 页各有停留；中断场也落了 dwell；换课件时先结算旧课件。
+注：上面的日志里「4 pages」指 4 页有有效停留，与台账那条记录的页码区间对得上。
+
+过程中发现并处理的问题
+--------------------------------------------------------------------
+1. 累加器桶键原来存原样路径（C:\课程\第一课.pptx），台账是 c:\课程\第一课.pptx →
+   同一份课件会在 dwell.json 里被拆成两条。已改为 Begin 里走 Ledger.Key 归一（断言 T02/E04）。
+2. 显示名兜底原来用归一后的 key，会把「课件A.pptx」写成「课件a.pptx」。改成用原始路径取文件名（S07/E31）。
+3. 写入实测速度时，Advance 里两次 DateTime.Now 会差几毫秒（EndedAt 与 Seconds 不一致）。统一成一个 now。
+4. 历史均值分支原来没夹取，脏台账（比如 1 秒/页）会把剩余时间算成「约 1 分钟」。现在统一夹 [8,600]。
+5. harness 侧：System.Text.Json 9.0.2 依赖 System.IO.Pipelines 9.0，缺了会让 Save 在序列化阶段失败
+   （只记 LastError、不落盘）。已在 harness 补引用 —— 结论是插件的失败兜底确实生效了（没崩、只少一份统计）。
+6. 自测里最初把累加器时长写成「微秒级」翻页，导致整场都是 0 秒被丢掉；加了真实等待后恢复正常。
+   这条也说明设计取舍：单页停留不足 0.5 秒会被四舍五入成 0 而不记录（当作噪音，不污染平均值）。
+
+需要别人接线的点（我按约定没有碰这些文件）
+--------------------------------------------------------------------
+A. 面板/卡片要显示「每页停留」时，直接读 SessionEngine 的只读入口：
+     SlideSyncService.Engine?  ——注意：服务里引擎实例的字段名请按 Services/SlideSyncService.cs 现状取；
+     只要能拿到 SessionEngine，就有 engine.Dwell（PageDwell）。
+   或完全绕开引擎：PageDwell.Load(settings.DataFolder)（构造不会抛，读不到就是空表）。
+   常用三行：
+     var dw = PageDwell.Load(settings.DataFolder);
+     foreach (var d in dw.Decks())            // 按课件，最近用过的在前
+         foreach (var p in d.Pages)           // 页码 → { Seconds, Visits }
+     foreach (var s in dw.Subjects())         // 按科目，停留最久的在前
+   注意：这些返回的是快照（深拷贝），不是活对象；每次要最新数据就重新调。
+B. 卡片副标题不需要改任何代码：Remaining/公式没动，数据源已经换成实测速度。
+   若面板想额外显示「本课时实测 X 秒/页」，目前没有公开属性 —— 现在 SecondsPerPage() 是私有；
+   需要的话加一行 public double CurrentSecondsPerPage { get { return SecondsPerPage(); } } 即可，
+   我没有加，避免和正在改 Ui/ 的 agent 冲突。
+C. 写入时机与条件（如果面板要「立即看到」，得知道这个）：
+   dwell.json 只在「会话结束」和「换课件」时落盘（跟台账同一时刻），放映中不逐拍写盘。
+   且受两条既有开关约束：settings.RecordLedger 打开、且本场 Seconds >= settings.MinSessionSeconds。
+   所以打开一下就关的课件不会留下每页停留 —— 与台账「太短不算一节课」的规矩保持一致（有意为之）。
+   进程被强杀会丢掉当前这一场未落盘的部分（不做增量写，避免每拍 IO 抖动）。
+D. 键空间：dwell.json 的 key 与 ledger.json 完全一致（Ledger.Key）。面板要把台账记录和停留记录对上，
+   用 Ledger.Key(record.FilePath) 查 PageDwell.Deck(key) 即可；不要用原样路径查（大小写敏感会查不到）。
+E. 上限：500 份课件 / 每份 1000 页。要是以后课件数超了，丢的是「最久没用」的那份（按 updatedAt），
+   面板如果做「全部课件」列表要注意这一点。
+
+遗留问题
+--------------------------------------------------------------------
+1. dwell.json 目前没有保留期清理（台账的 Prune 是按天删记录）。数据量很小（KB 级），暂不处理；
+   若以后要跟 Prune 一起清，需要在 PageDwell 里加一个按 updatedAt 的 Prune。
+2. 单页停留 < 0.5 秒记 0（噪音过滤）是刻意的，但「老师飞快过一遍 PPT」这种场景会得到一份很稀疏的 dwell。
+3. 还没做真实宿主验证（按约定没启动 ClassIsland / WPS / PPT）。数据层与接线由反射 harness 覆盖，
+   真机上需要确认的是：PluginConfigFolder 下确实生成 dwell.json、且引擎 250ms 循环里没有额外 IO 抖动
+   （写盘只在会话结束，正常一节课一次）。
+4. 本次没有改 Ledger.cs / SyncSettings.cs / Ui/ / Automation/ / Services/；与并发改动这些文件的 agent
+   不存在文本冲突，但合并后请重跑一次构建（我最后一次 Rebuild：0 error）。
+5. Core/SessionEngine.cs 在我收尾时仍被别的 agent 改动（我改完是 1698 行，收尾复核已到 1746 行）。
+   我的 9 处接线全部在位（逐处 grep 过，见上面行号表），但合并后行号会继续漂，
+   定位请按代码内容（搜索 PageDwell / tracker / sessionSample / FlushDwell）而不是按行号。
+   每次合并后建议照旧跑一次：Rebuild → 重建 harness → 跑 harness（结果看 %TEMP%\page-dwell\result.txt）。
+
+断言统计
+--------------------------------------------------------------------
+  harness 源码断言数：212（T40 / S74 / P48 / E47 / D3）
+  本次执行断言数：209
+  通过：209
+  失败：0
+  退出码：0

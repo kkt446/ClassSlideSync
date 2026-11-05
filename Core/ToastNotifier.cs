@@ -136,31 +136,14 @@ namespace ClassSlideSync.Plugin.Core
                         return false;
                     }
 
-                    if (!RunHelper("--title " + QuoteArg(title) + " --body " + QuoteArg(body)
-                                   + " --log " + QuoteArg(_helperLogPath), 8000, out int code))
-                    {
-                        Interlocked.Increment(ref _failures);
-                        QuietLog("横幅：helper 超时/启动失败，用托盘气泡");
-                        return false;
-                    }
-
-                    if (code == 0)
-                    {
-                        Volatile.Write(ref _failures, 0);
-                        return true;
-                    }
-
-                    Interlocked.Increment(ref _failures);
-                    if (code == 31)
-                    {
-                        // 系统的「通知」总开关被关了：横幅永远不会出现，直接退托盘气泡更靠谱。
-                        QuietLog("横幅：系统通知被关掉了（helper exit=31），用托盘气泡");
-                    }
-                    else
-                    {
-                        QuietLog("横幅：helper 失败 exit=" + code + "，用托盘气泡（详见 " + _helperLogPath + "）");
-                    }
-                    return false;
+                    // 2026-11-05 审计 A03：这里原来在调用线程上同步 WaitForExit(8000)。Show 会被
+                    // 下课提醒（服务层 System.Threading.Timer）和引擎计时器调用，一次同步等 8 秒
+                    // 会把调度线程整个钉住，下课那一下的其它 tick 全被吞掉。改成后台跑、先乐观返回 true：
+                    // 真正失败时下一次会由 _failures 计数与 IsReady 城门回落到托盘气泡。
+                    string args = "--title " + QuoteArg(title) + " --body " + QuoteArg(body)
+                                  + " --log " + QuoteArg(_helperLogPath);
+                    Task.Run(() => ShowAsync(args));
+                    return true;
                 }
                 catch (Exception ex)
                 {
@@ -168,6 +151,35 @@ namespace ClassSlideSync.Plugin.Core
                     QuietLog("横幅：异常（忽略）：" + ex.Message);
                     return false;
                 }
+            }
+        }
+
+        /// <summary>后台真正跑 helper，结果只用于日志与失败计数，不再阻塞任何调度线程。</summary>
+        static void ShowAsync(string args)
+        {
+            try
+            {
+                int code;
+                if (RunHelper(args, 8000, out code) && code == 0)
+                {
+                    Volatile.Write(ref _failures, 0);
+                    return;
+                }
+                Interlocked.Increment(ref _failures);
+                if (code == 31)
+                {
+                    // 系统的「通知」总开关被关了：横幅永远不会出现，下次直接退托盘气泡更靠谱。
+                    QuietLog("横幅：系统通知被关掉了（helper exit=31），下次改用托盘气泡");
+                }
+                else
+                {
+                    QuietLog("横幅：helper 失败 exit=" + code + "（详见 " + _helperLogPath + "）");
+                }
+            }
+            catch (Exception ex)
+            {
+                Interlocked.Increment(ref _failures);
+                QuietLog("横幅：异步发送异常（忽略）：" + ex.Message);
             }
         }
 

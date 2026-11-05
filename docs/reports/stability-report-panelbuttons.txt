@@ -1,0 +1,109 @@
+课件续页 · 控制面板「立即跳转 / 打开文件夹」无反应修复报告
+日期：2026-10-31        插件版本：manifest.yml 1.2.2.0（未改）
+仓库：C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin
+
+一、根因（文件:行 + 改前代码）
+
+1)「打开文件夹」完全不弹：路径用了给左栏看的省略串
+   Ui\ControlPanel.axaml.cs  OnOpenFolderClick（改前约 946 行）第一行：
+       var folder = selectedRow?.Item.Folder;
+   Item.Folder 来自 Core\CardFileList.cs 的 FolderOf()，是显示用的省略路径
+   （形如 "…\panel-buttons\media"，永远带 "…\"），不是真实目录。
+   因此 Directory.Exists(folder) 恒为 false，方法只提示
+   “文件夹不在了，可能已被移动或删除：…” 就 return，openFolder 委托一次都没调用
+   → 服务/宿主收不到目录，explorer 永远不弹。
+   修复前 harness 实测： opens=0 folder='' hint='文件夹不在了，可能已被移动或删除：…\panel-buttons\media'
+
+2)「立即跳转」请求被服务静默吃掉：未上课时 engine == null 直接 return
+   Services\SlideSyncService.cs  RequestJump(string, int)（改前约 999 行）：
+       var e = engine;
+       if (e == null) return;
+   engine 只在 Arm()（开始上课/放映）里创建，Disarm() 时置 null
+   （SlideSyncService.cs:581/630/650 创建，679/689 置空）。
+   没在上课时点跳转：无日志、无提示、无任何动作。
+   面板 OnJumpClick 又在调用后写“已请求跳到第 N 页”，看起来像成功，实际引擎没收到。
+   真机 app.log（ClassIsland\data\Config\Plugins\ClassSlideSync.Plugin\app.log）
+   10-25 13:08 以后只有 panel: opened，没有任何 panel: jump 行，与此一致。
+
+3) 次要静默点
+   - Select（改前）按 selectedPage > 0 / item.Folder 非空置灰两个按钮；
+     RefreshSelectedDetail 也会把 JumpButton 重新置灰。点灰按钮零反馈，和“按钮坏了”同感。
+   - RequestJump（面板）在 JumpRequested == null 时直接 return，没有提示。
+   - 希沃伪键（希沃:课程名）在面板被提前拦成“没法自动跳页”，没走引擎的 SeewoBridge.GotoSlide；
+     拿伪键去 Process.Start / Navigate 必然失败。
+   - 文件被移走时没有统一提示。
+
+二、改动（只动了两个允许的文件；ControlPanel.axaml 未改，Click 绑定本来就正确）
+
+Ui\ControlPanel.axaml.cs
+  :305  RefreshSelectedDetail 不再置灰 JumpButton（选中即可点）
+  :454-477  Select：两按钮一律 IsEnabled = true；ClearSelection 仍置灰
+  :681-689  新增 public void ShowStatus(string?)：服务从任意线程回写状态条（内部 Post 到 UI 线程）
+  :937-946  OnHistoryRowPressed 点历史行也启用 JumpButton 后走 RequestJump
+  :963-1006 重写 OnOpenFolderClick：RealFolderOf 取真实目录（Path.GetDirectoryName → GetFullPath）；
+            希沃/无目录 → “希沃课件没有本机文件夹…/这份课件没有可打开的文件夹…”；
+            目录不存在 → 日志 open folder missing + “找不到这份课件的文件夹，可能已被移动：…”；
+            委托为空 → “打开文件夹的通道没接上（插件服务还没就绪）…”；
+            成功 → 日志 “open folder <目录>”，先 “正在打开文件夹…”，异常也有提示
+  :1008-1020 新增 RealFolderOf()（希沃伪键/裸文件名返回空串，不抛）
+  :1027-1067 重写 RequestJump(panel 统一入口)：页码<=0、路径空、委托空、非希沃且文件不存在
+            分别给可读提示；否则日志 “jump -> <文件> 第 N 页” + “正在跳转…” + handler；
+            希沃伪键不再拦，交给引擎
+  :1069-1077 OnJumpClick：无选中提示；其余走 RequestJump
+
+Services\SlideSyncService.cs
+  :74/76     新增 panelJumpAt（面板跳转计时，20 秒窗口）
+  :949-954   OnPanelJumpRequested → RequestJump(filePath, slide, true)（沿用既有引擎通道）
+  :960-1005  重写 OpenPanelFolder：空/目录不存在/成功/异常都写 app.log 并回写面板状态条；
+            IUriNavigationService 优先，失败回退 ShellExecute；
+            成功 “panel folder: opened <目录>”，目录没了 “panel folder: missing <目录>”
+  :1026-1082 重写 RequestJump(filePath, slide, fromPanel)：
+            engine == null 时不再 return —— 日志 “panel: jump -> … 第 N 页（未上课，引擎未启动）”
+            + 面板提示“现在没在上课，课件还没打开；开始上课后再点「立即跳转」”；
+            成功日志 “panel: jump -> <文件> 第 N 页”，调 e.RequestJumpTo(file, slide)，
+            只回“正在跳转…”，不提前报成功
+  :1084-1108 OnStateChanged 在 20 秒窗口内把引擎最终状态回写面板（已跳到第 N 页 / 打不开 PowerPoint 等），
+            并记 “panel: jump result -> …”
+
+未改：Core\PanelData.cs、Core\Ledger.cs、Core\SyncSettings.cs、Views\SettingsPages\*、
+      manifest.yml、*.csproj。未部署、未启动 ClassIsland/WPS/希沃、未加 NuGet、未动 git。
+
+三、构建
+
+命令（本机无系统级 SDK，用本地 8.0.419）：
+  & "C:\Users\xzq\.dotnet-sdk8\dotnet.exe" build ClassSlideSync.Plugin.csproj -c Release -t:Rebuild
+结果：0 个错误，216 个警告（均为仓库既有可空性/XAML 警告），耗时约 4.8 秒。
+产物：bin\Release\net8.0-windows\ClassSlideSync.Plugin.dll
+
+四、自测（临时 harness，引用构建出的 dll，反射构造 ControlPanel 窗口）
+
+位置：%TEMP%\panel-buttons（PanelButtons.csproj + Program.cs；Avalonia 11.3.17 + FluentAvaloniaUI 2.4.1，
+      ClassIsland.Core/Shared 2.1.0.1 仅作引用以便加载插件类型；未改插件工程）。
+结果：34 条断言，0 失败。分组：
+  1. 有记录的真实课件（16）：两按钮可用、详情可见、自动带出上次页码 9；
+     按钮中心命中测试确认落在 JumpButton 上（不是被遮挡）；
+     点击后跳页委托收到 1 次、文件正确、页码 9、状态条立刻“正在跳转…”、不再先报假成功；
+     app.log 出现 “panel: jump -> … 第 9 页”；
+     打开文件夹委托收到 1 次、目录是真实的 …\panel-buttons\media（不是 “…” 省略串）、
+     目录存在、状态条有反馈、app.log 出现 “panel: open folder …”。
+  2. 文件/目录不存在 + 希沃伪键（9）：文件不存在不发跳页、有可读提示、不写假成功；
+     目录不存在时“打开文件夹”说明找不到；希沃行跳转仍交给引擎（jumps=1, 希沃:白板课件, 第 15 页，
+     引擎侧按 SeewoBridge.GotoSlide 处理）且不崩；希沃行“打开文件夹”说明没有本机目录。
+  3. 未接服务（2）：跳页/开文件夹都提示“没接上…链路…”，不崩。
+  4. 未选课件（2）：按钮置灰、详情区隐藏。
+  5. 服务层（4）：engine==null 时状态条“现在没在上课…”且 app.log 有 panel: jump 行；
+     服务打开不存在的目录 → 提示 + app.log “panel folder: missing”。
+  6. ShowStatus 跨线程（1）：后台线程回写状态条成功显示。
+
+说明：Win32 注入鼠标点击在本会话因面板抢不到前台未生效（仅诊断，未计入断言）；
+      命中测试 + RaiseEvent 已证明点击确实落在按钮上并走完整处理链。
+
+五、现在点这两个按钮会发生什么
+
+1. 选中一份有记录的课件点「立即跳转」：面板立刻显示“正在跳转…”，app.log 记
+   “panel: jump -> <文件> 第 N 页”；上课中经 SessionEngine.RequestJumpTo 让 PPT/WPS 翻到第 N 页
+   （希沃仍走 SeewoBridge.GotoSlide），引擎的最终结果（已跳到第 N 页/打不开 PowerPoint 等）再回写状态条；
+   没上课则明确提示“现在没在上课…”，文件被移走则提示“找不到这份课件的文件…”，不会再静默。
+2. 点「打开文件夹」：用真实文件目录（不再用 “…” 省略路径）经 IUriNavigationService/ShellExecute
+   打开 explorer，app.log 记 “panel: open folder <目录>”，成功提示“已打开文件夹：…”；
+   目录被移走提示“找不到这份课件的文件夹，可能已被移动：…”，希沃行提示“希沃课件没有本机文件夹，台账里只有课件名”。

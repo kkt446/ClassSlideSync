@@ -1,0 +1,250 @@
+课件续页 · 自动化层 + 控制面板数据层 审查与修复报告
+=========================================================
+范围：Automation\Actions.cs、Automation\Rules.cs、Automation\UnfinishedDecks.cs、
+      Core\PanelData.cs、Core\LedgerCsv.cs、Ui\PanelRows.cs
+（Ui\ControlPanel.axaml(.cs)、Ui\NativeOverlayCard.cs 由其他 agent 在改，本报告只读不动）
+
+依据：https://docs.classisland.tech/dev/（自动化按官方 /dev/ruleset/ 口径；/dev/automation/ 是 404，未照抄）
+约束遵守：未启动 ClassIsland / WPS / PowerPoint / 希沃；未部署；未动 git；未加 NuGet。
+
+结论
+---------------------------------------------------------
+修掉 12 个真 bug（其中 1 个在审查时已被并发修改修好，我补回归测试锁定）。
+每个修复都有反射回归测试覆盖，共 131 条断言全部通过（不启动宿主）。
+仓库 Release / Rebuild：0 error；warning 去重后 197 条（基线 200，未增加），
+其中来自本报告 6 个文件的 warning 为 0 条。
+
+一、修复清单
+---------------------------------------------------------
+
+BUG-01 PendingJump 轮询的线程生命周期（句柄泄漏 + 假日志 + 取消后仍可能跳页）
+  现象：每触发一次「打开上次未讲完的课件」，进程就多留一个 CancellationTokenSource；
+        连续触发时，被顶掉的那次仍会在 app.log 里写“等了 120 秒没识别到…放弃跳页”，
+        日志与事实相反；极端时序下被顶掉的任务还能在取消后多跳一次页。
+  根因：Automation\Actions.cs:198-297（PendingJump）
+        · Arm 里 `current?.Cancel()` 之后从不 Dispose 旧 CTS（Actions.cs:219），
+          而 Watch 用了 token.WaitHandle（惰性分配内核事件），每个 CTS 都带一个句柄
+          → 每次触发泄漏一个内核句柄，长期上课会累积。
+        · Watch 只在循环头检查 token（Actions.cs:238），RequestJumpTo（Actions.cs:253）
+          之前不复查，取消与跳页之间是一个可被踩进去的窗口。
+        · 循环退出后无条件写超时日志（Actions.cs:267-272），分不清“超时”与“被新的请求顶掉”。
+        · 任务收尾后 current 不清空，字段一直挂着已结束的 CTS。
+  修法：Actions.cs:205-226 Arm 改为“锁内只换引用、锁外只 Cancel 不 Dispose”；
+        Actions.cs:228 Watch 改收 CancellationTokenSource，整个循环包 try/finally
+        （Actions.cs:277-286），finally 里 `if (ReferenceEquals(current, cts)) current = null`
+        再 Dispose 自己的 cts（谁创建谁释放，不跨线程释放正在 WaitOne 的句柄）；
+        Actions.cs:250 在 RequestJumpTo 之前复查取消；
+        Actions.cs:267-275 只在 !IsCancellationRequested 时才写超时日志。
+  证明：反射测试「轮询超时常量：120 秒」「Arm 之后有等待中的任务」
+        「第二次 Arm 换掉了旧的等待」「被顶掉的旧任务收到取消」
+        「旧任务的 CTS 被释放（不再泄漏 WaitHandle 句柄）」（Dispose 后访问 cts.Token 抛出
+        ObjectDisposedException 作为判据）「任务收尾后 current 被清空」
+        「当前任务的 CTS 也被释放」「Arm(slide=0)/Arm(空路径)/Arm(service=null) 不启动轮询」。
+
+BUG-02 自动化打开课件没有连点护栏（8 秒内重复开同一份）
+  现象：自动化动作被点两下，或规则抖动连续触发时，会 Process.Start 两次同一份课件，
+        开两个演示实例，第二个把第一个的放映顶掉（老师的翻页就白按了）。
+  根因：Automation\Actions.cs:40-105 OpenInBackground 直接 Process.Start（Actions.cs:77），
+        与卡片按钮走的 SlideSyncService.OnOpenDeckRequested 不同——后者有 8 秒同路径护栏，
+        自动化这条路径完全没有。
+  修法：新增 internal static class OpenThrottle（Actions.cs:121-160）：
+        RepeatGuardSeconds = 8（与卡片按钮口径一致），IsRepeat(key, nowUtc)（Actions.cs:135）
+        在 8 秒内同一 key 返回 true，并且**不刷新计时**（否则连点会无限续期）；
+        时钟回拨（nowUtc < lastUtc）不判重复而是重新计时。
+        OpenInBackground 在 Process.Start 之前用 Ledger.Key(path) 问一次（Actions.cs:67），
+        命中就写“8 秒内已经打开过同一份课件，忽略这次重复触发”并返回。
+  证明：「8 秒护栏」11 条：首次不重复、0 秒拦、7.9 秒拦、正好 8 秒放行、8 秒后按新起点重计时、
+        不同课件互不影响、空 key 永不算重复、时钟回拨不误判、常量与卡片按钮一致（=8）。
+
+BUG-03 EndSlide=0 的坏记录会让日志说谎（“待跳第 0 页”）
+  现象：台账里 EndSlide=0 / 负数的记录被“打开上次未讲完的课件”选中时，
+        app.log 写“待跳第 0 页”，但实际不会跳页——日志与行为不一致，排查时被误导。
+  根因：Automation\Actions.cs:85-96 直接拿 record.EndSlide 拼日志并调 PendingJump.Arm，
+        而 Arm 见到 slide<=0 会立刻 return（Actions.cs:205 起）。
+        Automation\UnfinishedDecks.cs:25 的注释还说“EndSlide=0 的坏记录由行动那边跳过”，
+        实现里并没有跳过。
+  修法：新增 UnfinishedDecks.JumpPage(record)（UnfinishedDecks.cs:35-39，
+        EndSlide>0 ? EndSlide : 0）；Actions.cs:85-96 改为 slide<=0 时只记
+        “记录里没有可用页码（EndSlide=…），只打开不跳页”并 return，不再调 Arm；
+        IsUnfinished 的注释同步改成真实行为（UnfinishedDecks.cs:23）。
+  证明：「JumpPage(EndSlide=0) → 0」「JumpPage(EndSlide=-3) → 0」「JumpPage(12) → 12」
+        「IsUnfinished：EndSlide=0 且知道总页数 → 算没讲完（规则口径原样）」。
+
+BUG-04 Action 的后台任务没有异常出口（一次异常就永久静默）
+  现象：自动化动作偶发“什么都没发生”，app.log 里也没有任何记录。
+  根因：Automation\Actions.cs:36 `Task.Run(OpenInBackground)`，而 OpenInBackground 内部
+        的台账遍历 / File.Exists / Process.Start 都没有 try/catch；
+        Task 上未观察的异常被 GC 时静默丢弃，宿主和日志都看不到。
+  修法：Actions.cs:48-104 整段包 try/catch，catch 里写
+        “automation: 打开未讲完课件时出错 ” + ex.Message 到台账日志。
+  证明：代码级（try 覆盖 NewestUnfinished / ResolveExistingFile / 护栏 / Process.Start / Arm 全程），
+        配合 BUG-05 的台账读取改造降低触发面；反射测试「规则：台账为 null → 不成立（安静返回）」
+        「NewestRecord(null) → null」覆盖同族“拿不到服务/没有台账就安静返回”的路径。
+
+BUG-05 “最近一条”用 StartedAt 字符串序比较，混排日期格式时选错记录
+  现象：同一份课件的台账里既有 “2026/9/8 10:00:00” 又有 “2026-09-30 09:00:00” 时，
+        规则「上次课件没讲完」和行动「打开上次未讲完的课件」会认错“最近一条”：
+        前者按字符串比较会认为 9/8 更新（'/' 的码位大于 '-'），于是把早已讲完的旧课当最新，
+        规则该成立时不成立；行动也可能打开更旧、或与规则判定不一致的那份。
+  根因：Automation\Rules.cs:37 原来调 ledger.Newest()，Ledger.Newest（Core\Ledger.cs:306-324）
+        用 string.CompareOrdinal(r.StartedAt) 排序；UnfinishedDecks.NewestUnfinished 同样如此。
+        而 Core\CardFileList.cs 的 CompareDesc 早就改成解析后的时间，并注释说明
+        “纯字符串比较会把 2026/9/8 排到 2026/10/1 后面”——口径不统一。
+  修法：UnfinishedDecks.cs 新增 NewestRecord(ledger)（:68-84）、IsNewer(candidate, best)
+        （:123-137）与 SortTime(record)（:140-148）：先按解析成功的时间比较（StartedAt 优先，
+        失败退 EndedAt），时间相等再退 StartedAt 的 Ordinal，最后退 FilePath，
+        保证确定性且不会把不同课件判成同一条；NewestUnfinished 也改用 IsNewer（:106）；
+        Rules.cs:37 改用 UnfinishedDecks.NewestRecord，规则与行动从此共用同一口径。
+  证明：「NewestRecord：取解析后时间最新的一条（讲完的那条）」——夹具就是
+        “2026/9/8 10:00:00”（解析为 2026-09-08）与 “2026-09-30 09:00:00”，
+        测试现场打印字符串序的结论（会选旧那条）作为对照；
+        「规则：最近一条已讲完 → 不成立」（旧实现会误判为成立）；
+        「NewestUnfinished：最近一条没讲完的是旧格式那条」；
+        「规则口径（不要求文件）：三份都算，取最新」。
+
+BUG-06 控制面板历史列表按字符串序排，“最新一条”可能错位 → 点“立即跳转”跳到旧页
+  现象：历史列表第一行不是真正最新的一次；ControlPanel 的 Select() 用
+        history[0].Slide 当“上次停的页”，于是「立即跳转」跳到几节课之前的页码。
+  根因：Core\PanelData.cs:87-106 History 直接沿用 ledger.Recent() 的顺序，
+        而 Recent（Core\Ledger.cs:257-284）是 string.CompareOrdinal(StartedAt) 降序
+        （同秒按写入顺序倒序）——混排日期格式时“最新”是错的；
+        Ui\ControlPanel.axaml.cs:206-229 的 selectedPage 依赖 history[0]。
+  修法：PanelData.cs:117-144 新增 NewestFirst(ledger, item, max)：
+        先 ledger.Recent(key, int.MaxValue)（保留 Recent 对 EndSlide<=0 的过滤与后缀桶回退），
+        再对下标做稳定排序（SortTime 降序，时间相同保持 Recent 的“后写入者优先”），最后取前 max；
+        SortTime（:147-153）用 DateTime.TryParse(InvariantCulture, None)。
+        History 与 TotalSlides 都改走它（:91、:164）。
+  证明：「历史：第一行是解析后时间更新的那条（页码 12）」「历史：第二行是旧那条（页码 5）」
+        「历史：第一行时间文案 = 10-01 09:00」「历史：坏记录（EndSlide<=0）不显示」
+        「历史：max=0/1、台账 null、item null」。
+
+BUG-07 总页数取的是“字符串序最新”那条记录的 SlideCount
+  现象：同一份课件换过版本（总页数从 30 变 40）后，面板上「共 N 页」可能显示旧版本的页数。
+  根因：Core\PanelData.cs:161-170 TotalSlides 用 ledger.Recent(key,1) 取第一条，
+        同样吃到 BUG-06 的字符串序；且 SlideCount<=0 时回退 EndSlide 可能为负。
+  修法：TotalSlides 改用 NewestFirst(ledger, item, 1)（:164），
+        回退改成 `SlideCount > 0 ? SlideCount : Math.Max(0, EndSlide)`（:169）。
+  证明：「总页数：取最新一条的 SlideCount（30）」
+        「总页数：SlideCount 缺、EndSlide 为负 → 0（不显示“共 -4 页”）」「台账 null → 0」。
+
+BUG-08 搜索搜不到界面上明明写着的“未标注科目”
+  现象：分组标题显示「未标注科目 · N 份」，但搜索框输入“未标注科目”结果是空列表，
+        老师会以为这些课件丢了。
+  根因：Core\PanelData.cs:49-57 Matches 只看 DisplayName / Subject / FolderHint，
+        而 Subject 为空（未标注）时界面上显示的是 CardFileGroups.SubjectOf 的兜底值
+        “未标注科目”（Core\CardFileGroups.cs:27），这个字符串不在任何被搜索的字段里。
+  修法：Matches 改为 Contains(f.DisplayName) || Contains(CardFileGroups.SubjectOf(f))
+        || Contains(f.FolderHint)（PanelData.cs:55），搜索范围与界面展示一致。
+  证明：「搜索：能搜到界面上显示的“未标注科目”」，另有
+        「搜索：空串=全部」「null=全部」「英文大小写不敏感」「关键词两端空格被 Trim」
+        「中文科目」「目录名参与匹配」「多个词是整串匹配（已知限制）」「null 列表 → 空结果」。
+
+BUG-09 倒序页范围显示成“第 10–3 页”
+  现象：台账被手改/导入成 StartSlide>EndSlide 时，历史行显示“第 10–3 页”这种倒序范围。
+  根因：Core\PanelData.cs:193-204 RangeText 只判 a<=0 / a==b，没处理 a>b。
+        正常引擎路径不会产生倒序（Core\SessionEngine.cs:861-869 的 EndSession 用
+        Math.Max(highest, endSlide) 并至少取 1），所以这只可能来自坏台账。
+  修法：RangeText 增加 a>b 分支，只报停下的那一页“第 b 页”（:201），并注释说明这是坏数据。
+  证明：「页范围：倒序坏数据 → 只报停下的页（不出“第 10–3 页”）」，
+        另有 3–7、起始缺、结束缺、0/0、负数、null 六条。
+
+BUG-10 PanelRow 的空数据：空引用 NRE、Subline 留孤立分隔符
+  现象：Detail 为空的行显示成“数学 · ”（尾巴挂个点）；分组里 rows 传 null 时面板直接 NRE；
+        item 为 null 时静默生成一行空数据而不是报错。
+  根因：Ui\PanelRows.cs:17-27 构造无 null 检查、字段直取；
+        :34-42 Subline 无条件 Subject + " · " + Detail；
+        :65-75 PanelGroup 直接存 rows。
+  修法：构造对 item 抛 ArgumentNullException（:21）、Name/Subject/Detail 全部 ?? ""
+        （:23-25）；Subline（:34-42）在 Detail 为空时不留尾部“ · ”、Subject 为空时不留前导；
+        PanelGroup 用 rows ?? new List<PanelRow>()（:69）、Subject ?? ""。
+  证明：「行：Detail 为空时只剩科目」「行：Detail 为空时不留尾部“ · ”」
+        「行：没有科目时不留前导分隔符」「行：科目和 Detail 都空 → 空串」
+        「行：正常一行 = 数学 · 第 8 页 · 3 小时前」
+        「行：item 为 null → 明确抛 ArgumentNullException」
+        「分组：rows 为 null → 空列表而不是 NRE」「分组：标题仍可用（数学 · 0 份）」。
+
+BUG-11 CSV 导出：负数页数被原样写出；`;`/制表符/前后空格不加引号
+  现象：坏台账（EndSlide<0）导出后“结束页”是负数、“总页数”是负数，Excel 里像数据算错了；
+        字段里含 `;`（部分区域设置的 Excel 用分号当分隔符），导出后会被拆成两列；
+        字段两端有空格时，Excel 打开会被 trim 掉，与台账不一致。
+  根因：Core\LedgerCsv.cs:93-95 ToCsv 直接 Int(StartSlide/EndSlide)，TotalSlides（:235-240）
+        回退 EndSlide 时没 clamp；Escape（:140-153）只对 , " CR LF 加引号。
+  修法：新增 NonNegative（:243-246）；ToCsv 的起始/结束页走 NonNegative（:93-94）；
+        TotalSlides 的 SlideCount<=0 分支改 NonNegative(record.EndSlide)（:239）；
+        Escape 的 needQuote 增加 ';'、'\t'、首尾空白（char.IsWhiteSpace）判定（:143-150）。
+  证明：「负数页数：总页数 → 0」「负数页数：起始/结束页按 0 写」
+        「转义：分号（Excel 在部分区域设置下用 ; 当分隔符）」「转义：制表符」
+        「转义：前导空格」「转义：尾部空格」「转义：字段中间的空格不加引号」
+        「转义：逗号」「转义：引号翻倍」「转义：换行」「转义：空串」「转义：null」
+        「转义：普通字段不加引号」。
+
+BUG-12（审查时已被并发修改修好，我补回归测试锁定）导出排序不确定 + 无锁快照
+  现象：同一秒内的多条记录，两次导出的行序可能不同（老师核对时以为记录丢了/错位）。
+  根因：Core\LedgerCsv.cs Collect 原实现注释写“OrderBy 是稳定排序”，
+        实际用的是 List<T>.Sort（内省排序，不稳定），且直接遍历 ledger.ByFile 没有快照锁。
+  现状：我审查时这两个问题已被另一个 agent 改掉：Collect 现在 lock (ledger.Sync)（:37）
+        并在 (索引, 记录) 上做 decorated 排序（:55-69），索引作 tie-break 保证确定性。
+        我没有重复改，只补了回归测试把它钉住。
+  证明：「稳定排序：条数」「稳定排序：同一时间点的行序 = 台账原序」
+        「稳定排序：两次导出行序一致」「排序主序：解析后时间新的在前」。
+        另：CSV 表头+CRLF、BOM=EF BB BF、ToBytes 正文与 ToCsv 一致、时长/日期/周几/节次/
+        课件名（含希沃伪键去前缀）、SuggestedFileName 共 40 条断言全绿。
+
+二、回归测试
+---------------------------------------------------------
+位置：%TEMP%\audit-auto\test\（AuditAuto.csproj + Program.cs，纯反射，不启动宿主）
+运行：dotnet <...>\AuditAuto.dll <插件 dll>
+结果：==== PASS 131 / FAIL 0 ====（exit 0）
+说明：测试只反射加载纯逻辑类型（PendingJump / OpenThrottle / PanelData / LedgerCsv /
+      UnfinishedDecks / UnfinishedDeckRule.Evaluate / PanelRow / PanelGroup）；
+      OpenUnfinishedDeckAction / ToggleCardAction 继承 ActionBase，加载类型就需要
+      ClassIsland.Core，因此刻意不碰；SlideSyncService 用 GetUninitializedObject 造壳，
+      再用 Ledger 的公开 ByFile 注入测试桶，全部在临时目录里跑，不写老师的数据。
+
+三、发现但没改的（说明原因）
+---------------------------------------------------------
+1) PanelData.History / TotalSlides 在 item.FilePath 为空时拿 item.Key 当台账桶名
+   （Key 形如 file:xxx.pptx / seewo:x，不是桶名），必然查不到。
+   没改的原因：CardFileList.Build 一定填 FilePath，这条分支实际走不到；
+   改它需要动 Core\CardFileList.cs（不在我的文件范围）。
+2) 搜索是“整串子串”匹配：输入“数学 期中”匹配不到任何课件（只认连续子串）。
+   没改的原因：属交互设计取舍（拆分多关键词会改变现有匹配语义），已有测试
+   「多个词是整串匹配（已知限制）」把现状钉住，是否支持多关键词应由产品决定。
+3) Escape 没有防 Excel 公式注入（字段以 = + - @ 开头时不加前缀 '）。
+   没改的原因：会改变导出文件的可读内容（老师会看到多出来的单引号），
+   属产品决策；台账路径/课件名由本机产生，注入风险低。
+4) Ledger.Newest / Ledger.Recent 仍是 StartedAt 字符串序（Core\Ledger.cs，不在我的范围）。
+   我的三个调用点（规则、行动、PanelData）都已改用解析时间，但库里还有别的潜在调用方；
+   根治要改 Ledger.cs 的排序口径，建议后续统一。
+5) PendingJump 的轮询粒度是 1 秒、上限 120 秒（Actions.cs:200）；PowerPoint 冷启动
+   超过两分钟时仍会放弃。属于既有超时策略，未调整（改大要评估老师误等成本）。
+
+四、需要别人改的（这两个文件有人在改，我没动）
+---------------------------------------------------------
+1) 【高】ToggleCardAction 用 Armed 判断“卡片是否可见”（Automation\Actions.cs:178）
+   `service.Armed` 的含义是“引擎与卡片正在运行”，不是“卡片可见”。
+   卡片被 autoHide 收起、或老师手动点收起后，NativeOverlayCard.expanded=false（private，
+   没有公开只读属性），但服务仍然 armed。此时执行「显示悬浮卡片」自动化会走
+   HideCardForAutomation → Disarm，把引擎和卡片一起销毁，
+   **正在讲的这一节课从此不再记台账**（最伤的一类静默数据丢失）。
+   建议：NativeOverlayCard 加 `public bool IsExpanded => expanded;`，
+   SlideSyncService 加 `public bool CardVisible => armed && (card?.IsExpanded ?? false);`，
+   Actions.cs:178 改成按 CardVisible 判断（不可见就 Show、可见才 Hide）。
+2) Ui\ControlPanel.axaml.cs:160-189 Rebuild() 恢复选中用 StringComparison.Ordinal 比 Key，
+   而 IsCurrent 用 OrdinalIgnoreCase；大小写不同的台账键会丢选中（选中跳回第一行）。
+3) Ui\ControlPanel.axaml.cs:252-263 RecordCount() 统计全部记录（含 EndSlide<=0），
+   而历史列表经 Ledger.Recent 过滤掉 EndSlide<=0；状态条“记录 N 条”与列表口径不同。
+4) Ui\ControlPanel.axaml.cs:206-229 Select() 用 history[0].Slide 作为 selectedPage；
+   我已把 PanelData.History 的排序修对，但若后续有人改 History 语义，这里要跟着复核。
+
+五、构建与验证
+---------------------------------------------------------
+命令：& 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build
+      'C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\ClassSlideSync.Plugin.csproj'
+      -c Release -t:Rebuild
+结果：0 error；warning 共 396 行、去重后 197 条（基线 200，未增加）；
+      来自本报告 6 个文件的 warning = 0 条。
+备注：审查期间仓库有多个 agent 并发编辑，中途出现过 MSB4025（读到半截 csproj）、
+      ControlPanel/NativeOverlayCard 缺成员的编译错误，均非本层改动引起；
+      最后一次完整构建与“冻结快照”（%TEMP%\audit-auto\frozen）构建都是 0 error。
+未部署、未动 git、未启动任何被测宿主程序。

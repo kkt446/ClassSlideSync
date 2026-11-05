@@ -1,0 +1,180 @@
+ClassIsland 插件「课件续页」功能 7 / 功能 8 稳定性报告
+========================================================
+日期：2026-10-24
+范围：课前预备态卡片（功能 7）+ 点卡片打开课件并跳到上次那页（功能 8）
+构建：net8.0-windows / Avalonia 11.3.17 / ClassIsland 2.1.0.1 SDK
+
+一、结论
+--------
+- 两个功能已实现并落盘；`dotnet build -c Release -t:Rebuild` 成功，0 error。
+- 反射验收工程 50 条断言全过（0 fail）。
+- 96dpi 出图 3 张，逐张看过：无压字、无溢出、按钮/齿轮/竖带不重叠。
+- 真机（ClassIsland 宿主 + WPS/PowerPoint/希沃）**完全没有启动**，端到端链路未验证，见第五节。
+
+二、改了哪些文件、哪些行
+------------------------
+（路径前缀：C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\）
+
+1) Core\LessonWindow.cs
+   - 36-45：`Result` 新增 `bool InPreClass; TimeSpan PreClassStart; int PreClassPeriod; int SecondsToStart;`
+   - 80-100：主循环前加独立预扫。原来的 `InLesson && !InPeriod` 同时覆盖「课前 lead」和
+     「课后 grace」（PostClassGraceSeconds 默认也是 120 秒），无法区分；新预扫要求
+     `now >= start-lead && now < start`，下课后不再误判成预备态。原有 InLesson/InPeriod/Detail
+     语义与节号保持不变，调度侧不受影响。
+
+2) Core\LessonClock.cs
+   - 36-44：`Verdict` 新增 `bool InPreClass; int PreClassPeriod; string PreClassSubject; string PreClassDetail;`
+   - 80-95：抄 `r.InPreClass/PreClassPeriod`；InPreClass 时用 `lessons.NextClassSubject?.Name.Trim()`
+     取「这一科」。不能用 CurrentSubject：课前通常还在上一科的课间。
+
+3) Core\Ledger.cs
+   - 316 起：新增 `public SessionRecord? LastUnfinishedForSubject(string subject, int withinDays)`。
+     科目 Trim + OrdinalIgnoreCase；`LastUsed(r) >= now-withinDays`；取这一科 StartedAt 最新的一条；
+     只有 `SlideCount>0 && EndSlide>0 && EndSlide<SlideCount` 才返回。
+     语义刻意是「这一科最近用过的那份没讲完」：最近一份已讲完时返回 null，不翻更早的旧账
+     （否则会把上学期没讲完的课件翻出来）。
+
+4) Core\SessionEngine.cs
+   - 78：`CardState` 新增 `public bool ReadyOnly; public string ReadyFile=""; public int ReadySlide; public int ReadyRemaining;`
+     （新增字段而非复用 Previous/Current；卡片不读台账，只吃这份快照）
+   - 102：`Hash()` 末尾 `if (ReadyOnly) h = h*31 + 700000 + ReadySlide*7 + ReadyRemaining*13 + ReadyFile.GetHashCode();`
+     不加这一句，预备态与「等待放映」哈希相同，卡片收到状态也不重画。
+   - 193-202：`openJumpFile/openJumpSlide/openJumpUntil` + `volatile ReadySnapshot ready`。
+   - 540：`Step` 里 `deckOpen = PptBridge.LooksLikePath(filePath);` 之后调 `TryJumpPendingOpen();`
+   - 950：`sealed class ReadySnapshot { On/FilePath/Slide/Remaining }`。
+   - 963-997：`SetReady(filePath, slide, remaining)` / `ClearReady()` / `RequestJumpOnOpen(filePath, slide)`。
+     SetReady 只在值变化时整份替换并立即 `Push`：预备态要在打铃前两分钟出现，不能等下一拍。
+   - 1004-1024：`TryJumpPendingOpen()`：只对同一台账键（`SameBucket`，即 `Ledger.Key` 归一化后相等）
+     且 90 秒内的请求跳页；超时作废，避免下一节课打开同一份课件时莫名跳页。
+   - 1403-1422：`BuildState` 末尾的预备态分支：`rd.On && !st.DeckOpen && !st.SuiteOnly && !isShowing`
+     时才顶替正常态；写 ReadyOnly/ReadyFile/ReadySlide/ReadyRemaining，FileName 取文件名，
+     Current/SlideCount/Previous 清零、历史清空。
+
+5) Ui\NativeOverlayCard.cs
+   - 203-204：`Rect32 readyOpenHit; bool readyCard;`
+   - 264：`public event Action<string,int> OpenDeckRequested;`（path, slide）
+   - 829-835：`ContentHeight96` 预备态分支：12 + TitleStep96(20) + 22 +（Remaining>0 ? 22 : 0）
+     + BtnGapTop96(8) + BtnHeight96(32) + 12 = 128 / 106。刻意不跟 CardHeight/CardScale 走。
+   - 889：`ApplyContentHeight`：`if (historyPanel || filePanel || st.ReadyOnly) h96 = need;`
+     保证窗口高 = `Scaled(ContentHeight96)`，不跟老师给正常卡片调的高度/缩放走。
+   - 1190：`OnConsistencyCheck` 的 want 并入 ReadyOnly，否则心跳不补显。
+   - 1313-1316：`ApplyPending` 的 `hasDeck = st.DeckOpen || st.ReadyOnly`；预备态时强制收起文件/历史面板。
+   - 1476-1490：`OnClick` 在齿轮之后、文件面板之前：`ReadyOnly` 时整卡点击发
+     `OpenDeckRequested(ReadyFile, ReadySlide)` 并 return；不受 ClickToJump 开关限制（这不是跳页，
+     是打开外部文件）；齿轮/竖带/收回仍优先。
+   - 1638-1675：`DrawReady`：标题行（Paint 已画文件名）→「上次停在第 N 页」→（有剩余页）
+     「还有 M 页没讲」→ 实心 accent 按钮「打开并接着讲」；按钮矩形记入 readyOpenHit。
+   - 1714：Paint 开头清空命中区时一并清 readyOpenHit/readyCard。
+   - 1944-1948：Paint 的 `else if (st.ReadyOnly) DrawReady(...)` 分支。
+
+6) Services\SlideSyncService.cs
+   - 62/65：`lastReadyKey` / `lastOpenDeckPath` / `lastOpenDeckAt`
+   - 170/175：`LessonClock.Verdict clock` 提到方法级，保留给后面的预备态判断。
+   - 255-258：`suppressCard = timetableGoverns && !inClass && !inPreClass && !ShowCardOutsideClass;`
+     原公式里课前窗口不算"课表外"，不改的话默认设置下预备态会被 suppressCard 直接抹掉。
+   - 286-319：预备态计算：`inPreClass && PreClassSubject.Length>0` → `ledger.LastUnfinishedForSubject(...)`；
+     文件存在才 `live.SetReady(file, EndSlide, max(0, SlideCount-EndSlide))`；否则 `live.ClearReady()`；
+     `ready:` 日志只在内容变化时写，避免每 2 秒刷屏。
+   - 565/628：`c.OpenDeckRequested += OnOpenDeckRequested;` / 退订。
+   - 751-792：`OnOpenDeckRequested`：`Process.Start(new ProcessStartInfo(path){UseShellExecute=true})`
+     （外部文件关联，不是宿主导航）；同路径 8 秒内连点只拉起一次；随后 `engine.RequestJumpOnOpen(path, slide)`；
+     文件不存在/异常时给卡片状态「课件不在了」「打不开课件」。
+
+未改动：Core\PptBridge.cs、Core\SeewoBridge.cs、Ui\ControlPanel.*、csproj、manifest。
+
+三、验收数字
+------------
+构建（Rebuild，Release）：
+  `200 个警告 / 0 个错误`
+  （需求写「沿用现有 193 条」，但当前工程 Rebuild 实际是 200 条：这 200 条全部是既有警告，
+   功能 7/8 没有新增警告——初版曾多出一条 CS0414，已把那个只写不读的字段删掉。）
+
+反射验收（%TEMP%\ready-mode\ready-mode.exe，Assembly.LoadFrom 真实插件 dll）：
+  RESULT: 50 passed, 0 failed
+  分组：
+  - Ledger.LastUnfinishedForSubject 8 条：未讲完→返回；已讲完→null；SlideCount=0→null；
+    30 天前→null；空科目→null；科目忽略大小写/首尾空格；最近一份已讲完时不翻更早旧账。
+  - LessonWindow.Compute 预备窗口 11 条：09:59（第 1 节，离打铃 60 秒）→InPreClass；
+    10:00 打铃→不是预备；10:41 课后 grace→不是预备（旧实现区分不开的点）；
+    10:48（第 2 节，离打铃 120 秒）→InPreClass；09:50→不是预备。
+  - SessionEngine.BuildState 10 条：无课件+有快照→ReadyOnly/ReadyFile/ReadySlide=5/Remaining=12/
+    FileName/Previous=0；SlideCount<=0→Remaining=0；负数夹 0；无快照→不进预备态；
+    deckOpen=true→预备态让位且 DeckOpen=true；Hash 区分两种态。
+  - 高度/DPI 7 条：96dpi 128（有剩余页）/106（无剩余页），均 ≤210；
+    96dpi Scaled(128)=128=各行缩放之和；144dpi =192=各行缩放之和；96/144 的 96 稿高度一致；144=1.5×96。
+  - 命中区（96dpi，236×128）14 条：按钮 [28,84]–[222,116]；
+    齿轮图标 [198,10]–[222,34]、齿轮命中区 [192,4]–[228,40]、竖带 [0,0]–[18,128]；
+    按钮在客户区内、右边留 14、底边留 12；与齿轮/齿轮命中区/竖带均不重叠；
+    竖带宽 18、齿轮命中区 36×36；无剩余页时按钮底边 94（106−12）且仍在区内。
+
+截图（%TEMP%\ready-mode\shots\）：3 张，96dpi，GetWindowRect 实测窗口尺寸与内容高度表一致
+  - ready-remaining.png   236×128：标题「纯页码课件.pptx」+「上次停在第 5 页」+「还有 12 页没讲」+ 按钮
+  - ready-noremain.png    236×106：无「还有 M 页没讲」这一行，按钮上移，无留白
+  - ready-longname.png    236×128：超长文件名（含中文括号）省略号截断在齿轮左侧，不压齿轮、不压按钮
+  三张均逐张查看：按钮文字「打开并接着讲」完整、无裁切，竖带箭头与齿轮正常。
+
+测试代码：%TEMP%\ready-mode\Program.cs（反射 + 断言）、shoot.ps1（按 .ready 文件给的矩形截图）。
+测试工程不引用插件工程，也不加任何 NuGet 包；运行时从插件 bin 与 ClassIsland app-2.1.0.1-0 目录解析依赖。
+
+四、实现里值得记一笔的决定
+--------------------------
+- 预备窗口单独判定（LessonWindow 预扫）而不是复用 InLesson && !InPeriod：后者把课后 grace 也算进来，
+  默认 120 秒grace 会让「下课 2 分钟内」误显示「打开并接着讲」。
+- 科目取 NextClassSubject 而不是 CurrentSubject：课前仍在上一科课间，CurrentSubject 是上一科。
+- 预备态在卡片侧并入 `hasDeck`（而不是让服务端伪造 DeckOpen）：服务端不用改语义，卡片只认一个状态源；
+  deckOpen 一旦为真 BuildState 就不会再写 ReadyOnly，老师自己打开课件后自然切回正常态。
+- 跳页只在「同一台账键」且 90 秒内兑现：`Process.Start` 拉起外部程序后 COM 桥需要时间，
+  RequestJumpOnOpen 只是登记，真正的 RequestJumpTo 由引擎线程在 Bridge 第一次认出该路径时发；
+  这样绕开了「服务线程不能碰 COM」的既有约束。
+
+五、没有验证的（重要，别当成已验证）
+------------------------------------
+1. 真机根本没启动：没有启动 ClassIsland，没有 WPS / PowerPoint / 希沃白板，也没有进入真实课表。
+   因此以下链路全部未走通：课表 tick → Arm → 预备态显示 → 点按钮 → 系统默认程序打开 → COM 桥识别 →
+   自动跳到上次那页。
+2. `Process.Start(UseShellExecute=true)` 没有实际执行过（测试里没有可打开的真实 pptx 关联）。
+3. `PptBridge` 对 WPS 的 `FilePath` 识别、`JumpToSlide` 在真实课件上的行为未验证。
+   若老师默认程序是 WPS，可能出现「打开了但桥认不到、90 秒后请求作废、不跳页」——按设计不会乱跳，
+   但也没有提示。
+4. 课表服务不可用 / 无排课 / 跨零点时段：LessonClock 的既有逻辑没改，预备态在这些情况下不会出现
+   （InPreClass=false），但未在真实 ClassIsland 数据上跑过。
+5. 多显示器、125%/150% 实际缩放下的窗口位置：命中区与高度是纯函数、有断言，但窗口摆放（Place）
+   只在 150% 缩放的这台机器上以强制 96dpi 的方式截图，未在 100% 的真实显示器上跑过。
+6. 台账里有历史记录但 `Subject` 为空（旧版本记录）：`LastUnfinishedForSubject` 匹配不到，预备态不会出现。
+   这一点没有迁移逻辑。
+
+六、这份需求里我认为不对/需要确认的地方
+--------------------------------------
+1. 「`ContentHeight96` 现在是三态都 176」不准确：工程里只有正常卡片固定 176；历史面板和文件面板
+   早就按行数长高了（`ContentHeight96` 里分别 return 26+rows*26+26+10 等）。所以「三态」这个说法
+   与代码不符，我按「正常卡片 176、预备态 128/106」实现。
+2. 「上次停在第 N 页」用的是台账 `EndSlide`，而 `EndSlide` 的语义是「翻到过的最远页」，不是「最后停留页」。
+   老师从第 8 页往回讲到第 3 页时，台账仍记 8，预备态会写「上次停在第 8 页」——这是既有数据模型的
+   限制，功能 7 沿用了它。若要精确，需要引擎额外记录「最后一次停留页」。
+3. 「课前 2 分钟」与 `PostClassGraceSeconds=120` 在时间上会重叠（上一节下课后的 grace 与下一节课前的 lead
+   可能同时成立）：需求只说了「进入课前预备窗口」，没说要排除课后 grace。我按「已进 lead 且未打铃」
+   判定，所以下课 grace 期间不会显示预备态；但如果两节连排、间隔小于 grace+lead，语义上仍需确认。
+4. 「上课后如果老师自己打开了课件，预备态自然切回正常态」：我按「只要 DeckOpen/SuiteOnly/Showing 任一为真
+   就让位」实现，也就是老师**课前**打开课件也会立刻切回正常态。需求只写了「上课后」，这点请确认是否符合预期。
+5. 「避免在老师手动打开别的课件时乱跳：只对同一路径跳」：我用的是台账键相等（`Ledger.Key` 归一化后比较，
+   不是字符串相等），标题兜底路径与 COM 路径大小写/短路径不同也能认成同一份。但「同一路径」在
+   老师先打开 A、再打开 B 的情况下，B 会覆盖 A 的 openJump 请求（后一次 `RequestJumpOnOpen` 直接覆盖），
+   没有队列——需求没说这种情况该怎么处理。
+6. 「点按钮 → 用系统默认程序打开」与既有 `DoJump` 的冲突：`DoJump` 在 `bridge==null` 时会
+   `PptBridge.Launch(jumpPath)` 再启动一次 PowerPoint。服务端已经 `Process.Start` 过，理论上会出现
+   「开两份」。现在靠「等 Bridge 认出课件后才发 RequestJumpTo」规避（那时 bridge 必不为 null），
+   但极端时序下 bridge 掉线仍可能重复拉起。需求没有提这个交互。
+7. 「警告沿用现有 193 条」与当前工程不符：现在 Release Rebuild 是 200 条，全部是既有警告，功能 7/8 未新增警告。
+   需求给的是旧数字，验收时以「0 error」为准。
+8. 需求没有要求设置开关，所以功能 7 是「只要 AutoStartBeforeClass 打开就生效」，没有单独开关；
+   老师若想关掉预备态，只能关 AutoStartBeforeClass（会连正常卡片一起关）。建议后续在设置页加一个
+   「课前预备卡片」开关。需求也没提 `ShowCardOutsideClass` 与预备态的关系——我让预备态不受它抑制。
+
+七、复现命令
+------------
+构建：
+  & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build 'C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\ClassSlideSync.Plugin.csproj' -c Release -t:Rebuild
+验收：
+  & "$env:TEMP\ready-mode\bin\Release\net8.0-windows\ready-mode.exe"
+出图：
+  powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\ready-mode\shoot.ps1"

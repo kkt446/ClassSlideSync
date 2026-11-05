@@ -1,0 +1,200 @@
+课件续页插件 · 稳定性报告（任务 6 页码对齐 + 任务 10 移动/改名重关联）
+日期：2026-10-25
+改动范围：Core/Ledger.cs（只新增两个 API，未改任何现有语义）、新建 Core/DeckRemap.cs
+未触碰：Core/SessionEngine.cs、Core/SyncSettings.cs、Ui/、Automation/、Services/、csproj、git
+
+结论
+--------------------------------------------------------------------
+1. 课件被改过（指纹变 / 页数变）时，能把「上次停在第 N 页」映射到新版对应页；
+   映射可信（Kind=Exact/Shifted）才给页码，证据不足一律给「课件改过了，页码可能不准」，
+   整份换掉时连页码都不给（NewSlide=0）。不启动 WPS/PPT/LibreOffice，纯托管解 OpenXML。
+2. 台账里的路径失效时，在「科目文件夹 + 原件所在目录（含子目录）」里按
+   「文件名相似 + 内容指纹相同/相似 + 每页文字相似」找候选；唯一命中才改台账并记
+   `relink:` 日志，歧义或没命中就保持「找不到文件」，绝不错挂到别人的课件上。
+3. 构建 0 error（218 warning 全部是仓库既有风格告警，本次改动文件 0 条警告）。
+4. 反射自测 167 条断言全过（要求 ≥50）。
+5. 需要引擎接线才能生效：本报告最后两节写明「在哪里调」——我按约定没有改 SessionEngine。
+
+改动明细
+--------------------------------------------------------------------
+Core/Ledger.cs（只新增，插在两处，未动原有方法体）
+  - L357-378  public List<SessionRecord> AllRecords()
+              在 lock(Sync) 里把各桶非空记录收进一个新 List（列表结构固定，记录对象仍是台账里的）。
+              任务 10 要扫「路径已失效」的记录，不能拿 ByFile 的字典直接遍历（别的线程会整本换字典）。
+  - L515-533  public bool Relink(string oldPath, string newPath)
+              复用内部 Adopt（整桶迁移 + 逐条改 FilePath），成功后 Save() 并
+              Log("relink: history moved 旧名 -> 新名")；失败/异常 Log("relink failed: ...") 并返回 false。
+              调用约定与 Adopt 一致：调用方先确认新文件就是同一份课件。
+
+Core/DeckRemap.cs（新建，1300 行，namespace ClassSlideSync.Plugin.Core，纯托管 + System.IO.Compression）
+  区域 1  OpenXML 读取
+    DeckPage { string Text; string Title; bool IsEmpty }        // Text=整页所有 a:t，Title=第一段
+    DeckPages { string Path; string Fingerprint; List<DeckPage> Pages; int Count; Page(int) }
+    DeckReader.CanParse(path) -> bool                           // 只认 .pptx/.pptm/.ppsx
+    DeckReader.Read(path) -> DeckPages?                         // 读不出来返回 null，从不抛
+      页序按 ppt/presentation.xml 的 <p:sldId r:id> + ppt/_rels/presentation.xml.rels 解析，
+      ResolvePart 处理 ../ 与绝对路径 —— PowerPoint 删页后 slideN.xml 编号是稀疏的（1,3,7,9…），
+      按文件名数字排序会串页；只有 sldIdLst 缺失时才回退到数字排序。
+      每页用 XmlReader 取 a:t（a:p 结尾成段），跳过 <p:pic> 等无关节点，不解整棵树。
+
+  区域 2  相似度（全静态纯函数，便于单测）
+    Normalize(s)               小写、全角转半角、空白/标点/符号换成 \u0001 分隔、去首尾
+    Dice(a,b)                  字符二元组多重集 Dice，0..1
+    PageSim                    0.75*正文Dice + 0.25*标题Dice
+    ContentSimilarity(old,new) 旧版均匀抽 ≤8 页，每页在新版里找最像的一页，取平均
+    NameSimilarity(a,b)        去掉扩展名 / 「副本 拷贝 复件 copy」/ 尾部 (1)(2) 与 v2 之后再比；
+                               子串关系给 0.75+0.25*长度比
+
+  区域 3  页码对齐  MapPage(oldPages, newPages, oldSlide) -> RemapResult
+    RemapKind { None, Exact, Shifted, Uncertain, Replaced, Unavailable }
+    RemapResult { Kind, OldSlide, NewSlide, OldCount, NewCount, Shift, Confidence, Note, Usable }
+    Usable = Kind ∈ {Exact, Shifted}        // 卡片只有在这里才敢跳
+    ① 归一化文字完全相同 → Exact（置信度 1.0）。唯一命中才算；多份一模一样的页走②或判重复。
+    ② 上下文偏移投票：取旧第 N 页前后各 3 页，各自在新版窗口里找最像的一页，
+       用「新索引-旧索引」加权投票（票数≥2 且权重≥1.1 才算数；
+       投票给出的候选页自身相似度须 ≥0.45，均分 ≥0.55 才采信）→ Shifted。
+       删页/插页会让整段课件平移同一页数，这一级是主力。
+    ③ 没有上下文共识时退到单页最佳匹配：相似度 ≥0.62，且比第二像的页高出 ≥0.08，
+       同分偏向原位置（距离奖励 0.03）→ Shifted。
+    ④ 相似度 0.30~0.62 → Uncertain（给个大致页码 + 「页码可能不准」）；
+       <0.30 → Replaced（NewSlide=0，不给页码，提示找不到对应页）。
+    ⑤ 旧页没字（纯图片页）→ 只有邻居投票够一致（≥3 票、均分≥0.70）才 Shifted，否则 Unavailable。
+    ⑥ 页码超界（旧 12 页停在第 12 页、新版只剩 10 页）夹到最后一页去找，结论里仍写原始页码。
+
+  区域 4  按台账取旧版  RemapFor(ledger, record, currentPath, oldSlide, cacheFolder=null)
+    - 指纹相同且页数相同 → Exact「课件没改过，页码不变」。
+    - 否则用 record.Fingerprint 去页面留底缓存里取旧版每页文字；取不到 →
+      Unavailable「课件改过了，页码可能不准：没有旧版第 N 页的留底」，并顺手把新版存进缓存。
+    - 取到 → MapPage，然后把新版也存缓存（下次再改就有两份留底）。
+
+  区域 5  页面留底缓存  DeckPageCache（ledger.Root\deckpages.json）
+    台账里只有指纹、没有每页文字，旧版被改掉后原文件就没了，所以必须提前按指纹留一份。
+    MaxEntries=80、每页文字截 600 字、标题截 200 字、原子写（写 .tmp 再 File.Replace/Move）；
+    读写失败一律吞掉——缓存写不进去只是「下次没法对齐」，不影响上课。
+    DeckRemap.CacheFor(folder) 静态注册表复用实例；Remember(folder,deckPath) / Cached(folder,fp)。
+
+  区域 6  移动/改名重关联
+    RelocateResult { bool Found; string Path; string Note; List<RelocateCandidate> Candidates }
+    RelocateCandidate { Path, Fingerprint, NameScore, ContentScore(-1=没算), SameFingerprint, Score, Accepted }
+    FindMoved(missingPath, fingerprint, folders, cacheFolder=null, maxFiles=400)
+      候选目录 = 传入目录（科目文件夹）+ 原件所在目录，SearchOption.AllDirectories，最多 400 份，
+      跳过 ~$ 临时文件与非 pptx；排除 missingPath 自己。
+      逐份：NameScore；Fingerprint（Ledger.Fingerprint，头尾各 64KB + 长度）；
+        同指纹 → Score=1.0+0.5*名字分，直接接受（内容一字节不差，改名也认）；
+        否则若有旧版留底 → 最多比 14 份的每页文字，Score=0.55*内容+0.45*名字，
+          接受线：(内容≥0.85 且 名字≥0.50) 或 (内容≥0.70 且 名字≥0.80)；
+        没有内容证据（旧记录没指纹 / 候选读不出来）→ Score=0.25*名字，只有 名字≥0.92 才接受。
+      接受份数 ≥2 且头两名分差 <0.08 → 判歧义，不关联，
+        提示「找到 N 份都像的课件，先不自动关联」（接错比找不到更糟）。
+      成功 → Note「已重新关联：文件名」；失败 → Note 恒为「找不到文件」。
+    Relink(ledger, missingPath, folders, logMiss=false)
+      从 ledger.Last(missingPath) 取指纹 → FindMoved → ledger.Relink 成功则
+      Log("relink: \"旧\" -> \"新\" (same fingerprint | pages 93% name 71%)")。
+      logMiss=false 时找不到不写日志（卡片每拍调也不刷日志）。
+
+阈值总表（都是 public const，改一处即可调）
+--------------------------------------------------------------------
+  MatchThreshold        0.62   单页最佳匹配的接受线
+  MarginThreshold       0.08   与次佳的差距 / 重关联歧义线（两处共用）
+  ContextFloor          0.55   上下文投票的均分下限
+  ContextVerify         0.45   投票选中的那页自身相似度下限
+  ReplaceFloor          0.30   低于它判「整份换掉」
+  RelocateContentStrong 0.85   重关联：内容够像
+  RelocateNameLoose     0.50   重关联：名字有一半像
+  RelocateContentWeak   0.70   重关联：内容凑合
+  RelocateNameStrong    0.80   重关联：名字很像
+  RelocateNameOnly      0.92   没有内容证据时唯一允许的名字线
+
+构建
+--------------------------------------------------------------------
+命令：& 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build "…\ClassSlideSync.Plugin\ClassSlideSync.Plugin.csproj" -c Release -t:Rebuild
+结果：已成功生成，0 个错误，218 个警告（无一条来自 Core/DeckRemap.cs 或本次新增的 Ledger 代码）。
+备注：第一次构建曾报 3 个 CS0246「找不到类型 SubjectColor」（Core/SyncSettings.cs:79/471/632）——
+      那是另一个 agent 正在同一文件里写 SubjectColor 的瞬时状态（该类随后出现在 SyncSettings.cs:800），
+      与本次改动无关；重试即 0 error。报告如实记录这条「构建可能撞上别人的半成品」。
+
+自测（反射 harness，不引用插件工程）
+--------------------------------------------------------------------
+位置：%TEMP%\deck-remap\harness（Harness.csproj + Program.cs）
+样本：%TEMP%\deck-remap\samples（make_samples.py 用 python-pptx 生成 17 份真实 pptx）
+运行：
+  dotnet <harness>\bin\Release\net8.0\DeckRemapHarness.dll <samples> <插件 dll 的副本> <work>
+结果：passed=167 failed=0 skipped=0（明细见 %TEMP%\deck-remap\harness-result.txt）
+断言分布：
+  A01-A23  解析与缓存：页数/首页标题/末页、稀疏编号仍按 sldIdLst 排序（第 5 页还是「带分数」、
+           第 8 页还是「通分」）、.ppt 与假 zip 返回 null、缓存读写落盘、两个 MapPage 重载一致
+  B01-B27  删页/插页：原样 5→5、删第 5 页后 7→6（Exact，那页没改）、6→5（被删页的下一页）、
+           12→11；插第 3 页后 5→6、3→3、4→5；删末页后 11→11、原 12 页不可用；
+           反向（旧=删页版）7→8；末尾加页不影响旧 12 页
+  C00-C08  只改标题：仍映射第 4 页、不算 Exact、Shift=0、置信度 ≥0.6、提示「内容有改动」
+  D01-D08  完全无关的替换（交通安全课件）：Replaced、不给页码、不可用、提示「页码可能不准」、
+           不说「对应新版」
+  E01-E15  歧义与空白页：两页都像 → Uncertain；纯空白页 → Unavailable「没有文字」；
+           重复页有上下文 → Shifted 第 3 页，无上下文 → Uncertain 且取离原位置最近
+  F01-F10  单页小改：正文微调仍第 6 页；整页重写 → 不可用；旧版本多出来的页不可用
+  G01-G17  RemapFor 全流程：删页后 7→6 + 提示前移、顺手缓存新版；没改过 → Exact「页码不变」；
+           指纹为空/对不上 → Unavailable 且提示可能不准；反向加页 7→8；空参数不抛
+  H01-H26  重关联：同内容改名（彻底不同的名字）→ 找到并改台账 + `relink:` 日志含 same fingerprint；
+           同名内容相近 → 找到；同名但内容无关 → 拒绝；两份都像 → 不关联且提示；
+           无指纹但同名 → 找到、不同名 → 拒绝；递归子目录 → 找到；.ppt 候选不参与；
+           ledger 为空 / 空路径 / 目录不存在 → 找不到，台账不动
+  I01-I33  健壮性：页码 0/负数 → None；超界不抛；空参数不抛；Normalize/Dice 边界；
+           台账 AllRecords/Relink 自身（成功/旧路径为空/新路径有记录/不存在返回 false/落盘）
+
+harness 环境坑（复现时照做，否则会误判成代码 bug）
+  - 插件 dll 编译期引用 System.Text.Json 9（宿主机 ClassIsland 提供），harness 自己是 net8.0
+    已加载 8.0，同一默认 ALC 不能并存两个版本 → 必须把插件装进独立 AssemblyLoadContext
+    （Harness.csproj 里 Program.cs 的 `new AssemblyLoadContext("plugin", true)` + Resolving）。
+  - 还要把 NuGet 缓存里 system.text.json 9.0.2、system.text.encodings.web 9.0.2、
+    system.io.pipelines 9.0.2 的 lib\net8.0\*.dll 复制到 harness bin 目录（S.T.Json 9 序列化时
+    才去要 Pipelines，缺了只会在「写 deckpages.json」这一步静默失败——第一轮 A16-A20 全失败就是这个）。
+  - 另一个 agent 的 `-t:Rebuild` 会把插件 bin 目录清掉，harness 跑到一半就 FileNotFound；
+    所以先把插件 dll 复制到 %TEMP%\deck-remap\plugin\ 再跑。
+
+未验证 / 风险
+--------------------------------------------------------------------
+  - 只用 python-pptx 生成的标准 pptx 验过；WPS/希沃导出的 pptx 若把文字放进图形（p:graphicFrame /
+    SmartArt / 备注页），这部分文字读不到，会被当成空页 → Unavailable「没有文字」，不会瞎给页码。
+  - 纯图片页、扫描页同理：没有 a:t 就无法对齐，按「可能不准」处理。
+  - .ppt（二进制）不支持解析；重关联时这类候选不参与（H23）。
+  - 缓存是「第一次看到这个版本时」留的底：如果老师改了课件、又在插件没跑起来（ClassIsland 没开）
+    的情况下上了一节课，旧版每页文字没留底，只能给「页码可能不准」。这是设计上的取舍，
+    不猜。
+  - 本机没有真机跑 ClassIsland（按约定不启动），所以 UI 上的最终文案效果未截图。
+
+需要接线的地方（我没有改 SessionEngine，以下是建议改法）
+--------------------------------------------------------------------
+1) 留底 + 改名认领 —— Core/SessionEngine.cs `BeginSession`，在 L798 `currentFp = Ledger.Fingerprint(filePath);`
+   之后加一行：
+       DeckRemap.Remember(ledger.Root, filePath);        // 每份课件每个版本解析一次，约 20~80ms，在引擎线程的 Begin 里
+   这样「上次停在第 N 页」对应的旧版每页文字才有据可查。
+
+2) 路径失效时的重关联 —— 同一段的 L804-L822（现在只按「指纹相同」认领改名/挪目录）。
+   这里是 BeginSession 已知「当前键在台账里查不到」的位置，接到：
+       var moved = DeckRemap.Relink(ledger, filePath, new[] { settings.FindSubjectFolder(subject) }, logMiss: false);
+       if (moved.Found) { /* 台账已改到 moved.Path，历史还在；卡片可以用 moved.Path 显示 */ }
+   建议把 subject 从 LessonContext 里取；settings 就是现有的 SyncSettings 实例，
+   科目文件夹用 SyncSettings.FindSubjectFolder(record.Subject)（找不到会返回 ""，传进去也没关系）。
+   找不到时不要动台账（Relink 内部已经保证），保持「找不到文件」。
+
+3) 卡片上的「文件改过，页码已偏移」—— Core/SessionEngine.cs L1500-L1514。
+   现在 `st.PreviousTrusted = TrustedFingerprint(r);` 为 false 时只写死一句
+   「文件在那之后被改过，页码可能已偏移」，页码仍是旧版第 N 页。
+   建议在 `st.PreviousTrusted = TrustedFingerprint(r);` 之后插入（约 L1502 后）：
+       if (!st.PreviousTrusted && r != null)
+       {
+           var remap = DeckRemap.RemapFor(ledger, r, histKey, st.Previous, ledger.Root);
+           if (remap.Usable) st.Previous = remap.NewSlide;   // 让 DoJump 跳到对齐后的页
+           st.Hint = remap.Note;                             // 可信：对应新版第 M 页；不可信：页码可能不准
+       }
+   注意 st.Previous 在这之前可能已被 finished 分支置 0（L1497-1498），要放在 finished 判断之后、
+   st.Hint 赋值之前。DoJump 用的是 displayed/st.Previous（L1483-1494、L1283），改成对齐后的页码即可，
+   不需要动跳转逻辑。
+   RemapFor 内部读新版 pptx（一次几十毫秒）+ 查缓存，卡片是 2 秒刷新的，建议按
+   （路径 + 指纹）做一次记忆，或只在 !st.PreviousTrusted 时才算 —— 这次的实现里
+   RemapFor 每次都会重新 DeckReader.Read 当前文件，如果性能敏感，接线时请在 SessionEngine 侧
+   加一层「上次算过的 (path, fp) → RemapResult」缓存。
+
+4) 任务 10 的「卡片显示找不到文件」—— 若 Ui/CardFileList 或 Automation/UnfinishedDecks 里已经有
+   File.Exists 判断，可在那里调用同一句 Relink（它很便宜：找不到时不写日志、不改台账；
+   唯一开销是扫目录，建议加个「这份课件每 30 秒最多试一次」的节流）。

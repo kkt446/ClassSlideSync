@@ -1,0 +1,263 @@
+课件续页插件 —— 演示软件桥接层 + 宿主服务层 审查修复报告
+审查日期：2026-10-24
+审查范围（只改了这三个文件）：
+  Core\PptBridge.cs          （COM / ROT / Win32 窗口判定）
+  Core\SeewoBridge.cs        （希沃白板本机 MCP，JSON-RPC over HTTP）
+  Services\SlideSyncService.cs（ClassIsland 服务：250 ms 心跳 + 课表 tick）
+未改动：Plugin.cs、SessionEngine、Ledger、Ui\*、Automation\*、Views\*（并发改动中）。
+公开成员名一个都没改（SessionEngine / Ui\* 正在并发改，改签名会撞车）。
+
+结论：0 error / 200 warning（= 基线，未新增）；桩测试 89 PASS / 0 FAIL；
+      未部署，未启动真实的 ClassIsland / PowerPoint / WPS / 希沃。
+
+════════════════════════════════════════════════════════════════════
+一、修掉的 bug（每条：现象 → 根因(文件:行) → 修法 → 证明）
+════════════════════════════════════════════════════════════════════
+
+【B1】ROT 扫描每轮泄漏 Application / IMoniker 的 RCW
+  现象：老师关掉 PowerPoint（或 WPS）后进程常驻不退；任务管理器里 POWERPNT.EXE 一直
+        留着，第二次上课再打开就变成"两个 PPT"，插件可能挂到那个看不见的旧实例上。
+        跑一上午之后 COM 调用开始变慢、偶发"拿不到 Presentations 集合"。
+  根因：Core\PptBridge.cs:583-622。ROT 枚举里每个 moniker 都 rot.GetObject(...) 拿一个
+        Application 的 RCW，但只有"评分更高"的那个才被赋给 out com；落选的、以及被
+        更好的候选顶掉的旧 com，都从不 ReleaseComObject；monikers[0] 也从不释放。
+        RCW 引用计数不清零时，PowerPoint 即使收到 Quit 也会等最后一个外部引用消失，
+        表现就是"关了却还在"。后台每 2 s 重连一次，泄漏随运行时长线性增长。
+  修法：每轮 finally 里 Marshal.ReleaseComObject(monikers[0]) + Array.Clear(monikers,0,1)；
+        选赢家时 DropCandidate(com, o)，落选时 DropCandidate(o, com)。
+        新增 Core\PptBridge.cs:1197 static void DropCandidate(object? o, object? keep)：
+        用 ReleaseComObject（减一）而不是 FinalReleaseComObject，并用 ReferenceEquals
+        保护"两个 moniker 绑定到同一实例、拿到同一个 RCW"的情形——强放会把刚选中的
+        赢家一起打死，真机上表现为随后跳页报"RCW 已断开"。
+  证明：桩测试 A5（ROT 为空时 Connect() 15 ms 返回 null、DumpRot 不抛异常）；
+        B 组假 COM 状态机 24 条断言全过；逐个 GetObject 对照审计，全部有成对释放。
+
+【B2】GetActiveObject 回退路径同样泄漏
+  现象：同 B1，WPS 会注册 Kwpp.Application / WPP.Application / wpp.Application 多个
+        ProgID，每次重连泄漏 2-3 个 Application 引用，WPS 退出后残留更明显。
+  根因：Core\PptBridge.cs:634-656，GetActiveObject 拿到的对象只在"评分更高"时才保留。
+  修法：两处成对调用 DropCandidate（646 行替换前、652 行落选）。
+  证明：同上（A5 / 代码审计）。
+
+【B3】DumpRot 诊断本身也泄漏
+  现象：老师点几次"诊断/导出 ROT"之后，PPT 同样关不掉（诊断功能反噬）。
+  根因：Core\PptBridge.cs:667-700，GetObject 的返回值只用于打印，从不释放。
+  修法：finally { DropCandidate(o, null); }（691 行）+ 每轮释放 moniker。
+  证明：桩测试 A5 连续调用不抛异常；代码审计。
+
+【B4】双开 PPT 时可能挂到"空实例"
+  现象：老师课前开着两个 PowerPoint（一个放着课件、一个是空白启动窗），插件读到
+        总页数 0、页码 0，卡片一直显示"0/0"。
+  根因：Core\PptBridge.cs:583-631 的 ROT 循环里 `if (best >= 2) return true;` 命中第一个
+        "有文件"的实例就返回，不再比较后面的候选；另外早退会把还没枚举到的更好实例
+        直接丢掉。
+  修法：扫完整张 ROT，取评分最高的（ScoreInstance：3 有文件/放映中 > 2 有 deck 无文件 >
+        1 空实例 > 0 已死），0 分不选；分数相同保留先遇到的。
+  证明：桩测试 A4（ScoreInstance 0/1/2/3 四档打分）+ B 组状态机。
+
+【S1】希沃端点发现没有总耗时预算
+  现象：希沃没开、或端口被防火墙/半死进程占着时，一上课卡片要 8-11 s 才出来，
+        跳页按钮点下去也卡这么久；日志里"seewo: no mcp server"前面是一长串空白。
+  根因：Core\SeewoBridge.cs:339-361。Discover() 串行试 config 里读到的端点 + 5 个候选
+        端口（7916/7917/13247/19463/27733），每个 TryEndpoint 都是一次完整 initialize
+        握手，单次上限 RequestTimeoutMs=1500，却没有总预算：最坏 5×1500=7500 ms
+        （再加 config 条目）。这段跑在引擎/调度线程上，直接卡住 250 ms 心跳和课表 tick。
+  修法：新增常量 DiscoverBudgetMs=2500（60 行）；Discover 里 Stopwatch（340 行），
+        两个循环头部各一个 `if (probe.ElapsedMilliseconds >= DiscoverBudgetMs) break;`
+        （350、358 行），超预算写日志"seewo: probe budget 2500 ms used up"。
+  证明：桩测试 E1——绑 5 个"只接不答"的 TCP 端口模拟半死希沃，实测 GetState 3046 ms
+        返回（改前 ≥7500 ms），日志里能看到预算用完；E1c 确认端点全死时 Found=false
+        （不会假装连上）。
+
+【S2】SSE 解析取到"通知"而不是"响应"
+  现象：偶发"希沃里还没打开这份课件"、或 initialize/tools 报 "no result in response"，
+        而希沃里课件明明开着；再点一次又好了。
+  根因：Core\SeewoBridge.cs:919-966。MCP 服务端常在响应前先推自己的 SSE 事件
+        （notifications/message 之类），旧代码取"第一个以 { 开头的事件"，于是把通知
+        当成响应交给 TryGetResult，报"没有 result"。
+  修法：收集所有 data 事件后，先倒序找含 "result" / "error" 的事件（真正的响应），
+        找不到再退化为任一 JSON 事件、最后一个事件、整段文本；新增 IsJsonValue(966 行)。
+  证明：桩测试 C2（桩先推通知再给 id=7 的响应，断言取到 id=7）、C3（只有通知时不崩）；
+        D2 端到端从结构化响应里解析出课件名/页码/总页数。
+
+【S3】RPC 发起前后两次读 baseUrl（另一个线程刚好把端点清空）
+  现象：日志里 initialize 与 drop 成对刷屏，希沃"时好时坏"。
+  根因：Core\SeewoBridge.cs:789-818。`Post(baseUrl, ...)` 在重连前后各读一次字段；另一条
+        线程的 DropEndpoint 会把 baseUrl 清成 ""，`new HttpRequestMessage(Post, "")` 抛
+        异常 → 被 Post 捕成"传输失败" → HandleCallFailure 再把刚恢复的会话拆一次，
+        于是越拆越连不上。Initialize 里也有同样问题（已用局部 url）。
+  修法：进方法先 `var url = baseUrl;`，为空直接 `RpcResult.Fail(true, "no endpoint")`；
+        重连后重新读 url 再校验（803 行）；Initialize 的 notifications/initialized 用
+        局部 url（660 行）。
+  证明：桩测试 E2（空端点 CallRpc 返回失败而不是抛异常，错误文本含 endpoint）。
+
+【S4】tools 表原地 Clear+Add，与并发遍历打架
+  现象：极偶发"希沃跳页出错"，日志里是 InvalidOperationException（集合已修改）。
+  根因：LoadTools/DropEndpoint 里对同一个 List<ToolDef> 做 Clear + 逐条 Add，而 GotoSlide
+        正在 tools.Exists(...) / FindJumpTool 里遍历它。
+  修法：一律整表换引用（`tools = new List<ToolDef>()`，372、392 行），读方先 `var tl = tools;`
+        再遍历（GotoSlide 274 行）。
+  证明：桩测试 D1 端到端跳页仍走完整工具链（en_find_shells → get_current_courseware_info
+        → get_slide_info → en_goto_app_ui → goto_slide）。
+
+【S5】两条线程同时握手，互相把 session 顶掉
+  现象："希沃时好时坏"，日志里成对出现 initialize / drop。
+  根因：Core\SeewoBridge.cs:614-634。两条线程同时看到 initialized==false，各发一次
+        initialize；后者的 Mcp-Session-Id 覆盖前者的，前者还在途的请求被服务端判 400，
+        HandleCallFailure 顺手把刚建好的端点整个 drop。
+  修法：readonly object initGate（79 行）+ lock(initGate) 内复查 disposed / baseUrl /
+        initialized 再握手，整段串行化。
+  证明：代码审计 + D 组端到端（桩日志里没有重复 initialize，D1i 断言请求数）。
+
+【V1】课表 tick 无重入闸
+  现象：一节课开始时偶发双卡片，或卡片出来了但跳页没反应；日志里 arm/disarm 交错出现。
+  根因：Services\SlideSyncService.cs:164。Timer 周期 2 s，但一拍里要做进程枚举（希沃 6 个
+        进程名 + PPT 窗口枚举 + 每个窗口开进程句柄）、COM 重连、Process.Start，超过 2 s
+        就会并发进入第二拍；两拍同时改 armed / card / engine。
+  修法：`int tickBusy`（162 行）+ `if (Interlocked.Exchange(ref tickBusy, 1) == 1) return;`
+        （170 行），finally 里清零（357 行）。
+  证明：代码审计 + 构建；并发时序需真机（Timer 竞争在桩环境里无法稳定复现）。
+
+【V2】Arm 失败后 armed 永远为 true → 插件静默失效
+  现象：插件"突然再也不出卡片"，直到重启 ClassIsland；日志在"arm: ..."之后没有任何后续
+        （既没有 engine started，也没有 disarm）。
+  根因：Services\SlideSyncService.cs:581。Arm 先把 armed=true，再 new NativeOverlayCard()、
+        new SessionEngine()；任何一步抛异常（窗口类注册失败、COM 初始化失败）都会带着
+        armed=true 退出，调度器看到 armed 就不再来 Arm，也不会走 Disarm。
+  修法：建卡片、起引擎各包 try/catch；失败时 armed=false、写 "arm failed: ..."、把已经
+        建好的半成品 Dispose 掉（595-650 行；BuildCard 提到 664 行便于复用）。
+  附带纠正：旧注释声称"卡片必须切到宿主 UI 线程建"，但 NativeOverlayCard 是插件自建的
+        Win32 窗口、自带 "ClassSlideSync-overlay" 线程（Ui\NativeOverlayCard.cs:266），
+        任何线程都能 new。我一度按注释改成 Dispatcher.Post + 等 3 s，复核 Ui 实现后
+        回退——那条路会在宿主 UI 卡住时把调度器线程钉 3 s，还会制造"卡片建好但已被
+        放弃"的边角状态。
+  证明：代码审计 + 构建；桩环境不建真实窗口，行为验证列为需真机项。
+
+【V3】看门狗重建引擎时可能"复活"已收掉的卡片
+  现象：下课后卡片收了，但日志里引擎还在跑（心跳继续、CPU 占用），下次待命出现两个
+        引擎抢同一个 PPT。
+  根因：Services\SlideSyncService.cs:721-761。WatchdogTick 在 Dispose 旧引擎、构造新引擎
+        这段时间里不复查 armed；此时另一条线程（下课 / 插件停止 / 自动化）完成 Disarm，
+        看门狗随后 `engine = fresh; fresh.Start();` 又把引擎装回去。
+  修法：赋值前 `if (!armed) { fresh.Dispose(); return; }`（752-758 行）。
+  证明：代码审计（时序竞争需真机 Timer）。
+
+【V4】主题事件订阅从不退订
+  现象：插件停用/重载后换主题仍会往已停的插件里跑；反复启停后 RecomputeAppearance
+        一次跑好几遍；日志里出现重复的 theme 行。
+  根因：Services\SlideSyncService.cs:773-806 用匿名 lambda 订阅 IThemeService.ThemeUpdated，
+        Stop() 里没法退订（没有句柄）。
+  修法：新增字段 IThemeService themeService / EventHandler<ThemeUpdatedEventArgs>
+        themeHandler（53-57 行）；WatchThemeChanges 里若同一服务且已有句柄直接 return；
+        Stop() 先摘字段再 -=（1132-1147 行）。
+  证明：编译通过（EventHandler<ThemeUpdatedEventArgs> 来自 SDK 2.1.0.1，编译器校验类型）
+        + 代码审计。
+
+【V5】Stop 之后日志管道还开着
+  现象：停用插件后仍有日志写进 data 目录；宿主退出瞬间可能写盘竞争。
+  根因：Stop() 只置 started=false、Dispose 调度器、Disarm，settings.LogSink 仍指向
+        这个已停服务的账本。
+  修法：Stop() 里 `settings.LogSink = null!;`（1150 行，标注"摘掉"而非"空值语义"）。
+  证明：代码审计 + 构建。
+
+════════════════════════════════════════════════════════════════════
+二、发现但没改的（需要真机确认 / 风险大于收益 / 属于设计级改动）
+════════════════════════════════════════════════════════════════════
+
+1) PptBridge 里 Snapshot()、GotoSlide()、FindActivePresentation()、FindPresentation()、
+   EditingSlide() 通过 P()/PIndex() 取到的大量 RCW 都不释放（PptBridge.cs:688 起）。
+   不敢改的原因：RCW 是"每个 COM 身份一个"，同一对象可能同时被几处持有，盲放会让后续
+   调用报"RCW 已断开"，症状比泄漏更糟。要真机用 RCW 计数/COM 引用计数验证后再逐个改。
+
+2) JumpToSlide 最坏约 30 s 阻塞调用线程（PptBridge.cs:1049-1118：OpenDeck 重试 3×1500 ms、
+   等 Slides.Count 10 s、Run 两次各 9 s）。它跑在引擎线程；看门狗 30 s 判"引擎卡死"会把
+   引擎换掉，而旧线程还在 COM 里出不来——两个引擎可能同时对同一 PowerPoint 发 Run/
+   GotoSlide（双开、双跳）。正确修法是整段改异步 + 可取消 + 单飞，属于设计级改动，且会
+   和正在并发改 SessionEngine 的人撞车，本次不动。
+
+3) JumpToSlide 用魔法字符串直通判断（PptBridge.cs:1060 `g != "拿不到放映视图对象"`）——
+   任一侧改一句提示文案，控制流就静默变了。建议将来改成错误码/枚举。
+
+4) ExitShow 成功时返回 null（PptBridge.cs:1121），与其它方法"成功返回空串"的约定不一致；
+   调用方若用 == null 判断会误判成功为失败。
+
+5) COM 线程模型：引擎线程是 MTA，PowerPoint 是 STA，每次属性读取都是跨套间 RPC；
+   PPT 弹模态框时调用无限阻塞，看门狗只能换引擎、救不了线程（这也是重启上限 5 次的
+   原因）。彻底修需要给 COM 单独一条 CoInitializeEx(STA) 线程 + 消息泵，重写级改动。
+
+6) SeewoBridge 里还有三处"不够干净但不会崩"的点：
+   - cachedState 在 500 ms 缓存窗口内被多条线程共享读（只读，风险低）；
+   - LooksLikeSessionError 用 body.Contains("session") 判定会话失效，过于宽松；
+   - HandleCallFailure 对 HTTP 400 一律拆会话，工具级参数错误（比如缺 shellId）也会拆
+     （会自愈，代价是一次 1.5 s 重连）；
+   - 熔断只在调用"完成之后"才计时（SlowStateMs=1200），慢调用本身仍阻塞调用线程。
+
+7) SuiteActive() 与 SuiteOnScreen() 在同一拍各枚举一次窗口（SlideSyncService.cs:243），
+   IsSuiteFrame 会给每个可见窗口开一次进程句柄。只是性能问题，改它会动到公开行为，
+   本次未改（如果真机上 CPU 偏高，优先合并这两次枚举）。
+
+8) IUriNavigationService：怀疑 nav.Navigate(new Uri(folder)) 在路径含空格/#/%/中文时
+   静默不打开。用真 .NET 8 实测 `new Uri(@"D:\课件\第 1 章 #2 100%\演示")`：
+   AbsolutePath 与 OriginalString 都完整还原，#、%、空格均未截断 → 判定"URI 解析不是
+   问题"，所以没有加校验（加了反而多一层假风险）。但 Navigate 是否真的打开资源管理器
+   仍需真机确认：它失败时不抛异常，代码里的 ShellExecute 回退也就不会触发。未改。
+
+9) 构建告警里有 CS8622/CS8625 等可空性提示，属于既有代码风格，本次只保证"不新增"，
+   不做大规模 nullability 清理（会与并发改动冲突）。
+
+════════════════════════════════════════════════════════════════════
+三、验证
+════════════════════════════════════════════════════════════════════
+
+构建（任务指定的命令，-c Release -t:Rebuild）：
+  200 个警告 / 0 个错误
+  说明：中途出现过一次 MSB3021/MSB3027（无法复制 bin\...\ClassSlideSync.Plugin.dll），
+        原因是并行 agent 的 PanelTests 进程正加载着这个 dll；该进程退出后用同一条命令
+        重建即 0 error。与源码无关，这里如实记下。
+  告警基线：把改动前后我三个文件的告警逐条 diff（忽略行号位移）→ 无新增模式；
+        唯一新增的一条 CS8625 已用 `null!` 消掉。
+
+桩测试（%TEMP%\audit-bridges\，全部用假 COM 对象与手写 MCP HTTP 桩，不启动任何真实程序）：
+  === 汇总: PASS=89 FAIL=0 ===
+  A 组 PptBridge 纯函数：LooksLikePath / DocumentFromTitle / ClassifyLabel / ScoreInstance /
+     SuiteActive·SuiteOnScreen·SuiteFrameDocuments 不抛 / ROT 为空时 Connect() 立即返回 null；
+  B 组 假 COM 状态机：放映中 Snapshot 的 Current/SlideCount/FilePath/Diag、GotoSlide 参数
+     （resetAnimation=true 传 -1）、JumpToSlide 已在放映时直跳、ExitShow 调到 View.Exit、
+     未放映时 Showing=false、坏对象只写 Diag 不抛、Dispose 幂等；
+  C 组 SeewoBridge 纯函数：ExtractJson（纯 JSON / SSE 先通知后响应 / 只有通知 / 多行 data）、
+     NormalizeUrl、BuildJumpArgs（按 schema 选 pageNumber、带 shellId、无页码字段返回 null）、
+     FindJumpTool、LooksRunning；
+  D 组 端到端：GotoSlide(7) 返回空串且桩侧收到正确工具序列与参数、GetState 解析结构化响应、
+     HTTP200+isError 不拆会话、桩不响应时 1506 ms 放弃；
+  E 组（本次新增）：探测总预算 3046 ms 被截断且日志有 "probe budget"、空端点 CallRpc 直接
+     失败不抛异常。
+
+合规：未启动 ClassIsland / PowerPoint / WPS / 希沃；未碰 data 目录；未部署；未动 git；
+      未加 NuGet 包；未改任何公开成员名。
+
+════════════════════════════════════════════════════════════════════
+四、改动文件清单
+════════════════════════════════════════════════════════════════════
+
+Core\PptBridge.cs
+  + static void DropCandidate(object? o, object? keep)          行 1197
+  * TryFindBestInstance：每轮释放 moniker、候选成对释放、全表取最高分  行 568-660
+  * DumpRot：GoToObject 结果与 moniker 成对释放                    行 667-700
+
+Core\SeewoBridge.cs
+  + const int DiscoverBudgetMs = 2500                             行 60
+  * Discover：Stopwatch 总预算 + 两处 break                        行 339-361
+  * ExtractJson：倒序优先取带 result/error 的事件 + IsJsonValue     行 919-970
+  * CallRpc：局部 url + 空端点短路                                行 789-818
+  * Initialize：notifications/initialized 用局部 url              行 660/676
+  * TryEndpoint / DropEndpoint：tools 整表换引用                  行 372 / 392
+  * EnsureSessionForCall：lock(initGate) 串行握手                  行 614-634
+
+Services\SlideSyncService.cs
+  + int tickBusy / IThemeService themeService / EventHandler<ThemeUpdatedEventArgs> themeHandler
+  * ScheduleTick：Interlocked 重入闸                              行 164-357
+  * Arm：建卡片/起引擎失败回滚，去掉错误的"必须 UI 线程"跳转        行 581-661
+  * BuildCard：卡片构建抽成独立方法（调用方线程直接建）              行 664-677
+  * WatchdogTick：重建前复查 armed                                行 721-761
+  * WatchThemeChanges：具名句柄 + 防重复订阅                       行 773-806
+  * Stop：先摘句柄退订主题、再摘 LogSink，最后 Disarm               行 1132-1153

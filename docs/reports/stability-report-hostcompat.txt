@@ -1,0 +1,333 @@
+课件续页（ClassSlideSync.Plugin 1.2.2.0）宿主兼容（ClassIsland 2.0.x ~ 2.1.x）改造报告
+================================================================
+
+日期：2026-10-31
+范围：让插件在 ClassIsland 2.0.0.1 ~ 2.1.0.1 全部 2.x 宿主上「能加载、能跑基础功能」；
+      2.1 才有的能力在旧宿主上降级（缺功能可以，但不能崩、不能白屏、不能静默）。
+版本号 manifest.yml：仍是 1.2.2.0（未动）；TFM 仍是 net8.0（未动）；manifest.yml / SyncSettings /
+Views / ControlPanel / *.csproj 一行未改。改动的只有 Plugin.cs 和新增的 Core/HostCompat.cs。
+
+结论（先说答案）
+----------------------------------------------------------------
+1. 「2.1 才有的 API」这个前提基本不成立。把 nuget 上 ClassIsland.Core 六份真实包
+   （2.0.0.1 / 2.0.1 / 2.0.2 / 2.0.3 / 2.0.4 / 2.1.0.1）逐条反射核对 56 项后：
+   ActionBase / TriggerBase / ComponentBase / SettingsPageBase / TriggerSettingsControlBase<T> /
+   AddAction<T> / AddAction<T,TSettingsControl> / AddTrigger<T> / AddTrigger<T,TSettingsControl> /
+   AddComponent<T> / AddRule / AddSettingsPage<T> / 四个 [*Info] 特性 / AppBase / ILessonsService /
+   IUriNavigationService / IAppHost / ConfigureFileHelper —— 从 2.0.0.1 起就全部存在。
+   我们真正用到、而 2.0.x 里会缺的只有一样：教程系统（ITutorialService + TutorialGroup，
+   2.0.3 才加）。
+2. 2.0.4（本报告的基准版本）缺什么：我们用的宿主 API **一个都不缺**；唯一「无」的是
+   SettingsPageCategory.Plugins 这个枚举成员 —— 它在包括 2.1.0.1 在内的所有版本里都不存在，
+   而我们的 [SettingsPageInfo] 走的是 5 参 ctor，默认值取自枚举里已存在的成员，因此不构成风险。
+3. 因此降级面很小但逻辑仍然保留：旧宿主（2.0.0.1~2.0.2）缺教程系统 → 只跳过「新手引导」一节，
+   记一行 `compat: skipped tutorial (host <ver> lacks ITutorialService.RegisteredTutorialGroups)`；
+   2.0.0.1 还缺 AddSettingsPageGroup(id,icon,name) 三参重载 —— 我们没用到，仅记录在案。
+   其余行动 / 规则 / 触发器 / 组件 / 设置页在 2.0.0.1 上照常注册。
+4. 改造方式：注册之前先反射探测宿主能力（Core/HostCompat.cs），每个注册分区包在
+   TryRun/Skip 里；缺失时跳过并记一行，同一 feature 只记一次；注册体自己抛异常也吞掉并记
+   `compat: failed ...`，绝不把异常抛给宿主（Initialize 抛异常 = 插件加载失败 = 白屏）。
+   2.1 宿主上能注册的项目与改造前逐项相同，没有为了兼容砍功能。
+5. 构建：Rebuild 0 error / 218 warning（全是改动前就有的 nullable 警告）；
+   `-p:CreateCipx=true` 打包成功（cipx 14 项、6,719,122 字节，含 manifest.yml 与插件 dll）。
+6. 离屏断言 149 条全绿（A 108 + B 22 + C 19），0 失败；全程无窗口、无 Start-Process、
+   不启动 ClassIsland / WPS / 希沃。
+
+为什么必须「先探测再调用」，而不是 try/catch 包住调用点
+----------------------------------------------------------------
+插件是按 2.1.0.1 的 SDK 编的，IL 里写死了 2.1 程序集里的类型/成员引用。CLR 在**方法开始执行
+之前**就解析该方法体用到的类型 token：宿主缺类型时抛的是 TypeLoadException，方法自己的
+try/catch 还没机会运行 —— 这就是「在旧宿主上一点就白屏」的机理。
+所以判断必须在调用点**之前**、用反射完成：反射查的是名字字符串，不需要类型存在。
+HostCompat 的全部实现（含探测与日志）都是这个形状，且不引用任何 ClassIsland/Avalonia 类型。
+
+验证方法（可复现，全部离屏）
+----------------------------------------------------------------
+- 包来源：nuget.org 的 ClassIsland.Core / ClassIsland.Shared / ClassIsland.Shared.IPC
+  2.0.0.1 / 2.0.1 / 2.0.2 / 2.0.3 / 2.0.4，解包到 %TEMP%\ci204\classisland.core.<ver>（2.0.4 在
+  %TEMP%\ci204\core）；2.1.0.1 取本机 nuget 缓存。没有 dotnet add package、没有引用进工程。
+- 反射探针：%TEMP%\ci204\probe（net8.0 控制台，AssemblyLoadContext 解析依赖），
+  对每份 ClassIsland.Core.dll 跑同一份 56 项清单，结果落 %TEMP%\ci204\facts-<ver>.txt。
+- 能力层单测：%TEMP%\ci204\compat-tests，直接链接工程里的 Core/HostCompat.cs 源文件
+  （测的就是生产代码，不是副本），把六份真实 Core 各装进独立 ALC 探测；再用假探测面覆盖
+  「探测抛异常 / Sink 抛异常 / 无版本号」等极端情况。
+- 注册逻辑单测：同一 harness 用 AssemblyLoadContext.Default.LoadFromAssemblyPath 加载真实
+  插件 dll + 真实 2.1.0.1 宿主，反射调 Plugin.RegisterAutomation(IServiceCollection, caps)，
+  按四种画像（2.1 全绿 / 无教程 / 无双泛型 / 全缺）数注册条目与日志。
+  注：行动/规则/触发器/组件 id 在 ClassIsland.Core 里是进程级静态表，二次注册会抛
+  「ID 已被占用」，所以四种画像各起一个进程（相当于全新宿主），而不是同进程连跑。
+
+一、2.0.4 API 事实表（本报告的核心；「有/无」为该 API 在 ClassIsland.Core 2.0.4 中是否存在）
+----------------------------------------------------------------
+探测方式缩写：
+  T  = 反射找类型（probe.HasType）
+  M  = 反射找静态扩展方法（名字 + 泛型参数个数 + 参数个数，参数个数**含首个 IServiceCollection**）
+  P  = 反射找静态属性（probe.HasStaticProperty，类型全名 + 属性名）
+  C  = 反射找特性类并按我们源码里的实参个数试构造
+
+  1) 自动化行动
+  API                                                  2.0.4  探测方式                缺失时降级行为
+  ActionBase (abstract)                                 有     T                       caps.Actions=false → 8 条行动注册全部 Skip（log action:<name>）
+  ActionBase<T>                                         有     T                      同上（带设置抽屉的行动也不注册）
+  AddAction<TAction>(IServiceCollection)                有     M("AddAction",1,1)     行动不可用 → Skip action:<name>
+  AddAction<TAction,TSettingsControl>(IServiceCollection) 有   M("AddAction",2,1)     caps.ActionsWithSettings=false → 退回 AddAction<T>：
+                                                                                       行动照常可执行，无设置抽屉；另记一行
+                                                                                       `compat: skipped action:notify.settings-control (...)`
+  AddRule(id,name,iconGlyph,HandleDelegate)             有     M("AddRule",0,5)       Skip rule:unfinished-deck
+  AddRule<TSettings>(...)                               有     M("AddRule",1,5)       未使用（我们走非泛型重载）
+  AddAction(IServiceCollection,string,string,string,Action<object,string>) 有 M("AddAction",0,5) 未使用（同上）
+
+  2) 触发器
+  TriggerBase (abstract)                                有     T                       caps.Triggers=false → Skip trigger:slide-page-reached
+  TriggerBase<TSettings>                                有     T                       —
+  AddTrigger<TTrigger>(IServiceCollection)              有     M("AddTrigger",1,1)    Skip trigger:slide-page-reached
+  AddTrigger<TTrigger,TSettingsControl>(IServiceCollection) 有 M("AddTrigger",2,1)    caps.TriggersWithSettings=false → 退回
+                                                                                       AddTrigger<TTrigger>：触发器可用、无设置界面；
+                                                                                       另记 `trigger:slide-page-reached.settings-control`
+  TriggerSettingsControlBase<T>                         有     T                      含在上面的降级里
+
+  3) 主界面组件
+  ComponentBase（: Avalonia UserControl）               有     T                       caps.Components=false → Skip component:deck-progress
+  ComponentBase<T>                                      有     T                       未使用
+  AddComponent<TComponent>(IServiceCollection)          有     M("AddComponent",1,1)  Skip component:deck-progress
+  AddComponent<TComponent,TSettings>(IServiceCollection) 有    M("AddComponent",2,1)  未使用
+
+  4) 设置页
+  SettingsPageBase（: UserControl）                     有     T                       caps.SettingsPages=false → Skip settings-page：
+                                                                                       没有设置页，但插件其余功能照常（不白屏）
+  AddSettingsPage<TPage>(IServiceCollection)            有     M("AddSettingsPage",1,1) 同上
+  AddSettingsPageGroup(id,icon,name) 三参              有     M("AddSettingsPageGroup",0,3) 未使用；2.0.0.1 无此重载（见第二节）
+
+  5) 特性（源码 `[ActionInfo]` 等写法在编译期落到这些类上；类名没有 Attribute 后缀）
+  ActionInfo(id,name,iconGlyph,addDefaultToMenu,defaultGroupToMenu)   有  C  注册体抛异常时被 TryRun 吞掉并记 failed，不崩
+  TriggerInfo(id,name,iconGlyph)                         有     C                      同上
+  ComponentInfo(guid,name,iconSource,description)       有     C                      同上
+  SettingsPageInfo(id,name,un,sel,category)             有     C                      同上
+    （我们的 `[SettingsPageInfo(id,name,un,sel)]` 编译成 5 参 ctor，2.0.0.1 起就存在；
+      第 5 参取默认枚举值，所有版本都有该成员）
+  ActionInfo.IsRevertable 属性                          有     P(实例属性)            未使用
+
+  6) 教程（2.0.3 才加的整块）
+  ITutorialService                                      有     T                      caps.Tutorials=false →
+  ITutorialService.RegisteredTutorialGroups（static）   有     P                      只 Skip tutorial，其余分区不受影响，
+  TutorialGroup / Tutorial / TutorialParagraph         有     T                      记一行
+  ITutorialService.BeginTutorial(Tutorial)              有     M(实例方法)            `compat: skipped tutorial (host <ver> lacks
+  AddTutorialGroupByUri(Uri)                            有     M("AddTutorialGroupByUri",0,2)  ITutorialService.RegisteredTutorialGroups)`
+
+  7) 服务与宿主基础（调用点在业务代码里，只在宿主「有」时才被调用）
+  IAutomationService                                    有     T                      拿不到就不写自检日志（LogAutomationRegistrations 已 try/catch）
+  IThemeService                                         有     T                      调用点已有 null 保护 + try/catch
+  IUriNavigationService                                 有     T                      调用点已有 null 保护 + try/catch
+  IUriNavigationService.Navigate                        有     （声明在基接口 IPublicUriNavigationService）
+  ILessonsService                                       有     T                      课表信息拿不到 → 走既有「无课表」分支
+  ILessonsService.GetClassPlanByDate(DateTime, ref Guid?) 有   M(实例方法，声明在本接口)
+  IPublicLessonsService.CurrentSubject                  有     （声明在基接口，ClassIsland.Shared.IPC）
+  IPublicLessonsService.CurrentClassPlan                有     （同上）
+  IPublicLessonsService.CurrentTimeLayoutItem           有     （同上）
+  IProfileService                                       有     T                      仅探测，未强依赖
+  IAppHost.TryGetService<T>()                           有     M(实例/静态，ClassIsland.Shared)  调用点均有 null 检查
+  AppBase.Current（static）                             有     P                      版本号探测失败时退化到程序集版本
+  AppBase.AppVersion / AppVersionLong（static）         有     P                      拿不到 → 退化「按类型存在性判断」
+  AppBase.AppStarted / AppStopping（事件）              有     （反射可命中）         订阅在 Initialize 里，不会因缺 API 抛
+  ConfigureFileHelper（ClassIsland.Shared.Helpers）     有     T                      LoadConfig 失败已有 try/catch
+  PluginBase.Initialize(HostBuilderContext,IServiceCollection) 有 M(实例方法)          —
+  PluginBase.PluginConfigFolder / Info                  有     （属性）               —
+  [PluginEntrance]                                      有     C                      —
+
+  8) 唯一「无」：SettingsPageCategory.Plugins
+  SettingsPageCategory.Plugins                          无     （枚举成员反射）        不使用；所有版本（含 2.1.0.1）枚举值都只有
+                                                                                       Internal, External, About, Debug
+
+二、跨版本矩阵（56 项，六份真实 ClassIsland.Core 反射结果）
+----------------------------------------------------------------
+记法：Y=存在，-=不存在。版本列依次为 2.0.0.1 / 2.0.1 / 2.0.2 / 2.0.3 / 2.0.4 / 2.1.0.1。
+
+  id                                   0.0.1 0.1 0.2 0.3 0.4 1.0.1
+  addaction1 (AddAction<T>)             Y    Y   Y   Y   Y   Y
+  addaction2 (AddAction<T,TControl>)    Y    Y   Y   Y   Y   Y
+  addaction_ng (5 参)                   Y    Y   Y   Y   Y   Y
+  addrule1 (AddRule<TSettings>)         Y    Y   Y   Y   Y   Y
+  addrule_ng (5 参)                     Y    Y   Y   Y   Y   Y
+  addtrigger1 / addtrigger2             Y    Y   Y   Y   Y   Y
+  addcomponent1 / addcomponent2         Y    Y   Y   Y   Y   Y
+  addsettingspage1                      Y    Y   Y   Y   Y   Y
+  addsettingspagegroup (3 参)           -    Y   Y   Y   Y   Y
+  type.actionbase / actionbase1         Y    Y   Y   Y   Y   Y
+  type.triggerbase / triggerbase1       Y    Y   Y   Y   Y   Y
+  type.componentbase                    Y    Y   Y   Y   Y   Y
+  type.settingspagebase                 Y    Y   Y   Y   Y   Y
+  type.triggersettingsbase              Y    Y   Y   Y   Y   Y
+  attr.actioninfo/triggerinfo/          Y    Y   Y   Y   Y   Y
+       componentinfo/settingspageinfo
+  type.iautomationservice               Y    Y   Y   Y   Y   Y
+  type.ithemeservice                    Y    Y   Y   Y   Y   Y
+  type.iprofileservice                  Y    Y   Y   Y   Y   Y
+  type.iurinavigationservice            Y    Y   Y   Y   Y   Y
+  type.ilessonsservice                  Y    Y   Y   Y   Y   Y
+  prop.ilessons.subject/classplan/      Y    Y   Y   Y   Y   Y
+       timelayout（IPublicLessonsService）
+  meth.ilessons.getplan                 Y    Y   Y   Y   Y   Y
+  type.appbase / prop.appbase.current   Y    Y   Y   Y   Y   Y
+  prop.appbase.version                  Y    Y   Y   Y   Y   Y
+  event.appbase.started/stopping        Y    Y   Y   Y   Y   Y
+  meth.iapphost.tryget                  Y    Y   Y   Y   Y   Y
+  type.configurefilehelper              Y    Y   Y   Y   Y   Y
+  type.pluginbase / pluginentrance      Y    Y   Y   Y   Y   Y
+  prop.pluginbase.configfolder          Y    Y   Y   Y   Y   Y
+  meth.pluginbase.initialize            Y    Y   Y   Y   Y   Y
+  meth.iuri.navigate                    Y    Y   Y   Y   Y   Y
+  meth.ipublicnav.navigate              Y    Y   Y   Y   Y   Y
+  type.itutorialservice                 -    -   -   Y   Y   Y
+  prop.itutorial.groups（static）        -    -   -   Y   Y   Y
+  addtutorialgroup (AddTutorialGroupByUri) - -   -   Y   Y   Y
+  type.tutorialgroup / tutorial /        -   -   -   Y   Y   Y
+       tutorialparagraph
+  meth.itutorial.begintutorial          -    -   -   Y   Y   Y
+  enum.settingspagecategory.plugins     -    -   -   -   -   -
+
+结论：
+  - 2.0.1、2.0.2 缺的只有教程系统那一组（8 项）。
+  - 2.0.0.1 在此之上再缺 AddSettingsPageGroup 三参重载（我们没有用到）。
+  - 2.0.3 / 2.0.4 / 2.1.0.1 之间，我们使用面内**没有差别**。
+  - 2.0.4 → 2.1.0.1 的 ClassIsland.Core 全量 API 差分只有 18 处新增、0 处删除
+    （ObservableKeyValuePair`2、VerticalDrawer 的 DrawerContent/DrawerTemplate 等 4 个属性、
+    PathHelpers.IsSafePath），都不在我们使用面；2.0.0.1 → 2.0.4 新增 267 条、删除 13 条
+    （IProfileTransferService、AdvancedContextDragBehavior 等），同样不在使用面。
+
+三、降级清单（feature → 旧宿主缺 API 时的行为 → 日志）
+----------------------------------------------------------------
+  平台闸门（非 Windows）          Initialize 第一行，行为与改造前完全相同：记一行 + 只注册只读设置页 + return
+  settings-page                  缺 SettingsPageBase/AddSettingsPage → 不注册设置页；插件其余照常
+  action:open-unfinished-deck    缺 ActionBase/AddAction<T> → 不注册该行动，记 1 行
+  action:toggle-card             同上
+  action:open-panel              同上
+  action:jump-last-page          同上
+  action:open-deck-folder        同上
+  action:clear-deck-history      同上
+  action:notify                  缺双泛型 → 退回 AddAction<T>（可执行、无设置抽屉）+ 记 .settings-control 1 行；
+                                 连 ActionBase 都缺 → 不注册
+  action:jump-to-page            同上
+  rule:unfinished-deck           缺 AddRule(id,name,glyph,handle) → 不注册规则，记 1 行
+  trigger:slide-page-reached     缺双泛型 → 退回 AddTrigger<T>（可用、无设置界面）+ 记 1 行；
+                                 缺 TriggerBase/AddTrigger<T> → 不注册
+  component:deck-progress        缺 ComponentBase/AddComponent<T> → 不注册组件，记 1 行
+  tutorial                       缺 ITutorialService 或其静态属性 → 不注册新手引导，记 1 行
+
+日志格式固定为：
+  compat: host <版本> (<来源>) tutorials=yes/no action=yes/no ...   ← 启动时一行，说明探测结果
+  compat: skipped <feature> (host <版本> lacks <api>)                ← 同一 feature 只记一次
+  compat: failed <feature> (host <版本>): <异常类型>: <消息>          ← 注册体自己抛异常时（吞掉，不崩）
+日志写入 PluginConfigFolder 下的 app.log（沿用既有 Ledger），Debug 输出同步一份。
+
+四、代码改动
+----------------------------------------------------------------
+新增 Core/HostCompat.cs（约 420 行）：
+  - HostCapabilities：探测结果（HostVersion / VersionSource / 17 个 bool 能力），
+    Describe() 产出上面那行 `compat: host ...`。
+  - IHostProbe + ReflectionHostProbe：ForRunningHost() 扫当前进程里的 ClassIsland.* 程序集；
+    ForAssemblies(...) 供离屏断言注入 2.0.x 的 Core.dll。版本优先读
+    ClassIsland.Core.AppBase.Current.AppVersion，拿不到退到 ClassIsland.Core 程序集版本，
+    再拿不到写 "unknown"。
+  - HostCompat：Initialize（生产）/ Initialize(probe)（测试）/ Initialize(caps)（注册逻辑测试）
+    / Detect（纯函数）/ TryRun / Skip / Log / ResetForTests；
+    去重用静态 HashSet<string>，锁保护；Sink 抛异常也被吞掉，不影响插件。
+  - 该文件不引用任何 ClassIsland / Avalonia 类型：只用到 System.Reflection + System.Diagnostics。
+
+Plugin.cs：
+  - 平台闸门保留在 Initialize 第一行，分支内容未动。
+  - 闸门之后：HostCompat.Initialize(line => ledger.Log(line))，拿到 caps。
+  - 设置页改为 HostCompat.TryRun("settings-page", ...)。
+  - 新增 internal static RegisterAutomation(services, caps)：行动 / 规则 / 触发器 / 组件 / 教程
+    分区注册，全部经 TryRun/Skip；带设置抽屉的行动走 RegisterActionWithSettings（双泛型优先，
+    退化单泛型），触发器同理。
+  - 教程那一行的注释写明了「必须在调用点之前判断」的原因（TutorialGuide.Register 方法体直接
+    引用 ITutorialService，缺类型的宿主上一 JIT 就 TypeLoadException）。
+  - AppStarted/AppStopping 订阅、LogAutomationRegistrations、ToastNotifier、SlideSyncService
+    的创建顺序与改动前一致；Windows 上仍会创建全部东西。
+
+未改动：manifest.yml（apiVersion 2.0.0.0 / version 1.2.2.0 / supportedOSPlatforms [Windows]）、
+*.csproj、Core/SyncSettings.cs、Views/**、Ui/ControlPanel.axaml*。
+
+五、离屏断言（149 条，全绿）
+----------------------------------------------------------------
+工具：%TEMP%\ci204\compat-tests（net8.0，无 PackageReference，直接 HintPath 引 nuget 缓存里的
+Microsoft.Extensions.DependencyInjection 8.0.0；链接生产的 Core/HostCompat.cs）。
+运行方式（无窗口、不启动任何宿主程序）：
+
+  CompatTests.exe <ClassSlideSync.Plugin.dll> %TEMP%\ci204            # A+B：130 条
+  CompatTests.exe <...dll> %TEMP%\ci204 --c1                          # 2.1 全绿：5 条
+  CompatTests.exe <...dll> %TEMP%\ci204 --c2                          # 无教程：4 条
+  CompatTests.exe <...dll> %TEMP%\ci204 --c3                          # 无双泛型：5 条
+  CompatTests.exe <...dll> %TEMP%\ci204 --c4                          # 全缺：5 条
+
+A 部分（108 条 = 6 版本 × 18）：六份真实 ClassIsland.Core 各进独立 ALC，逐条断言
+  tutorials / settings-page-groups / 13 个恒真能力 / HostVersion 与程序集版本一致 /
+  VersionSource="ClassIsland.Core assembly" / HostAssemblyFound。
+  期望值来自第二节矩阵：2.0.0.1 tutorials=no & pagegroups=no；2.0.1、2.0.2 tutorials=no；
+  2.0.3/2.0.4/2.1.0.1 全 yes。
+
+B 部分（22 条）：假探测面 + 守卫语义
+  B1  全能力宿主 → 8 项能力全 true，VersionSource=AppBase.Current.AppVersion
+  B2  去掉 Tutorial* → 只有 Tutorials=false，其余能力保留；版本回退到程序集版本 2.0.2.0
+  B3  探测面自己抛异常 → Detect 不抛，退化全 false，版本 "unknown"
+  B4  不可用时不执行、只记 1 行、格式逐字匹配
+      `compat: skipped action:demo (host unknown lacks AddAction<T>)`（3 条）
+  B5  同 feature 再 Skip / TryRun 一次 → 仍只有 1 行（去重）
+  B6  不同 feature → 第 2 行
+  B7  可用时正常执行且不写日志（2 条）
+  B8  注册体抛异常 → 不逃逸、返回 false、记 `compat: failed action:boom ...`（2 条）
+  B9  失败后同 feature 再来一次不重复记
+  B10 Sink 自己抛异常 → Skip 不外泄
+  B11 AppVersion 优先于程序集版本
+  B12 无任何版本信息 → "unknown"，能力全 false，不抛（2 条）
+  B13 ResetForTests 清空去重表
+
+C 部分（19 条 = 4 个进程 ×（C0 1 条 + 场景断言），即 c1=5 / c2=4 / c3=5 / c4=5）：
+  真实插件 dll + 真实 ClassIsland.Core 2.1.0.1，反射调 Plugin.RegisterAutomation
+  C0  [ActionInfo] 行动类型 ≥8 个（每个进程都先做这一条）
+  C1  2.1 画像：8 条行动全部注册、服务数 ≥ 行动数+3（设置控件已注册）、无 skipped、无 failed（4 条）
+  C2  无教程画像：行动数不变、tutorial 只 skip 一次、文案逐字匹配（3 条）
+  C3  无双泛型画像：8 条行动全部退回注册成功、notify / jump-to-page 的 .settings-control 各 1 条、
+      无 failed（4 条）
+  C4  全缺画像：不抛、0 个服务注册、action skip 只 1 条、日志只有 skipped 与 host 行（4 条）
+  （各画像单独进程运行：ClassIsland.Core 的行动/规则/触发器/组件 id 表是进程级静态表，
+    二次注册会抛「ID 已被占用」，这正是宿主对重复注册的正确保护，不代表插件有问题。）
+
+六、构建与打包
+----------------------------------------------------------------
+  & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build ClassSlideSync.Plugin.csproj -c Release -t:Rebuild --nologo -v q
+    → 0 个错误 / 218 个警告（既有 nullable 警告，本次未新增）
+  & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build ClassSlideSync.Plugin.csproj -c Release -t:Rebuild --nologo -v q -p:CreateCipx=true
+    → 0 个错误；cipx\ClassSlideSync.Plugin.cipx，14 项，6,719,122 字节（含 manifest.yml、
+      ClassSlideSync.Plugin.dll 452,096 字节、README、ToastHelper、test/纯页码课件.pptx）
+
+七、残余风险（反射查不到、必须如实记录）
+----------------------------------------------------------------
+1. Avalonia 版本：插件按 SDK 2.1.0.1 编译，deps.json 里 Avalonia 11.3.17；宿主实际版本
+   2.0.0.1=11.3.6、2.0.1~2.0.4=11.3.10、2.1.0.1=11.3.17。.NET Core 在同一 ALC 内按简单名
+   绑定，所以插件会跑到宿主的 Avalonia 上；但如果编译后的 XAML/代码用到 11.3.10 之后才加的
+   Avalonia 成员，旧宿主会在运行时 MissingMethodException。本次未逐条核对 Avalonia API 差集
+   （超出「宿主 API」范围），列为已知残余风险。
+2. 插件 dll 的 deps.json 列出 ClassIsland.Core 2.1.0.1 / Shared 2.1.0.1。ClassIsland 把插件
+   装进与宿主共享的加载上下文，按简单名命中已加载的 2.0.x 程序集，因此能加载；若某个宿主
+   改成严格按版本绑定，会变成「插件加载失败」而不是「功能缺失」。这是宿主加载器行为，插件侧
+   无法控制（且改 deps.json 需要改 csproj，本次不允许）。
+3. 2.1.1.x 的 ClassIsland.Core 只带 lib/net10.0（宿主跑 .NET 10）。net8.0 插件在 .NET 10 宿主
+   上仍可加载，但没有实测（本机没有 .NET 10 运行时跑反射探针），矩阵未覆盖 2.1.1.x。
+4. 本报告的「有/无」是反射层面的静态事实；「2.0.4 上能跑」= API 层面不缺 + 注册逻辑对缺失项
+   有降级。真实宿主内的行为（例如宿主对组件容器的二次校验）未在本机启动 ClassIsland 验证
+   （按要求全程离屏）。
+
+八、复现步骤
+----------------------------------------------------------------
+  1. 解包（一次性）：Expand-Archive ClassIsland.Core.<ver>.nupkg → lib/net8.0/ClassIsland.Core.dll
+  2. 反射探针：%TEMP%\ci204\probe\bin\Release\net8.0\Probe.exe <ClassIsland.Core.dll> --facts
+  3. 能力 + 注册断言：
+       dotnet build %TEMP%\ci204\compat-tests\CompatTests.csproj -c Release
+       CompatTests.exe <插件 dll> %TEMP%\ci204
+       CompatTests.exe <插件 dll> %TEMP%\ci204 --c1 | --c2 | --c3 | --c4
+  4. 构建/打包：见第六节两行命令。
+
+附：矩阵原始数据
+----------------------------------------------------------------
+  %TEMP%\ci204\facts-2.0.0.1.txt … facts-2.1.0.1.txt（各 56 行，格式 F|<id>|PRESENT/ABSENT|<detail>）

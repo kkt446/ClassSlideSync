@@ -1,0 +1,211 @@
+浮层卡片层审查报告（Ui\NativeOverlayCard.cs / Ui\PanelRows.cs）
+审查时间：2026-10-24 21:45–22:15    审查者：卡片层审查+修复子任务
+范围：只动 Ui\NativeOverlayCard.cs（自绘浮层窗口）与 Ui\PanelRows.cs（列表行模型）。
+未启动 ClassIsland / WPS / PowerPoint / 希沃，未部署，未动 git，未加 NuGet。
+
+=====================================================================
+0. 方法与证据链
+=====================================================================
+* 反射 harness：%TEMP%\audit-card\AuditCard\（net8.0-windows，不引用插件工程，
+  运行时 Assembly.LoadFrom 加载插件 dll，按签名反推 CardState / CardAppearance /
+  CardHistoryItem / CardFileItem / CardSameNameItem / Rect32）。
+  - 20 个布局用例：96/144 dpi × 贴右/贴左 × 正常卡 / 课件库（8 行 2 组，带筛选与分页）/
+    历史 / 「哪一份？」 / 预备态 / 收起药丸，外加 2 个"工作区比卡片矮"（600/540）用例。
+    每个用例断言：所有命中矩形在客户区内、不压竖带内沿、不与齿轮命中区相交；
+    collapseHit 覆盖竖带中段；出图存 shots\audit-card-*.png。
+  - 3 个行为取证用例：换分辨率、捕获丢失、同名换课件（见 1.1–1.3）。
+  - GDI 记账：GetGuiResources(GetCurrentProcess(), 0) 前后对比 + 200 轮机制对照。
+* 基线对照：把插件源码整树复制到 %TEMP%\audit-card\baseline\，逐条回退本轮修复
+  （画笔顺序、ClipHit、WM_DISPLAYCHANGE / WM_SETTINGCHANGE、WM_CAPTURECHANGED、
+  "关→开"上升沿），同一 harness 跑同一组用例：
+  基线 64 条断言失败，修复版 0 条（exit=0）。两份 dll 哈希不同
+  （修复版 13F4172BBFAD…，基线 679C8CBB4063…），可确认跑的不是同一份产物。
+* 出图：shots\audit-card-96-right-normal.png … audit-card-144-right-files-short.png 共 18 张，
+  96/144 dpi 的每一类都人工看过（见第 4 节）。
+
+=====================================================================
+1. 真 bug（已修）
+=====================================================================
+1.1 插上投影仪换分辨率后，卡片跑到屏幕外（老师看到"卡片不见了"）
+  现象：笔记本 1920×1080 讲课，接投影仪切成 1024×768 镜像后浮层卡片整块消失；
+        把分辨率切回去又出现。贴右布局时最明显。
+  根因：工作区只在 Run() 和 WM_DPICHANGED（Ui\NativeOverlayCard.cs:1387）里刷新。
+        换分辨率时 dpi 常常不变（尤其"复制/镜像"模式），Windows 只广播 WM_DISPLAYCHANGE，
+        不会发 WM_DPICHANGED ⇒ screenRight 停在 1920；Place()（:586-596，:593
+        x = screenRight - cardWidth）算出 x = 1684，窗口落在新屏幕右边外面。
+  修法：WindowProc 增加两个分支——:1399 case WM_DISPLAYCHANGE、:1411 case WM_SETTINGCHANGE：
+        WorkingArea() → ApplyWorkArea → ApplyLook → Place → InvalidateRect。
+        WM_SETTINGCHANGE 先比较工作区矩形，没变就什么都不做（这条广播很勤，
+        每次 SetWindowPos 会让卡片闪一下）。
+  证明：harness DisplayChangeCase —— 先伪造工作区 3000×2000（等价"字段里留着旧分辨率"），
+        Place 后卡片 right=3000，而真实工作区右边界 1707。
+        基线：送 WM_DISPLAYCHANGE 后 screenRight 仍 3000、卡片 right=3000（屏幕外 1293px）→ 断言失败；
+        修复版：screenRight=1707、卡片 right=1707（重新贴回屏幕内）→ 通过。
+
+1.2 拖拽中途捕获被抢走 → 卡片再也关不掉，之后点什么都变"拖动"
+  现象：按住卡片拖动时如果弹了 UAC/宿主对话框、或 Alt+Tab 切走，松手可能收不到
+        WM_LBUTTONUP；此后课件已经关掉，卡片仍赖在屏幕上，而且点击跳页失灵。
+  根因：BeginDrag 里 SetCapture（:1664），但 WindowProc 原来完全没有
+        WM_CAPTURECHANGED 分支（:1485 是这次新增的）。dragArmed 永久为真 ⇒
+        ApplyPending 里 `if (dragging || dragArmed) shouldShow = true;`（:1563）永远成立
+        ⇒ 卡片永不隐藏；同时 WM_MOUSEMOVE 只要 dragArmed 就把这一下当拖动，
+        命中链根本走不到 OnClick。
+  修法：新增 case WM_CAPTURECHANGED（:1485）：清 dragArmed/dragging，本来在拖就 DropCard()
+        记住落点；并把 WM_LBUTTONUP（:1462）改成"先记下这一下算什么、清状态、再 ReleaseCapture"。
+        顺序是这次改动引入的新约束：ReleaseCapture 会同步送回 WM_CAPTURECHANGED，
+        若不先取快照，拖完那一下会被误判成点击。
+  证明：harness CaptureLostCase —— 置 dragArmed/dragging 后送 WM_CAPTURECHANGED，
+        再把 8 秒闩锁拨到过去、推一条"课件关闭"状态：
+        基线：dragArmed 仍 True、shown 仍 True（卡片关不掉）→ 断言失败；
+        修复版：False/False、shown=False → 通过。
+
+1.3 同名课件：A 先被收起 → 关掉 A → 立刻打开同名的 B，卡片不再弹出
+  现象：老师把卡片收成药丸，关了课件又打开另一份同名的（"3.2 电功率.pptx" 桌面一份、
+        素材盘一份，页数也一样），卡片一直保持药丸，不弹出来。
+  根因：自动弹出靠 expandedForDeck 这个"本轮已弹过"的记号，复位条件只有 switchedDeck
+        （:1571），而 deckKey 只由"文件名 + 页数"组成（:1568）。
+        CardState 没有路径字段，CardFileList 的同名归并也是按显示名做的
+        （Core\CardFileList.cs:98-225，Identity 只用显示名）⇒ A/B 在卡片层完全不可区分
+        ⇒ switchedDeck 恒为 false ⇒ 不弹。
+  修法：加字段 deckWasOpen（:254）；ApplyPending 里取 DeckOpen 的"关→开"上升沿
+        deckJustOpened（:1545-1546，必须用 st.DeckOpen 而不是 hasDeck——8 秒 deckLatchUntil
+        闩锁会把"关"这件事糊掉）；在 deckKey 逻辑之后 `if (deckJustOpened) expandedForDeck = false;`
+        （:1629）。
+  证明：harness SameNameSwitchCase —— 开 A（expanded=true）→ DoCollapse() 收成药丸 →
+        推关闭状态 → 推同名 B：
+        基线：expanded=False（还是药丸）→ 断言失败；
+        修复版：expanded=True（重新弹出）→ 通过。
+        副作用检查：同一份课件里翻页不会反复弹（上升沿只在"关→开"出现一次）；
+        课间 DeckOpen=false、上课变 true 也会弹一次，这是本来就该有的行为。
+
+1.4 贴右布局时，课件库行尾的「第 N 页 · x 小时前」被竖带盖掉 4–7px
+  现象：96dpi 下最后几个字被竖带压住看不清，144dpi 更明显（对照
+        shots\audit-card-144-right-files.png 修复前后：字尾正好切在竖带边缘）。
+  根因：详情右对齐到 w - pad（原代码 :2219），贴右时 pad=ContentPadRight96=14 ⇒ 右端 222，
+        而竖带内沿 rail.L=218（96dpi）/ 327（144dpi，w-pad=334）⇒ 行尾 4–7px 落在竖带下面；
+        竖带是后画的，直接盖住文字。
+  修法：右端改成"让开竖带"的内容右边界（:2222-2226）：detailRight = w - pad，
+        仅当竖带在右侧且落在行内时取 rail.L - Scaled(2)；贴左布局（pad=28）不受影响。
+  证明：修复后 96dpi 行尾 216 < 218、144dpi 325 < 327；shots 里字尾完整、与竖带留 2px 缝；
+        命中矩形不受影响（20 个布局用例仍全绿）。
+
+1.5 命中区压住竖带：点课件库行尾 / 下一页 / 返回的右端，卡片被收起
+  现象：贴右时点行尾那一条（约 11px 宽）不是选中该行，而是把卡片收起；
+        历史面板的行尾和「‹ 返回」右端同样。老师点了没反应/莫名收起。
+  根因：行框左右各外扩 7px 免瞄准：`pad-7 … w-pad+7`（行 :2195、返回 :2254、
+        翻页 :2242-2243、历史面板 :662/:671），贴右时右端 229 > 竖带 218；
+        OnClick 里第一条命中判断就是 collapseHit（:1709），所以拇指落在竖带范围内一律先收起。
+        「哪一份？」面板早就做了裁切（:2283-2291 的 hitT/hitR），其它面板漏了。
+  修法：抽出 ClipHit(row, rail, gearHit)（:1923）——按竖带内沿砍右端（贴左时砍左端）、
+        把压到齿轮命中区的上沿抬到 GearHit.B；套用到 filterHits（:2162）、fileRowHits
+        （:2200）、pagePrevHit / pageNextHit（:2242-2243）、fileBack（:2254）、
+        历史行与返回（:662/:671）。
+  证明：harness 逐矩形断言 + 点击取证。
+        基线：96dpi 课件库 10 个命中区越界（fileRowHits 右端全是 229、pageNextHit 229、
+              backHit 229），历史面板 4 个；点 (228,91) 命中的是"收起"（断言失败）；
+              144dpi 课件库同样 10 个；矮屏用例 9 个。
+        修复版：全部 0 个越界；点 (217,91) 命中该行、(220,91) 正常收起；144dpi 点 (326,136) 命中行。
+        说明：竖带画在行之后、本来就盖在行上，所以"看到竖带就收起"不算视觉错误——
+        这条修复的价值是让命中区与视觉边界一致，消掉"点在行上却没选中"的边界纠纷。
+
+1.6 15 秒自动收起偶尔彻底失效（竞态丢一轮，之后再也不收）
+  现象：极少数情况下卡片不再自动收起，要等下一次点击或状态推送才恢复。
+  根因：OnHideTimer（:1322）里 `if ((UtcNow - lastActivity).TotalSeconds < autoHideSeconds - 0.5) return;`
+        —— 定时器是 OneShot（Change(seconds, Infinite)），早到（与点击同一毫秒）时直接返回、
+        没有重排，这一轮就永久丢了，直到下次 RestartHideTimer。
+  修法：早到时按剩余时间重排 `t.Change(TimeSpan.FromSeconds(autoHideSeconds - idle), Infinite)`
+        （:1328 一带）；真的到点仍走 Wake(WM_APP_HIDE)。
+  证明：改后 OnHideTimer 不再有"返回但不重排"的分支（逻辑收敛）；
+        harness 在 Prepare 里显式 autoHide:false，保证定时器不会在测量途中收面板。
+
+=====================================================================
+2. 规范性修正（不是 bug，但改了更稳；单列以免夸大）
+=====================================================================
+2.1 GdiCanvas 画笔释放顺序（字段 :2735、ctor :2772、Dispose :2900）
+    原写法 CreatePen(PS_NULL) → SelectObject → Dispose 里直接 DeleteObject(nullPen)，
+    没先把 DC 原来那支笔还回去。**实测不构成跨次泄漏**：DeleteObject 对"仍选在 DC 里"的
+    画笔返回 True 但不真释放，真正释放发生在 DeleteDC，而 Paint 每帧都 DeleteDC。
+    实测 Paint × 60 前后 GDI 对象 11 → 11（修复版与基线一模一样）。
+    改法只是让释放时机确定、不依赖 DC 生命周期，因此不计入 bug。
+
+2.2 空值兜底（:1359 ApplyPending、:1535 OnConsistencyCheck、:330 Diag）
+    pending 字段初值就是 new CardState()（:68），服务层 OnStateChanged 的 st 也来自引擎、
+    不会为 null，所以这三处是防御性加固。Diag 原来直接读 now.DeckOpen（同函数其它地方
+    都判了 now == null），一旦真被置 null 会抛，顺手统一成局部 s = now ?? new CardState()。
+
+2.3 Paint 顶部清 collapseHit / jumpHit（展开分支 :2032-2033，收起分支 :2048-2049）
+    原来只有"正常卡"分支会清 jumpHit，其它分支靠"反正都 return"侥幸不出错；
+    真出问题要等以后新增分支，属隐患治理，当前不可复现，不计入 bug。
+
+=====================================================================
+3. 发现但没改（含原因）
+=====================================================================
+3.1 多屏：WorkingArea() 只取 SPI_GETWORKAREA（:2492-2496，只问主屏工作区），Place 永远贴主屏；
+    拖到副屏会被 WM_DPICHANGED / WM_DISPLAYCHANGE 拉回主屏，DropCard 的垂直百分比也按主屏
+    高度算。改它要引入 MonitorFromWindow + GetMonitorInfo，并改 PositionChanged 的
+    (bool onRight, int percent) 语义（服务层在存这两个值），超出"只修卡片层 bug"的边界。
+3.2 EnsureFont 用 AddFontResourceExW 加载自定义字体（:1016），Dispose 里没有对应的
+    RemoveFontResourceExW。每次 Arm/Disarm 会往进程字体表里多挂一份。
+    没改的原因：字体表是进程共享的，贸然 Remove 可能把宿主/控制面板正在用的同一份字体摘掉，
+    需要在服务层统一管理字体生命周期。
+3.3 高度表与 Paint 起笔差 2px：ContentHeight96 用 10 起算、Paint 从 Scaled(12) 起笔，
+    各面板底部实际留白比表里算的多 12px（FileBackStep=26 而返回行只画 22）。
+    核实过不裁切、不越界（正常卡 12+20+54+8+32+8+4+8+18+12=176 = CardContent96；
+    预备态 128 正好），纯留白差异；改表会牵动所有面板高度，风险大于收益。
+3.4 旧注释残留：:1044-1045 还写着"贴右时药丸停在卡片左边缘、离屏边还有 cardWidth-tabWidth"，
+    与 CollapsedPill（x0 = OnRight ? cardWidth - tabWidth : 0，:1079）已经不符。
+    只影响可读性，未改（改注释要整段重排，容易和并行改动撞车）。
+3.5 96dpi 课件库文件名列偏窄：nameW = inner - detailW - 14，96dpi 下常常只剩 60px，
+    名字被 Ellipsis 截成"1.4 测量平…"。属窗口只有 236px 宽的设计取舍，不算 bug。
+3.6 FilterChips 里"当前筛选不可见时强行补一个 chip"（:782）可能撑出 inner（chip 压到竖带/
+    齿轮区域）；触发条件是筛选值不在前 5 个科目里，点击命中已被 ClipHit 夹住，
+    视觉上 chip 越界 4-8px，未改。
+3.7 Dispose 不 Join 消息线程、hwnd 不归零（:2500）；服务层 Disarm 会把 card 置空，
+    目前没有消费者读旧实例的 IsCreated，改动收益低。
+
+=====================================================================
+4. 视觉复核（自己看过，不是只跑断言）
+=====================================================================
+* audit-card-96-right-normal.png：标题 / 大页码 12 / 共 30 页 / 「已经讲到最后一页」/
+  橙色「从第 8 页接着讲」/ 进度条 / 「历史 · 3 次 ›」全在窗口内，右列没有被竖带切掉。
+* audit-card-96-right-files.png、audit-card-144-right-files.png：三个筛选 chip、「物理」分组、
+  8 行、行尾详情右对齐（1.4 之后不再顶到竖带）、「‹ 上一页 1/2 下一页 ›」、「‹ 返回」完整。
+* audit-card-96-left-files.png：贴左布局 pad=28、竖带在最左，行文字没有被"❮"箭头压住。
+* audit-card-96-right-history.png / -144-right-history.png：标题、3 行历史（最新一行橙色）、返回。
+* audit-card-96-right-samename.png：「哪一份？（同名 3 份）」+ 三个候选各两行 + 返回，
+  行高 40 与高度表一致，末行没有被窗口下边缘裁掉。
+* audit-card-96-right-ready.png：两行正文 + 橙色「打开并接着讲」，按钮底边距窗口下沿 12px。
+* audit-card-96-right-pill.png / -144：药丸只有右侧 32px、箭头 + 竖向进度条；
+  屏幕上的可见形状由窗口 region 决定（PrintWindow 会连被裁掉的区域一起画出来，
+  所以图里看得到整块底板，属正常）。
+* 高度自洽：20 个用例里每个窗口高度都 ≤ 工作区（含 600/540 矮屏用例）；
+  矮屏时 FilePageSize 自动缩页（144dpi/540 → 每页 7 行、窗口 486，命中区无越界）。
+
+=====================================================================
+5. PanelRows.cs
+=====================================================================
+逐行看过（63 行）：PanelRow 的 IsSelected 有相等短路再发 PropertyChanged；
+Detail/Subline/HasBadge 都是派生只读；PanelGroup.Rows 可空兜底。
+消费方 ControlPanel.axaml.cs:314-324 每次重建 ObservableCollection<PanelGroup>、
+:358-386 手工维护 IsSelected，与实现一致；PanelGroup 不需要 INotifyPropertyChanged
+（Rows 只在重建时换新对象）。未发现 bug，本轮未改。
+
+=====================================================================
+6. 构建与警告
+=====================================================================
+命令：& 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build
+      'C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\ClassSlideSync.Plugin.csproj'
+      -c Release -t:Rebuild
+结果：200 个警告 / 0 个错误 —— 与基线一致，未新增警告，也未新增警告类别。
+我改的两个文件贡献 21 条，全部是审计前就存在的类别（CS8618 事件可空性 ×8、CS8625 ×3、
+CS8603、CS8604 ×2、CS8622 ×2、CS0414 wakePending）。
+（审查期间 bin 目录多次被并行任务占用/清空；某一时点曾读到 201 条，是另一位 agent 正在改的
+ Services/SlideSyncService.cs 中间态，收敛后回到 200。为绕开 MSB3026 文件锁，中途验证构建
+ 输出到 %TEMP%\audit-card\out\；最终以正式命令就地 Rebuild 复核，产物
+ bin\Release\net8.0-windows\ClassSlideSync.Plugin.dll，312832 字节，22:12。）
+
+结论：卡片层确认并修复 6 个真 bug（其中 3 个带修复前后行为数字：换分辨率、捕获丢失、
+同名换课件；另外 3 个是命中区压竖带、文字被竖带裁切、自动收起竞态），另做 3 项规范性加固；
+未修项已在第 3 节列出原因。20 个布局用例 + 3 个行为用例在修复版全绿、基线 64 条失败；
+最终产物（bin 下就地 Rebuild 的 dll）又跑了一遍同一套用例：全部断言通过、exit=0、
+GDI 对象 11 → 11。

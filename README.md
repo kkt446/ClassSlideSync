@@ -1,4 +1,4 @@
-﻿# 课件续页
+# 课件续页
 
 **记住每份课件讲到第几页。下次打开同一份课件，点一下就从那一页接着讲。**
 
@@ -84,10 +84,38 @@ ClassIsland 数据目录下：
 - `Config\Plugins\ClassSlideSync.Plugin\app.log` —— 运行日志（诊断日志开着时才详细）。
 - `Config\Plugins\ClassSlideSync.Plugin\SyncSettings.json` —— 本插件的设置。
 
+## 仓库结构
+
+```
+Plugin.cs                       插件入口：注册设置页、自动化行动/触发器、组件
+Core/                           不放窗口的一切：台账、引擎、桥接、版式计算、平台兼容
+  Ledger.cs                     历史台账（JSON、原子写、按课件归并）
+  SessionEngine.cs              状态机：检测放映 → 记页码 → 落盘（250 ms 循环 + 看门狗）
+  PptBridge.cs                  PowerPoint / WPS 的 COM 桥（Windows）
+  SeewoBridge.cs                希沃白板本机 MCP 桥（Windows）
+  LinuxSlideSource.cs           Linux 文件桥 ~/.local/share/classslidesync/
+  Appearance.cs                 颜色、DPI、主题解析
+  SyncSettings.cs               全部设置项 + 变更通知
+Services/SlideSyncService.cs    把课表、引擎、卡片、面板、通知串起来
+Ui/                             窗口层
+  NativeOverlayCard.cs          Windows 浮层卡片（Win32 分层窗口 + GDI 自绘）
+  LinuxCardWindow.cs            Linux 浮层卡片（Avalonia）
+  ControlPanel.axaml(.cs)       控制面板：课件库 / 设置 / 关于
+Views/SettingsPages/            宿主设置页（应用设置 → 插件 → 课件续页）
+Components/                     主界面组件「课件进度」
+Automation/                     自动化行动、触发器、设置抽屉
+tools/                          构建期与随包工具
+  ToastHelper/                  通知 helper（独立进程，见 csproj 的子工程目标）
+  linux-adapters/               Linux 适配器：libreoffice/（UNO）、wps/（加载项）
+  make-icon.py / make-sample-pptx.py / shot.ps1
+test/                           自测课件（纯页码课件.pptx 等）
+docs/reports/                   本地审计与测试报告（不入库）
+```
+
 ## 已知限制
 
 - 刚打开课件的一两秒里，WPS 的自动化接口还没就绪：卡片会先靠窗口标题认出课件、直接显示「上次停在第 N 页」，但**实时页码**要等接口就绪后才跟上。接口超过 4 秒不回话时，插件会暂停 6 秒再试（`app.log` 里记 `slow COM: …`），这段时间卡片不卡、只是页码不刷新。
-- 只跟踪 PowerPoint 和 WPS 演示，其他演示软件不支持。
+- Windows 上跟踪 PowerPoint 与 WPS 演示；Linux 上靠随包适配器跟踪 LibreOffice Impress（WPS Linux 属实验性）。其他演示软件不支持。
 - Linux 上页码要靠随包适配器（`tools/linux-adapters/`）：LibreOffice Impress 已实测可用，WPS Linux 只在 12.1.2 上验证到「加载项被登记但不执行」，属实验性。
 
 ## 更新日志

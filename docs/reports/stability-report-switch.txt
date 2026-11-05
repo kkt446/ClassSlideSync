@@ -1,0 +1,113 @@
+课件续页 · 功能7「课前预览上次没讲完的课件」开关接入报告
+====================================================================
+
+日期：2026-10-24
+仓库：C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin
+构建：& 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build '...\ClassSlideSync.Plugin.csproj' -c Release -t:Rebuild
+结果：0 个错误 / 200 个警告（基线 200，未新增；日志 %TEMP%\ready-switch-build-final.log）
+
+一、改了哪些文件、哪些行
+--------------------------------------------------------------------
+只动了两个 XAML 文件，两个 code-behind 都没有改动（不需要：两处都是纯绑定）。
+
+1. Views\SettingsPages\SlideSyncSettingsPage.axaml:100-112（新增 13 行）
+   位置：「运行时机」组里，「上课前自动待命」之后、「提前多少秒待命」之前。
+   - 中文注释 2 行（100-101）。
+   - `<controls:SettingsExpander x:Name="ReadyCardRow" ...>`
+     · IconSource = FluentIconSource &#xE81C;（与相邻设置行同样的图标列，行高对齐）
+     · Header = 「课前预览上次没讲完的课件」
+     · Description = 「上课前两分钟，如果这一科上次没讲完，卡片先亮出来，写着上次停在第几页。关掉就只在真正放映时出现。」
+     · IsVisible = `{Binding Settings.AutoStartBeforeClass}`（与「提前多少秒待命」「下课后保留多久」一致：自动待命关掉时整行收起，避免出现「不待命却预览」的矛盾配置）
+   - Footer 内 `<ToggleSwitch x:Name="ReadyCardToggle" IsChecked="{Binding Settings.ReadyCardEnabled, Mode=TwoWay}"/>`（108-110）。
+   文件总行数 418 → 432。
+
+2. Ui\ControlPanel.axaml:408-419（新增 12 行）
+   位置：「设置」页签 →「运行时机」组 →「上课前自动待命」之后、「提前多少秒待命」之前。
+   - 同样的 x:Name（ReadyCardRow / ReadyCardToggle）、同样的 Header/Description、同样的 IsVisible 绑定、同样的 TwoWay 绑定。
+   - 风格与同页其它开关一致：SettingsExpander + Footer + ToggleSwitch；面板离线测试不加载宿主图标，所以这一行不加 IconSource（与同页其它行一致）。
+   文件总行数 770 → 783。
+
+3. 两处都没有「搜索设置项」的过滤逻辑
+   设置页本身没有搜索框；控制面板的 SearchBox（Ui\ControlPanel.axaml 课件库页）只过滤课件库列表，不索引设置项。官方文档
+   https://docs.classisland.tech/dev/settings-page.html 也只约定 SettingsPageBase / SettingsPageInfo / 注册方式，没有设置项搜索 API。
+   因此任务第 3 条没有可接入的现有实现，未新增搜索机制（不另起一套）。
+
+二、开关怎么做到「改完即时生效」
+--------------------------------------------------------------------
+沿用仓库现有机制，没有新增事件或刷新代码：
+- 两处 ToggleSwitch 都直绑同一个 SyncSettings 实例（页面 DataContext=this，Settings => Plugin.Settings；
+  面板 DataContext=this，Settings 就是构造时传进来的那个实例）。Avalonia 的 TwoWay 绑定写回属性，
+  SyncSettings.Set(...) 触发 PropertyChanged。
+- Plugin.cs 已经订阅 Settings.PropertyChanged：每次变化都 ConfigureFileHelper.SaveConfig 落盘，并调用
+  Service.OnSettingsChanged()（重算外观 / 卡片配置 / 日志 / 清理历史）。
+- SessionEngine.SetReady 每次被调用时都重新读 settings.ReadyCardEnabled（Core\SessionEngine.cs:981），
+  调度器约 2 秒 tick 一次：关掉后下一轮 SetReady 得到 on=false，预备态快照被清掉；重新打开则下一轮恢复。
+  也就是说不需要重启、不需要重进页面。
+
+三、构建
+--------------------------------------------------------------------
+命令：& 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build 'C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\ClassSlideSync.Plugin.csproj' -c Release -t:Rebuild
+输出：0 个错误，200 个警告，退出码 0，耗时约 4.3 秒。
+警告与基线一致（200）；末尾两条 AVLN3001（ControlPanel.axaml / SlideSyncSettingsPage.axaml「no public constructor」）
+是这两个文件本来就有的 XAML 资源警告，不是这次新增。
+
+构建过程备注（如实记录）：21:42 仓库里出现了一个 tools\ToastHelper\ 辅助工程（不是本次改动），主工程的默认
+Compile glob 把它的源码和 obj 生成文件一起编了进去，导致 21:45 左右按上面命令构建出现 11 个 error
+（CS0579 重复特性、CS0234 Windows.Data/UI）。我用「同源码、排除 tools 的临时副本」验证过这次 XAML 改动本身
+是 0 error / 200 warning；随后主 csproj 增加了 `<Compile Remove="tools\**\*.cs" />` 等排除项（非我改动，我无权也
+没有动 csproj），21:49 再按原命令构建即为 0 error / 200 warning。最终数字以上面的结果为准。
+
+四、离线验收（不启动 ClassIsland / WPS / PowerPoint / 希沃）
+--------------------------------------------------------------------
+测试工程：%TEMP%\ready-switch\（ReadySwitchTests.csproj + Program.cs，仓库内不放测试文件）
+方式：Assembly.LoadFrom 加载真实 bin\Release\net8.0-windows\ClassSlideSync.Plugin.dll（21:49 构建），
+Avalonia 11.3.17 + FluentAvaloniaUI 2.4.1 离屏；ClassIsland 只从本机 2.1.0.1 安装目录解析宿主 dll，
+没有启动其中任何 exe。窗口放在 (-4000,-4000) 离屏渲染。
+
+断言：32 条，全部通过，0 失败（日志 %TEMP%\ready-switch\run-final.log）。
+覆盖点：
+1) SyncSettings 默认值：ReadyCardEnabled = true（1 条）。
+2) 控制面板「设置」页签（12 条）：
+   - 三页 TabControl 仍在；按名字能找到 ReadyCardToggle，且全树只有 1 个；
+   - ReadyCardRow 的 Header / Description 与要求逐字一致；
+   - 初始值与 Settings.ReadyCardEnabled 一致（开）；
+   - UI → Settings：把开关拨到关，Settings.ReadyCardEnabled 变 false；
+   - Settings → UI：代码改回 true，开关自己亮；
+   - 行随 Settings.AutoStartBeforeClass 隐藏 / 恢复。
+3) SessionEngine 闸门（8 条，用同一个 settings 实例反射造真实引擎 + 真实 Ledger）：
+   - 面板关掉后 SetReady(pptx,5,12) → BuildState(false,0,0) 的 ReadyOnly=false；
+   - 面板打开后 → ReadyOnly=true，ReadyFile 是传入的真实路径，ReadySlide=5，ReadyRemaining=12；
+   - 再次关掉后 SetReady → ReadyOnly 又变 false（预备态被清掉）；
+   - 再打开 → 仍能进入预备态。
+4) 插件设置页（11 条）：控件存在且唯一、Header/Description 逐字一致、初始值一致、
+   UI→Settings、Settings→UI、行随 AutoStartBeforeClass 显隐，页面构造不抛异常。
+
+五、截图（自己看过）
+--------------------------------------------------------------------
+1) %TEMP%\ready-switch\shots\settings-ready-row.png（900×620）
+   插件设置页「运行时机」组：新行位于「上课前自动待命」与「提前多少秒待命」之间，功能图标 + 两行描述完整显示，
+   ToggleSwitch 在右侧、处于 On，行高与上下行一致，没有截断或重叠。
+2) %TEMP%\ready-switch\shots\panel-ready-row.png（1000×680）
+   控制面板「设置」页签：同一位置、同一文案，右侧开关 On；与同页其它行同为 SettingsExpander + 右侧 ToggleSwitch 风格，
+   三页签仍在顶部，没有把「课件库 / 设置 / 关于」挤坏。
+
+看图后没有需要返工的地方；两张图都是「开」的状态。关掉「上课前自动待命」时整行收起的样子在断言里验过。
+
+六、没有验证的部分
+--------------------------------------------------------------------
+1) 没有在真实 ClassIsland 宿主里点过：开关的视觉主题（宿主主题色、亚克力背景、真实 SettingsExpander 样式）
+   与离屏 FluentAvalonia 渲染可能有差异；也没有验证鼠标点击 / 键盘焦点 / 触屏切换。
+2) 没有验证真实落盘：PropertyChanged → ConfigureFileHelper.SaveConfig 写 SyncSettings.json 的链路只做了代码审查，
+   测试里用的是临时 DataFolder，未等宿主的防抖/保存时机。
+3) 没有跑真实调度器：SetReady 是用真实引擎 + 手工调用验证的，没有等 2 秒 tick、没有接 ClassIsland 的真实课表时钟；
+   「上课前两分钟」的判定本身属于既有服务逻辑，不在本次改动范围。
+4) 没有验证真实预备卡片（Ui\NativeOverlayCard.cs）上「上次停在第几页」的实际文案与排版——本次只接开关，
+   卡片渲染未改动。
+5) DPI 缩放下的实际像素、以及宿主窗口最小尺寸下的换行未验证（离屏固定 96 DPI）。
+6) tools\ToastHelper 的构建冲突属于其它改动，未由我修复；我只确认了排除后主工程 0 error。
+
+七、结论
+--------------------------------------------------------------------
+两处 UI（插件设置页、控制面板「设置」页签）都已出现「课前预览上次没讲完的课件」开关，初始值与
+SyncSettings.ReadyCardEnabled 一致，双向即时生效；关掉后真实 SessionEngine 的 SetReady 不再进入预备态，
+重新打开可恢复。Release Rebuild 0 error / 200 warning（与基线一致），离线断言 32/32 通过，两张截图已核对。

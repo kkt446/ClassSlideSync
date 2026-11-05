@@ -1,0 +1,477 @@
+================================================================================
+ClassSlideSync.Plugin · 功能3「历史行写清是哪一节课」+ 修 lessonContext 永不赋值
+报告时间：2026-10-24 17:58（Asia/Shanghai）
+================================================================================
+
+一、做了什么（结论先行）
+--------------------------------------------------------------------------------
+1. 历史行的文案从「第 N 页 · 3 小时前」换成能定位到一节课的写法：
+     有课表信息：周三 第 3 节 · 15:20 · 第 5 → 8 页
+     没有课表信息：10-24 15:20 · 第 5 → 8 页
+2. 修掉真 bug：Services\SlideSyncService.cs 里的 lessonContext 从来没被赋值，导致
+   SessionEngine.BeginSession 里写 Subject / LessonName 的那段永远不执行（老师真实台账
+   7 个桶 39 条记录 Subject / LessonName 全空、课件库分组只有「未标注科目」）。现在它接
+   到 ClassIsland 的课表服务，并且写成「内存快照 + 调度器 2 秒刷新」，不在引擎线程读宿主。
+3. 台账 SessionRecord 新增 Weekday / Period / PeriodName 三个字段，老 JSON 缺字段照样能
+   Load（值为 0 / null，不当坏文件）。
+4. 文案格式化抽成纯函数 Core\HistoryLine.cs，绘制里只留「挑一个放得下的写法」。
+5. 行高、面板高度体系（ContentHeight96）一个字没动：16 组高度与改动前的 dll 逐项相同。
+
+构建：0 error。断言：65 条，0 失败。出图：6 张 PNG，逐张看过。
+
+================================================================================
+二、改动清单（行号以 2026-10-24 17:56–17:58 两次构建间的工作区为准，收尾时逐条 grep 复核过）
+================================================================================
+注意：这个仓库在我干活期间**不是独占的**，另一个任务同时在改 Ui\NativeOverlayCard.cs
+（+90 行课件库面板）、Core\PanelData.cs、Ui\PanelRows.cs、Ui\ControlPanel.axaml*、
+Core\PptBridge.cs。下面的行号取自最终构建那一刻，之后可能整体漂移；按函数名 grep 更稳。
+
+新增文件
+--------
+Core\LessonTag.cs（182 行，新）
+    :19  public sealed class LessonTag            —— 课表读数快照（Subject/LessonName/PeriodName/Period/Weekday/Context）
+    :40  public string Context                    —— 卡片副标题用，"数学 · 第 3 节"
+    :57  public static class LessonTimetable
+    :63  public sealed class Slot                 —— 离线喂给节次算法的时段（不引用 ClassIsland 类型）
+    :73  public static int WeekdayOf(DateTime t)  —— Sunday=0 → 7
+    :83  public static int PeriodAt(IList<Slot> slots, TimeSpan at)
+    :105 public static List<Slot> SlotsOf(ClassPlan plan)
+    :135 public static LessonTag Read(DateTime now)  —— 全程 try/catch，拿不到就返回只有周几的标签
+    :165 static ClassPlan PlanOf(ILessonsService lessons, DateTime now)
+
+Core\HistoryLine.cs（148 行，新）
+    :26  public static string Format(SessionRecord r)
+    :31  public static string Format(SessionRecord r, DateTime today)
+    :37  public static string Format(int weekday, int period, string startedAt, int startSlide, int endSlide, DateTime today)
+    :48  public static string[] Variants(...)     —— 从最全到最省，绘制按宽度挑
+    :77  public static string Slot(int weekday, int period)
+    :88  public static string Pages(int startSlide, int endSlide)
+    :103 public static string Clock(string startedAt)   —— 只要 "15:20"
+    :116 public static string When(string startedAt, DateTime today, bool withClock)
+
+改动的文件
+----------
+Core\Ledger.cs
+    :27  public int Weekday { get; set; }         // 1 = 周一 … 7 = 周日，0 = 不知道（老记录）
+    :28  public int Period { get; set; }          // 当天第几节（1 起），0 = 数不出来
+    :29  public string PeriodName { get; set; }   // 时段自己的孩子名（BreakName），没有就是空
+    三个属性都只加在 SessionRecord 末尾，没有初始化器：老 ledger.json 里没有这几个键时
+    System.Text.Json 留默认值（0 / null），Load 不会因此进 catch、不会把好台账改名 .corrupt-。
+
+Core\SessionEngine.cs
+    :19  public string[] Labels = new string[0];  // CardHistoryItem 新增：一条记录的几种写法
+    :206 public Func<LessonTag> LessonContext { get; set; }   // 原 Func<string[]>，语义改成整包标签
+    :763-765  current.Weekday / Period / PeriodName = tag.xxx（BeginSession 里写台账）
+    :774 日志行追加 " period=N"
+    :1002-1004 Retarget 复制旧记录时补三个新字段（换课件改成同一份时不能丢节次）
+    :1197 st.Context = tag.Context（卡片副标题）
+    :1256 历史行 Labels = HistoryLine.Variants(...)
+    删除了 HistoryLabel() 与只给它用的 Duration()（原位置留注释指向 Core\HistoryLine.cs）。
+
+Core\CardFileList.cs
+    :137 历史行同样走 HistoryLine.Variants(...)
+    :218 static string SubjectOf(List<SessionRecord> records)  —— 仍优先 Subject，空则按
+         PeriodName → LessonName 的顺序"捡"一个像科目的，捡不到保持 ""
+    :242 internal static bool LooksLikeSubject(string? s)  —— 拒绝空 / 超过 12 字 / "第…节" /
+         课间 / 午休 / 自习 / 上课 / 放学 / 分割线 / 行动 / 未标注科目
+
+Ui\NativeOverlayCard.cs
+    :522 void DrawHistoryPanel(GdiCanvas g, CardState st, int w, int pad, int inner,
+                               int y, int lineSmall, int lineJump, int stepJump,
+                               Color32 accent, Color32 muted)   —— Paint 里那段历史绘制整块搬出来
+    :560 string FitHistory(CardHistoryItem item, GdiCanvas g, int inner)  —— 按 Labels 挑第一个放得下的
+    :724 int ContentHeight96(CardState st)        —— 一个字没改
+    :1724 Paint 里只留一行 DrawHistoryPanel(...) 调用
+    为什么是私有方法：GdiCanvas / Color32 / Rect32 都是 NativeOverlayCard 的私有嵌套类型，
+    改成 internal 会 CS0051（可访问性不一致）。测试工程用反射 BindingFlags.NonPublic|Instance 调。
+
+Services\SlideSyncService.cs
+    :35  Func<LessonTag> lessonContext;           // 类型从 Func<string[]> 改过来
+    :44  volatile LessonTag lessonTag = new LessonTag();   // 引擎线程只读它
+    :78  lessonContext = () => lessonTag;         // ← 真 bug 的修复点：构造函数里就有值了
+    :102 public Func<LessonTag> LessonContext { get; set; }  // setter 仍会把新值转给当前引擎
+    :151 ScheduleTick 里 RefreshLessonTag();      // 每 2 秒一次（调度器原有节奏）
+    :282 void RefreshLessonTag()                  // 读课表 → 换快照 → 变化时写一行日志
+    :433 Arm() 里 new SessionEngine{ LessonContext = lessonContext, ... }
+    :515 WatchdogTick 重启引擎时把 ctx 带过去（原有逻辑，类型跟着改）
+
+未改：Plugin.cs（服务的构造函数已经自带 lessonContext，不需要在 Initialize 里再接线）、
+manifest.yml、版本号、csproj（没有加任何 NuGet 依赖）。
+
+================================================================================
+三、关键代码片段
+================================================================================
+1) 真 bug 的修复（Services\SlideSyncService.cs:35-46 / 71-79）
+        Func<LessonTag> lessonContext;
+        /// <summary>
+        /// 课表读数快照：科目、周几、第几节。只由调度器（每 2 秒）刷新，引擎线程只读。
+        ///
+        /// 为什么要缓存：2026-10-24 之前 lessonContext 这个字段**从来没被赋值**，引擎里那段
+        /// "把科目写进台账"的代码等于不存在，台账 39 条记录的 Subject / LessonName 全是空串。
+        /// 接上课表服务时又不能现场读 —— SessionEngine.BuildState 每次状态心跳（一秒好几次）
+        /// 都会问一遍"现在哪一科"，那是宿主的属性通知链，不能放在引擎线程上。
+        /// </summary>
+        volatile LessonTag lessonTag = new LessonTag();
+
+        public SlideSyncService(SyncSettings settings, string pluginConfigFolder)
+        {
+            this.settings = settings;
+            this.pluginConfigFolder = pluginConfigFolder;
+            // 2026-10-24 修 bug：以前这里是 null，引擎里 beginSession 的科目写入永远不执行。
+            lessonContext = () => lessonTag;
+        }
+
+2) 读课表（Core\LessonTag.cs:135-160）—— 每一处都可能拿不到，一律不抛
+        public static LessonTag Read(DateTime now)
+        {
+            var tag = new LessonTag();
+            tag.Weekday = WeekdayOf(now);
+            try
+            {
+                var lessons = IAppHost.TryGetService<ILessonsService>();
+                if (lessons == null) return tag;
+
+                var subject = lessons.CurrentSubject;
+                if (subject != null && !string.IsNullOrWhiteSpace(subject.Name)) tag.Subject = subject.Name.Trim();
+
+                var item = lessons.CurrentTimeLayoutItem;
+                if (item != null) tag.PeriodName = Clean(item.BreakName);
+
+                tag.Period = PeriodAt(SlotsOf(PlanOf(lessons, now)), now.TimeOfDay);
+                tag.LessonName = tag.PeriodName.Length > 0
+                    ? tag.PeriodName
+                    : (tag.Period > 0 ? "第 " + tag.Period.ToString(CultureInfo.InvariantCulture) + " 节" : "");
+            }
+            catch
+            {
+                // 读课表失败 = 当作"不知道是哪节课"，历史行退回日期格式，插件照常记页码。
+            }
+            return tag;
+        }
+
+3) 第几节（Core\LessonTag.cs:83-98）—— 只数 TimeType == 0（上课）
+        public static int PeriodAt(IList<Slot> slots, TimeSpan at)
+        {
+            if (slots == null) return 0;
+            int n = 0;
+            for (int i = 0; i < slots.Count; i++)
+            {
+                var s = slots[i];
+                if (s == null || s.TimeType != 0) continue;
+                n++;
+                // 起止写反的时段（跨零点、或老师手工填错）不参与判断，但节号照样占一位，
+                // 免得它后面所有节的号码整体往前挪一格。
+                if (s.End <= s.Start) continue;
+                if (at >= s.Start && at < s.End) return n;
+            }
+            return 0;
+        }
+
+4) 文案（Core\HistoryLine.cs:48-76）
+        public static string[] Variants(int weekday, int period, string startedAt,
+                                       int startSlide, int endSlide, DateTime today)
+        {
+            string slot = Slot(weekday, period);
+            string pages = Pages(startSlide, endSlide);
+            string clock = Clock(startedAt);
+            string whenFull = When(startedAt, today, true);
+            string whenDay = When(startedAt, today, false);
+
+            var list = new List<string>(4);
+            if (slot.Length > 0)
+            {
+                // 有节次就不写日期了：周几 + 第几节已经能定位到具体一节课，再写日期是多余的字
+                Add(list, Join(slot, clock, pages));
+                Add(list, Join(slot, pages));
+            }
+            else
+            {
+                Add(list, Join(whenFull.Length > 0 ? whenFull : whenDay, pages));
+                Add(list, Join(whenDay, pages));
+            }
+            Add(list, pages);
+            return list.ToArray();
+        }
+
+    时间一律 InvariantCulture，并且把分隔符转义掉（这是上一轮 ar-SA 事故的教训）：
+        t.ToString(@"HH\:mm", CultureInfo.InvariantCulture)
+        t.ToString(@"MM\-dd", CultureInfo.InvariantCulture)   // 跨年 yyyy\-MM\-dd
+
+5) 绘制时按宽度降级（Ui\NativeOverlayCard.cs:560-577）
+        string FitHistory(CardHistoryItem item, GdiCanvas g, int inner)
+        {
+            ...
+            for (int i = 0; i < variants.Length; i++)
+            {
+                string v = variants[i];
+                if (string.IsNullOrEmpty(v)) continue;
+                if (g.TextWidth(v, g.FontTiny) <= inner) return v;
+            }
+            ...
+            return g.Ellipsis(all, g.FontTiny, inner);   // 都放不下才截断
+        }
+    即：有节次时先牺牲「时:分」，再牺牲「节次」，最后只剩页码；页码和节次优先级最高。
+
+================================================================================
+四、lessonContext 接的是哪个 API（真实签名，反射自已装的 2.1.0.1 SDK）
+================================================================================
+用 %USERPROFILE%\.nuget\packages 里的 classisland.core / classisland.shared / classisland.pluginsdk
+2.1.0.1 反射出来的，不是猜的：
+
+  ClassIsland.Core.Abstractions.Services.ILessonsService
+      : INotifyPropertyChanged, INotifyPropertyChanging,
+        ClassIsland.Shared.IPC.Abstractions.Services.IPublicLessonsService
+      ClassPlan GetClassPlanByDate(DateTime date, out Guid? guid);
+      void StartMainTimer();  void StopMainTimer();
+      ObservableCollection<int> GetCyclePositionsByDate(DateTime? referenceTime);
+
+  ClassIsland.Shared.IPC.Abstractions.Services.IPublicLessonsService（父接口）
+      Subject CurrentSubject { get; set; }
+      TimeLayoutItem CurrentTimeLayoutItem { get; set; }
+      ClassPlan CurrentClassPlan { get; set; }
+      TimeState CurrentState { get; set; }
+      bool IsClassPlanEnabled { get; set; }  bool IsClassPlanLoaded { get; set; }
+      ClassPlan GetClassPlanByDate(DateTime date);
+
+  ClassIsland.Shared.Models.Profile.Subject
+      string Name { get; set; }   string Initial { get; set; }   string TeacherName { get; set; }
+
+  ClassIsland.Shared.Models.Profile.ClassPlan
+      ObservableCollection<TimeLayoutItem> ValidTimeLayoutItems { get; }
+      TimeLayout TimeLayout { get; }
+
+  ClassIsland.Shared.Models.Profile.TimeLayout
+      ObservableCollection<TimeLayoutItem> Layouts { get; set; }
+
+  ClassIsland.Shared.Models.Profile.TimeLayoutItem
+      TimeSpan StartTime { get; set; }   TimeSpan EndTime { get; set; }
+      int TimeType { get; set; }         // 0 = 上课, 1 = 课间, 2 = 分割线, 3 = 行动
+      string BreakName { get; set; }     // ← 没有 Name 属性，时段名只能取这个
+      string BreakNameText { get; }
+
+  取服务：ClassIsland.Shared.IAppHost.TryGetService<ILessonsService>()（与 LessonClock.cs、
+  CurrentSubjectName() 里现有用法一致）。
+
+  两处与需求原文的偏差（按真实 API 写，没硬套）：
+    a) 需求说「取 TimeLayout 的 Layouts[0]」。实际上 ClassIsland 2.1 的 TimeLayout.Layouts
+       就是时段列表本身，没有再嵌套一层"layout 数组"，所以直接 foreach 遍历它（SlotsOf）。
+    b) 需求说「CurrentTimeLayoutItem 那里能拿到名字就用它」。TimeLayoutItem 没有 Name，
+       只有 BreakName，所以 PeriodName 取 BreakName（课间/午休那类名字）；老师的课表如果
+       没填，PeriodName 就是空串，LessonName 退化为「第 N 节」。
+
+  热路径：lessonContext 不止 BeginSession 调一次 —— SessionEngine.BuildState 每个状态心跳
+  都会调（拼卡片副标题 st.Context）。所以引擎拿到的是 volatile 快照，真正读课表的是调度器
+  线程（ScheduleTick，2 秒一次，本来就在读课表）；日志只在科目/节次变化时写一行。
+
+================================================================================
+五、构建输出
+================================================================================
+命令（一字不改）：
+  & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build 'C:\Users\xzq\Documents\deepseek-harness\
+    default-workspace\ClassSlideSync.Plugin\ClassSlideSync.Plugin.csproj' -c Release -t:Rebuild
+
+最终结果（2026-10-24 17:58:40 收尾复跑，dll 242176 B）：
+      193 个警告
+      0 个错误
+      已用时间 00:00:02.67
+
+  （17:56:41 那次是 194 个警告 0 个错误、00:00:02.76。17:58:40 这次少 1 条，是因为并发的
+    另一个任务同时改了自己的文件，把它的某条警告消掉了；我这边的文件在两次构建里一行没变。
+    两次都是 0 错误，收尾后的那次 selftest / heights / shots 全部重跑过，结论不变。）
+
+警告数量说明（老实交代）：
+  * 改动前基线：186 个警告 0 个错误（17:43:49）。
+  * 我改完后第一次干净构建：189 个警告，多出的 3 条全部可归因于本次改动：
+      Core\Ledger.cs(29,23): warning CS8618 属性 "PeriodName" 必须包含非 null 值
+      Core\LessonTag.cs(174,26): warning CS8603 可能返回 null 引用
+      Core\LessonTag.cs(174,69): warning CS8603 可能返回 null 引用
+    （都与现有风格一致：SessionRecord 的所有 string 属性本来就各有一条 CS8618，
+      PlanOf 的 return null 是"拿不到课表就返回 null"的写法。）
+  * 最终这次 193 条：除我这 3 条外，比我基线多出来的那些来自**同时在这个仓库里改代码的
+    另一个任务**（那 5 条 CS8618/CS8603 在 Core\PptBridge.cs、Core\SeewoBridge.cs 等；
+    17:58:40 复跑时它自己消掉了 1 条，所以从 194 变 193）。不是我引入的，我也没法替它消掉。
+
+期间踩的坑（不是我的 bug，但要留档）：
+  * 17:47 左右一次编译失败，报 CSC : error AXN0001（Avalonia x:Name 生成器）和
+    Ui/ControlPanel.axaml.cs(144,13) CS0103 "EmptyTitle" 不存在 —— 是另一个任务把
+    Ui\ControlPanel.axaml / PanelData.cs / PanelRows.cs 改到一半，我正好撞上。稍后重编即过。
+    这个仓库现在不是独占的，谁再看到这种"突然冒出来的 axaml 错误"，先重试一次再怀疑自己。
+
+================================================================================
+六、测试工程与断言（%TEMP%\hist-period\probe\）
+================================================================================
+工程：C:\Users\xzq\AppData\Local\Temp\hist-period\probe\probe.csproj（net8.0-windows，
+      无任何 NuGet 引用，不启动 ClassIsland）
+方式：AssemblyLoadContext 加载已构建的 ClassSlideSync.Plugin.dll，反射调真实类型；
+      依赖 dll 从 %USERPROFILE%\.nuget\packages 里按"版本优先 + TFM 可加载"挑。
+      插件的依赖里有 System.Text.Json 9.0.0.0（.NET 8 框架只带 8.0），所以插件装进独立
+      ALC，框架自带的 System.* 仍交给默认 ALC，9.x 的那几个（STJ / Encodings.Web /
+      IO.Pipelines）从 nuget 装。
+      （这一步折腾了几轮：TypeLoadException ClassIsland.Shared 1.7 → 版本精确匹配 →
+        FileLoadException STJ 9 → 独立 ALC → TypeLoadException System.Runtime 4.1.1.0 →
+        框架程序集排除。最终方案如上。）
+
+运行：
+  probe selftest <dll>   → 断言，退出码 0 = 全过
+  probe heights  <dll>   → 打印 16 组 ContentHeight96 与像素高度
+  probe shots    <dll> <目录> → 离屏 DIB + GDI 画历史面板，存 PNG（手写 PNG 编码，
+                                不引 System.Drawing.Common）
+
+结果：断言 65 条，失败 0 条（对最终 17:58:40 的 dll 跑；17:56:41 那次同样 65/0）
+
+覆盖到的验收点：
+  [1] 老台账向后兼容（7 条）
+      - 老 JSON（没有 Weekday/Period/PeriodName）Load 成功，读回 1 桶 1 条
+      - Weekday = 0、Period = 0、PeriodName = null（渲染侧按 0/空处理）
+      - 其它字段没被动过，目录里没有 .corrupt-* 文件（说明没进异常分支）
+  [2] 新字段往返（8 条）
+      - Weekday=3 / Period=3 / PeriodName=上午第三节 / Subject=数学 / LessonName=第 3 节
+        写进 ledger.json 再 Load 回来一个不差
+      - JSON 里这几个键确实存在；中文按 STJ 默认转义成 \uXXXX（既有行为，不是这次改的）
+  [3] 历史行文案纯函数（16 条）
+      - 有节次：周三 第 3 节 · 15:20 · 第 5 → 8 页
+      - 无节次：10-24 15:20 · 第 5 → 8 页
+      - 跨年：2026-12-30 08:05 · 第 5 → 8 页（today=2027-01-05）
+      - 单页：周三 第 3 节 · 15:20 · 第 8 页；页码全 0：… · 页码未知
+      - StartedAt 是坏值：不崩，退成「第 5 → 8 页」
+      - 周日：周日 第 2 节 · 09:00 · 第 3 → 9 页
+      - 三种写法（最全 / 砍掉时分 / 只留页码）内容正确
+      - ar-SA 文化下算出来的文案与 zh-CN 完全相同（InvariantCulture 兜住）
+  [4] 第几节算法（8 条）
+      - 08:20 → 1；08:45（课间）→ 0；09:00 → 2；09:50 → 3（跳过课间）；11:00 → 0
+      - WeekdayOf：周三 → 3、周日 → 7、周一 → 1
+  [5] 面板高度（6 条，96 稿子像素）
+      - rows = 0/1/3/6 → 94 / 120 / 172 / 250
+      - 144 dpi 下 96 稿高度不变；像素高度 = 96 稿 × 1.5（258）
+  [6] 超长文本 + 三位数页码（6 条，144 dpi，inner = 312px）
+      - 抬头（77 字课程名）截断后 268 ≤ 279，且确实以「…」结尾
+      - 历史行 252 / 311 ≤ 312，没有溢出
+      - 三位数页码时自动退到「周三 第 3 节 · 第 100 → 128 页」（252px，整条显示，不是硬截断）
+      - Labels 为空时走 Ellipsis 兜底也不超宽
+  [7] 课件库科目兜底（5 条）
+      - Subject 有值 → 用它；Subject 空、PeriodName=物理 → 捡它
+      - PeriodName="第 3 节" / "课间" → 不硬凑，返回 ""（保持「未标注科目」语义）
+  [8] lessonContext 接线（9 条，这是 bug 的回归测试）
+      - 属性类型是 Func<LessonTag>
+      - SlideSyncService.LessonContext **不是 null**（老 bug 的直接回归断言）
+      - 调用它返回非 null 的 LessonTag（引擎里 tag != null 才写字段）
+      - 没有课表服务时：Subject = ""、Period = 0、Context = ""（不污染卡片副标题）
+      - LessonTimetable.Read 在无 ClassIsland 环境下不抛异常，Weekday 仍是 1-7，Period = 0
+
+================================================================================
+七、高度对比（新旧 dll，同一组 CardState）
+================================================================================
+基线 dll：C:\Users\xzq\AppData\Local\Temp\hist-period\baseline\ClassSlideSync.Plugin.baseline.dll
+          （改动前构建，207872 B，构建时间 17:43:49）
+新   dll：…\ClassSlideSync.Plugin\bin\Release\net8.0-windows\ClassSlideSync.Plugin.dll
+          （193 警告 0 错误那次，242176 B，17:58:40）
+
+  probe heights 对两个 dll 各跑一遍，16 行 "HEIGHT ..." 输出逐行相同（Compare-Object 只剩
+  抬头两行 <插件路径> 与 <构建时间> 不同，那是 dll 自己，不是几何）。
+    history rows=0..6 dpi=96   → h96 = 94 120 146 172 198 224 250（px 同值）
+    history rows=0..6 dpi=144 → h96 同上，px = 141 180 219 258 297 336 375
+    plain  rows=0   dpi=96/144 → h96 = 202，px = 202 / 303
+  也就是说 ContentHeight96 体系一个字没动，改文案没有把面板撑高或压扁。
+
+================================================================================
+八、出图（%TEMP%\hist-period\shots\，6 张，逐张看过）
+================================================================================
+C:\Users\xzq\AppData\Local\Temp\hist-period\shots\history-period-96.png     236×172
+C:\Users\xzq\AppData\Local\Temp\hist-period\shots\history-noperiod-96.png   236×172
+C:\Users\xzq\AppData\Local\Temp\hist-period\shots\history-period-144.png    354×258
+C:\Users\xzq\AppData\Local\Temp\hist-period\shots\history-noperiod-144.png  354×258
+C:\Users\xzq\AppData\Local\Temp\hist-period\shots\history-long-96.png       236×124
+C:\Users\xzq\AppData\Local\Temp\hist-period\shots\history-long-144.png      354×186
+
+画法：CreateDIBSection（32bpp 顶朝下）+ CreateCompatibleDC 造内存 DC，反射 new
+      NativeOverlayCard（它的构造函数只存字段，不建窗口不开线程）→ 设私有字段
+      dpi / expanded / historyPanel → GdiCanvas(hdc, w, h, dpi, look) → Clear + StrokeRounded
+      → 反射调 DrawHistoryPanel → 读像素手写 PNG。全部走产品代码里的同一套几何和同一支字体
+      （Microsoft YaHei UI，GDI 现造），不是另画一套示意。
+      2026-10-24 17:58:56 对最终 dll 重新生成过一遍，6 个文件的 SHA256 与 17:56 那批完全
+      相同（渲染是确定的，两次构建之间没有像素级变化）。
+
+逐张结论：
+  1) history-period-96.png（236×172，rows=3 + 顶部文件名）
+     「Unit 5 阅读课件.pptx」/「本课件历史 · 3 次」/ 三行
+     「周三 第 3 节 · 15:20 · 第 5 → 8 页」… 直到「周三 第 5 节 · 17:20 · 第 7 → 10 页」
+     /「‹ 返回」。最全的写法在 208px 内**整条放得下**，没有出现省略号；最近一条是
+     强调色（橙），其余弱化（灰）。行距均匀，底部「‹ 返回」与最后一行的间距和原来一致，
+     右边缘留白均匀，无溢出、无换行、无裁字。
+  2) history-noperiod-96.png（同尺寸，老记录）
+     「10-24 15:20 · 第 5 → 8 页」等三行，比有节次那版短，右侧留白更多。
+     两种格式混在同一面板里也不会显得参差（都是左对齐、单行、同一基线）。
+  3) history-period-144.png（354×258）
+     内容与 96 版逐字相同，等比放大 1.5 倍，字号/行高/圆角/描边同步放大；
+     没有出现 96 稿放得下、144 放不下的情况（两档 inner 与文字宽度同比例）。
+  4) history-noperiod-144.png：同上，无节次。
+  5) history-long-96.png（236×124，超长课程名 + 三位数页码）
+     抬头被截成「Unit 7 Section B 阅读与写…」，没有顶到右边框（给右上角收起箭头留了
+     22px）。历史行自动降级为「周三 第 3 节 · 第 100 → 128 页」——**牺牲了 15:20，
+     保住了节次和页码**，这是需求要求的优先级。没有换行、没有半个字被切掉。
+  6) history-long-144.png（354×186）：降级结果与 96 版一致（同一套宽度比较逻辑），
+     抬头同样带「…」，三行整体仍然齐左、行距一致。
+  排版结论：单行不换行、不溢出；有节次时优先保「第 N 节」+页码，最省时只留页码；
+  面板高度由 ContentHeight96 决定，与文案长短无关（长文本只会被截断，不会撑高面板）。
+
+================================================================================
+九、取舍与风险（都说清楚）
+================================================================================
+1) 「有节次时不写日期」是按需求给的样例做的。副作用：同一个课件、同一个「周三 第 3 节」、
+   不同周的两条记录，文案会一模一样（只有页码和时间可能不同）。台账里 StartedAt 仍然是
+   完整的 yyyy-MM-dd HH:mm:ss，控制面板（PanelData.cs 的三列视图）另有一列时间可看。
+   如果老师反馈"看不出是哪一周"，最小改动是把 Clock 换成 When（一行）。
+2) PeriodName 语义：取的是 TimeLayoutItem.BreakName，也就是课表里那个时段的名字。
+   如果老师课表没给时段命名，PeriodName 为空，LessonName 会退成「第 3 节」——写进台账的
+   是"第 3 节"而不是课程名。这是 ClassIsland 2.1 的 API 限制（TimeLayoutItem 没有 Name，
+   要拿课程名得再查 ProfileService 的 SubjectId → Subject，代价大且容易拿到错的）。
+3) 快照有最多 2 秒的滞后：BeginSession 读到的是调度器上一跳（≤2 秒前）的课表。上课铃响
+   前后那 2 秒内开始的记录，理论上可能记成上一节/下一节。正常路径是调度器先刷新、再 Arm、
+   引擎才 BeginSession，实际窗口比 2 秒更小。
+4) 引擎线程绝不去碰宿主服务：BuildState 每个心跳都调 lessonContext，所以那边只读
+   volatile 快照；真正读课表的是调度器线程。这条是硬约束，改动时别破坏。
+5) 老记录（老师现在的 39 条）Period = 0，历史行一律显示日期格式——这是预期行为，不是
+   回归。它们不会"补上"节次，因为当时没记。
+6) 警告从 186 涨到 193（我这边 +3，其余是并发任务改的文件，且它自己还在变动）。没有为了消警告去改
+   SessionRecord 的既有风格（加 = ""），那会和仓库现有写法不一致。
+7) DrawHistoryPanel / FitHistory 是私有方法（GdiCanvas / Color32 私有嵌套），测试只能靠
+   反射调。以后如果想让测试更稳，可以考虑把几何常量抽成 internal const，但这次没动。
+
+================================================================================
+十、没做到 / 没验证的部分（直说）
+================================================================================
+* 没有启动 ClassIsland（铁律），所以**没有端到端验证**"真实上一节课 → 台账里真的出现
+  Weekday/Period/Subject"。验证到的是：API 签名与 SDK 一致（反射核实）、Read() 在无宿主
+  环境下不抛且退回日期格式、引擎侧写入路径的字段搬运（BeginSession 的代码读过、断言覆盖
+  了 HistoryLine 与 SessionRecord 往返）。真实宿主里 CurrentSubject / CurrentTimeLayoutItem
+  的取值时机（尤其课间时 CurrentTimeLayoutItem 是不是课间项）没有实测。
+* 没有碰老师真实的 data 目录，也没有在真实台账上跑一遍（只用构造的老/新 JSON 测）。
+  所以"39 条老记录渲染成日期格式"是按代码推断的，不是在老师那 39 条上渲染出来的。
+* 只验证了 96 dpi 与 144 dpi（比例 1.5）。120 / 192 等其他缩放没测；按 Scaled() 的线性
+  关系推断没问题，但没有实测。
+* 点击历史行跳页的交互没有真人点过（命中矩形逻辑只是从 Paint 里原样搬进
+  DrawHistoryPanel，坐标计算一个字没改，但没实测）。
+* 没有在真机上跑单元测试框架（xUnit 之类），断言是自建的小 harness；仓库里也没有测试工程
+  （按铁律，测试代码只放在 %TEMP%，不进仓库）。
+* 卡片宽度改配置（CardWidth 不是 236）时，文案降级仍然会按 inner 自动挑写法，但没有为
+  特别窄/特别宽的自定义宽度出图验证。
+* 没有做"台账里同时有老记录（Period=0）和新记录"的历史面板出图（两种格式混排只从我读
+  代码判断是安全的：同一行高、同一字体、左对齐、各自按宽度降级）。
+
+================================================================================
+十一、复现命令
+================================================================================
+构建：
+  & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build 'C:\Users\xzq\Documents\deepseek-harness\
+    default-workspace\ClassSlideSync.Plugin\ClassSlideSync.Plugin.csproj' -c Release -t:Rebuild
+
+测试：
+  & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' 'C:\Users\xzq\AppData\Local\Temp\hist-period\
+    probe\bin\Release\net8.0-windows\probe.dll' selftest
+  & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' '…\probe.dll' heights '<插件 dll>'
+  & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' '…\probe.dll' shots '<插件 dll>' 'C:\Users\xzq\
+    AppData\Local\Temp\hist-period\shots'
+
+（基线 dll 在 C:\Users\xzq\AppData\Local\Temp\hist-period\baseline\
+  ClassSlideSync.Plugin.baseline.dll，可用于"改前/改后"高度对比。）
+================================================================================

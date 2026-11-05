@@ -1,0 +1,291 @@
+「课件进度」主界面组件 —— 实现与取证报告
+========================================================================
+生成时间：2026-10-25 12:58（Asia/Shanghai）
+目标程序集：ClassIsland 2.1.0.1（C:\Users\xzq\Desktop\github\ClassSlideSync\classisland\app-2.1.0.1-0\）
+上游需求：用户原话「3（主界面小组件：ClassIsland 大屏角落显示"本节内容进度 12/24"）」——
+主界面角落一个小组件，显示当前课件讲到第几页。
+开工前置检查：_backup-20261025-1232.zip 存在（7,462,534 字节，2026/10/25 12:32:20）。
+安装目录 classisland\ 仅读取程序集做取证，未写入任何文件；未部署、未启动 ClassIsland、未动 git、未加 NuGet。
+
+
+一、结论（先看这段）
+------------------------------------------------------------------------
+1. ClassIsland 2.1.0.1 有主界面组件（component）机制，和触发器是同一套套路：
+     基类   ClassIsland.Core.Abstractions.Controls.ComponentBase : Avalonia.Controls.UserControl
+     特性   ClassIsland.Core.Attributes.ComponentInfo（4 参 ctor：(guid, name, icon, description)）
+     注册   ClassIsland.Core.Extensions.Registry.ComponentRegistryExtensions.AddComponent<TComponent>()
+   基类**没有** OnInitialized/Loaded 虚方法，生命周期只能挂 Avalonia 的
+   OnAttachedToVisualTree / OnDetachedFromVisualTree。
+
+2. 已落地：新增组件 ClassSlideSync.Plugin.Components.DeckProgressComponent
+   - Id（GUID）    6F2C4B18-9A3D-4E57-8B21-5C7E0D9A4F63
+     （必须是**合法 GUID 字符串**：ComponentInfo 内部 Guid.Parse，写非 GUID 会在注册/加载期抛异常）
+   - 显示名        课件进度
+   - 图标          "\uE8A5"（Segoe Fluent Icons 单字符；IconExpressionHelper 见长度 1 就包成
+                   FluentIconSource。想换：\uE7C3 播放、\uE9D2 分页/文档、\uE81C 历史 都可用）
+   - 描述          显示当前课件讲到第几页（如 12 / 24）。没有课件在放映时自动隐藏。
+   - 设置          **刻意没有设置控件**（SettingsType 为 null），和内置「日期」「分割线」同构：
+                   组件设置抽屉里只显示通用的字体/颜色/宽度/边距，没有自定义项。
+
+3. 显示效果：竖排两行，上行小字「课件进度」，下行大字「12 / 24」。
+   没有任何课件在放映时整个组件 IsVisible = false（Avalonia 折叠：不测量、不布局、不绘制），
+   不显示占位符、不留空框。
+
+4. 构建：0 error（-c Release -t:Rebuild）。
+5. 自测：46 条断言全部通过（%TEMP%\component-progress\harness，反射 Release 产物 + 宿主 DLL，
+   不启动 ClassIsland、不碰 PowerPoint/WPS）。
+
+6. 只有一处改动是"新增文件"，没有任何既有文件被改：
+     新增  ClassSlideSync.Plugin\Components\DeckProgressComponent.cs
+   注册代码**没有**写进 Plugin.cs（按任务要求由你统一接线，代码见第四节）。
+
+
+二、API 取证（Mono.Cecil 只读元数据，没有 LoadFrom 反射宿主，避免依赖解析递归）
+------------------------------------------------------------------------
+为什么要 Cecil：早前用 AppDomain.AssemblyResolve + Assembly.LoadFrom 加载 ClassIsland.Core
+会因为卫星程序集（zh-Hans 等）解析递归导致 Stack overflow。Cecil 只读元数据，零副作用。
+
+1) 基类（ClassIsland.Core.dll，namespace ClassIsland.Core.Abstractions.Controls）
+     abstract class ComponentBase : Avalonia.Controls.UserControl
+         protected ComponentBase()
+         object SettingsInternal { get; internal set; }        // 属性本身 public，setter assembly 级
+         public virtual void OnMigrated(Guid sourceId, object settings)
+     abstract class ComponentBase<T> : ComponentBase
+         protected ComponentBase()
+         T Settings { get; }
+   注意：网上 1.x 文档提的 OnInitialized 在 2.1.0.1 里**不存在**（基类成员只有上面三项），
+   所以本组件用 Avalonia 的附加/脱离视觉树回调来订阅、退订。
+
+2) 特性 ClassIsland.Core.Attributes.ComponentInfo : Attribute
+     三种 ctor：
+         ComponentInfo(string guid, string name, string iconSource, string description = "")
+         ComponentInfo(string guid, string name, string description = "")
+         ComponentInfo()
+     3 参 ctor 的 IL 里是 Guid = Guid.Parse(guid) —— 这就是"Id 必须是真 GUID"的硬依据。
+     4 参 ctor 再走 IconSource = IconExpressionHelper.TryParseOrNull(第 3 参)。
+     IconExpressionHelper.TryParse：表达式长度 == 1 → new FluentIconSource(expr)；
+     否则按 fluent(...) 之类函数语法查表，未命中返回 false。⇒ 单字符字形最省事。
+     特性上还有 SettingsType / ComponentType / IsComponentContainer / MigrateSources 等属性，
+     其中 ComponentType 由 Register 在运行时回填。
+
+3) 注册扩展 ClassIsland.Core.Extensions.Registry.ComponentRegistryExtensions
+     public static IServiceCollection AddComponent<TComponent>(this IServiceCollection services)
+     public static IServiceCollection AddComponent<TComponent, TSettings>(this IServiceCollection services)
+     internal static ComponentInfo Register(IServiceCollection, Type component, Type settings)
+   Register 的 IL 行为：
+     - component.GetCustomAttributes(false) 找 [ComponentInfo]，没有就抛
+       ArgumentException("无法注册组件，因为这个组件 " + FullName + " 没有注册信息。")
+     - ComponentRegistryService.Registered 已有同 Guid → 抛
+       ArgumentException("此组件id " + Guid + " 已经被占用。")
+       ⇒ 同 Id 重复注册会直接失败；迁移/改名必须换 [MigrateFrom] 而不是复用 Id。
+     - services.AddTransient(componentType)（**普通瞬态，走 DI 构造**）
+     - info.ComponentType = componentType
+
+4) 实例从哪来（ClassIsland.Services.ComponentsService.GetComponent 的 IL）
+     type = isSettings ? info.SettingsType : info.ComponentType;
+     if (type == null) return null;
+     return Host.Services.GetService(type) as ComponentBase;
+   ⇒ 组件由 DI 容器 new，所以**必须有公共无参构造**（也可以改成构造注入，
+     但 AddComponent 是 AddTransient，注入什么取决于宿主容器现有注册，这里不冒险）。
+   ⇒ 同一个组件设置里可能有多个实例（主界面 + 管理界面预览 + 设置抽屉），
+     每个实例独立订阅，所以订阅/退订必须严格配对（见第六节断言）。
+
+5) 隐藏机制（这是本任务最容易踩坑的地方）
+   - 宿主侧 ClassIsland.Core.Controls.ComponentPresenter 的可见性判定：
+       CheckHideRule():     HideOnRule && HidingRules != null &&
+                            RulesetService.IsRulesetSatisfied(HidingRules)
+                            → IsVisibleInternal = false，否则 true
+       UpdateComponentHidState(): Settings.IsVisible = IsVisibleInternal && !_isAllComponentsHid
+   - ComponentSettings.IsVisible 的 setter 是 **internal**（getter public）：
+     IL 就是 ldarg.0/ldfld _isVisible/ret，setter 标记 assembly。
+     ⇒ 插件**不能**编程设置"按条件隐藏"，宿主那套 HideOnRule + HidingRules 是用户在
+       组件设置里自己配的规则集，插件侧无法代填。
+   - 插件侧没有 IHideableComponent 之类接口（Core 里全量搜过，没有）。
+   - ComponentPresenter.axaml 里有 class:comps-hidden 样式，但它的触发源是 IsVisibleInternal
+     （宿主自己的属性），不是组件的 IsVisible。
+   ⇒ 插件唯一不越权、且语义正确的做法：组件自身 IsVisible = false。
+     Avalonia 的 IsVisible=false 不是"透明"而是**折叠**：不 Measure、不 Arrange、不 Render，
+     期望尺寸为 0，ComponentPresenter 的 Border 不会留下和组件一样高的空位。
+     （本报告第 七 节把"未在真机上肉眼确认像素级间距"列为未验证项，见那里。）
+
+6) 字体/主题跟随（不起作用就等于没做）
+   - MainWindowCustomizableNodeHelper.ApplyStyles(Control, IMainWindowCustomizableNodeSettings) 会往
+     control.Resources 里写四个键：
+         MainWindowSecondaryFontSize / MainWindowBodyFontSize /
+         MainWindowEmphasizedFontSize / MainWindowLargeFontSize
+     （若用户关掉了"覆盖字号"，这 4 个键会被 Remove，回落到全局资源 → 组件自动跟随全局，
+       这正是我们要的"随主界面字体走"而不是写死字号。）
+   - 内置组件确实这么用（Cecil 扫 !XamlIlPopulate 里的 ldstr 证实）：
+         ClockComponent → MainWindowEmphasizedFontSize
+         CountDownComponent → MainWindowBodyFontSize
+         WeatherComponent → MainWindowSecondaryFontSize
+         ComponentPresenter（OnMainWindow 时给 Border#ComponentRootBorder 设 TextElement.FontSize）
+             → MainWindowBodyFontSize
+     TextElement.FontSize 是继承型附加属性，所以组件内部不设字号也会自动继承主界面正文字号。
+   - 纯 C# 里用 DynamicResource 的正确姿势（本组件采用）：
+         textBlock.Bind(TextBlock.FontSizeProperty, new DynamicResourceExtension("MainWindowEmphasizedFontSize"))
+     DynamicResourceExtension 在 Avalonia.Markup.Xaml.dll（Avalonia 11.3.17，Avalonia 主包传递引用，
+     不需要额外加 NuGet），实现 IBinding，可直接交给 Bind。
+   - 主题色：本组件**不设任何前景色/背景色**，继承宿主 TextElement.Foreground 与
+     ComponentPresenter 的 Opacity/BackgroundColor 绑定 → 深色/浅色主题、用户自定义颜色都自动跟随。
+     也不设 Margin/Padding/宽度，让组件设置抽屉里的边距/宽度控件真正生效。
+
+
+三、实现细节（ClassSlideSync.Plugin\Components\DeckProgressComponent.cs）
+------------------------------------------------------------------------
+公开常量（报告/自测都引用它们，避免字符串散落）：
+     public const string Id   = "6F2C4B18-9A3D-4E57-8B21-5C7E0D9A4F63";   // 第 48 行
+     public const string Name = "课件进度";                                  // 第 51 行
+     public const string Glyph = "\uE8A5";                                   // 第 57 行
+     public const string Description = "显示当前课件讲到第几页（如 12 / 24）。没有课件在放映时自动隐藏。";  // 第 60 行
+
+界面（构造函数里纯 C# 搭，没有 .axaml —— csproj 不许改，所以不走 AvaloniaXaml）：
+     StackPanel(Orientation = Vertical, Spacing = 0, HorizontalAlignment = Left)
+       ├─ TextBlock titleText  { Text = "课件进度", Opacity = 0.85 }
+       │     Bind(FontSizeProperty, DynamicResource "MainWindowSecondaryFontSize")   // 第 86 行
+       └─ TextBlock valueText  { Text = "0 / 0" }
+             Bind(FontSizeProperty, DynamicResource "MainWindowEmphasizedFontSize")  // 第 89 行
+     构造函数最后一行 IsVisible = false;                                              // 第 104 行
+     （先藏起来，避免组件刚被创建、还没拿到进度时闪一下 "0 / 0"。）
+
+纯函数（便于自测、也说明语义）：
+     public static string FormatProgress(int current, int total)   // 第 111 行
+         负数夹到 0；返回 current + " / " + total。总数未知时如实显示 "3 / 0"（不编造）
+     public static bool ShouldShow(SlideProgress? progress)        // 第 126 行
+         progress != null && progress.DeckOpen && progress.Showing
+         DeckOpen = 演示软件打开着这份课件；Showing = 真的在放映（全屏放映态）
+
+状态与接线：
+     public SlideProgress? LastProgress { get; private set; }      // 最近一次快照，便于排障
+     public int RefreshCount { get; private set; }                 // 刷新次数，自测用来判"没泄漏"
+     public bool IsAttached => service != null;
+     public void Attach(SlideSyncService? target = null)           // 第 138 行
+         target ?? OpenUnfinishedDeckAction.TryService()   // 复用 Automation/Actions.cs:107-111 的统一取法
+         ReferenceEquals(svc, service) → 只 Apply(svc.Progress) 后返回（幂等，重复 Attach 不叠加订阅）
+         否则 Detach() → service = svc → svc.SlideProgressChanged += OnProgress → Apply(svc.Progress)
+         订阅抛异常 → 回滚 service = null 并 Ledger.Log（绝不让组件把主界面拖崩）
+     public void Detach()                                          // 第 179 行
+         先 service = null 再 -=（和触发器 SlidePageTrigger.Unhook 同一写法，避免重入）
+     public void Apply(SlideProgress? progress)                     // 第 191 行
+         记 LastProgress → show = ShouldShow(...) →
+         show 时写 valueText.Text = FormatProgress(p.Current, p.SlideCount) →
+         IsVisible = show → RefreshCount++
+         隐藏时**不写文本**（保留上次页码：下次同一份课件恢复放映时，第一帧就是对的页码，
+         不会先跳一下 "0 / 0" 再变）
+     void OnProgress(SlideProgress progress)
+         Dispatcher.UIThread.CheckAccess() 为真 → 直接 Apply
+         否则 Dispatcher.UIThread.Post(..., DispatcherPriority.Background)   // 引擎线程 → UI 线程
+         整段 try/catch，取不到 UI 线程（例如自测环境）就直接 Apply 兜底
+     protected override void OnAttachedToVisualTree(...)   → base + Attach()      // 第 224 行
+     protected override void OnDetachedFromVisualTree(...) → Detach() + base      // 第 231 行
+     void Log(string line) => try { service?.Ledger?.Log(line); } catch { }
+
+数据源（没有改 Services/，只是读）：
+     Services\SlideSyncService.cs:1193  public SlideProgress Progress => progress ?? EmptyProgress;  // 永不 null
+     Services\SlideSyncService.cs:1187  static readonly SlideProgress EmptyProgress = new(false,false,"","",0,0,"","");
+     Services\SlideSyncService.cs:1202  public event Action<SlideProgress>? SlideProgressChanged;
+        （引擎线程上抛；只在换课件/换页/换课次时抛，不刷屏）
+     SlideProgress（同一个文件 1362 行起，public sealed，namespace 级）：DeckOpen / Showing /
+        DeckPath / DeckName / Current（1 起，0=没读到）/ SlideCount（0=未知）/ LessonKey / DayKey
+
+
+四、注册代码（请你接线，我没有改 Plugin.cs）
+------------------------------------------------------------------------
+需要的 using（Plugin.cs 顶部，第 12 行 using ClassSlideSync.Plugin.Views.SettingsPages; 之后）：
+
+    using ClassSlideSync.Plugin.Components;
+
+要加的一行（**插在 Plugin.cs:87 之后、第 89 行那条注释之前**）：
+
+    // 2026-10-25 用户第 3 条需求：主界面小组件「课件进度」，大屏角落显示"本节内容进度 12/24"。
+    // 组件与触发器同构：AddComponent<T>() 按 [ComponentInfo] 里的 Id 把组件注册成 transient，
+    // 没有设置控件（不传 TSettings）→ 组件设置抽屉里只有通用的字体/颜色/宽度/边距。
+    // 隐藏靠组件自身 IsVisible（宿主没有给插件的可见性钩子），取证见 stability-report-component.txt。
+    services.AddComponent<DeckProgressComponent>();
+
+即完整上下文（只作定位，不要照抄整段）：
+
+    services.AddTrigger<SlidePageReachedTrigger, SlidePageReachedSettingsControl>();   // 87 行
+
+    services.AddComponent<DeckProgressComponent>();                                    // ← 新增
+
+    // 新手引导：挂进 ClassIsland 自带的教程列表 ...                                          // 89 行
+    TutorialGuide.Register();
+
+接线后用户侧怎么用：ClassIsland 设置 → 主界面 → 组件（编辑模式）→ 从组件库里把「课件进度」
+拖到某一行 → 保存。之后只要检测到 PPT/WPS 在放映，这个角标就显示 "12 / 24"，下课/关闭放映
+后自动消失。用户自己也能在组件设置里调字号、颜色、宽度、边距，以及配"按规则隐藏"。
+
+
+五、构建
+------------------------------------------------------------------------
+    & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build `
+      "C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\ClassSlideSync.Plugin.csproj" `
+      -c Release -t:Rebuild -v:m -nologo
+
+    0 个错误，215 个警告，耗时 3.87s。
+
+警告全部来自既有文件（不是本次新增）：Core\PptBridge.cs、Core\SeewoBridge.cs、Core\SessionEngine.cs、
+Ui\NativeOverlayCard.cs 的可空性警告，以及两个既有 .axaml 的 AVLN3001。本次新增文件没有引入新警告。
+首次编译即通过，没有为了"让它编过"改过任何写法。
+
+
+六、自测（%TEMP%\component-progress\harness，46 条断言全通过）
+------------------------------------------------------------------------
+做法：ComponentHarness.csproj 引用插件 Release 产物 + 宿主目录里的
+ClassIsland.Core / ClassIsland.Shared / Avalonia.Base / Avalonia.Controls / Avalonia.Markup.Xaml /
+FluentAvalonia（全部 Private=false，不拷 DLL）；程序用
+AssemblyLoadContext.Default.Resolving 按名字去插件输出目录、再宿主目录 LoadFromAssemblyPath。
+不启动 ClassIsland、不调 PowerPoint COM、不写用户目录。
+
+断言分布（46 条，>15 的要求）：
+  1. 类型：可加载 / public sealed / 基类 == ComponentBase / 可当 UserControl / 有公共无参构造     5 条
+  2. 特性：唯一 [ComponentInfo] / Id 是合法 GUID / 特性 Guid == 常量 / 显示名 / IconSource 非空 /
+           Description 含 "12 / 24" / SettingsType == null                                   7 条
+  3. 文案：0/24、12/24、24/24、-1→0、3/0                                                    5 条
+  4. 判定：ShouldShow(null) / 无课件 / 打开未放映 / 放映中                                     4 条
+  5. 实例：初始隐藏 / 标题文本 / 初始 0 / 0 但不可见 / 放映中可见 / 12 / 24 / LastProgress /
+           末页 24 / 24 / 无课件隐藏 / 隐藏时保留文本 / 只打开未放映仍隐藏                    11 条
+  6. 字体：给组件 Resources 塞 MainWindowSecondaryFontSize=21、MainWindowEmphasizedFontSize=34
+           后，两个 TextBlock 的 FontSize 确实跟着变（验证"随主界面字体"）                     2 条
+  7. 事件：Attach 后 IsAttached / 订阅者 1 / 重复 Attach 不叠加 / 事件进来 LastProgress 更新 /
+           正文 5 / 10 / RefreshCount 增加 / Detach 后 0 / IsAttached false / 重复 Detach 不抛 /
+           退订后事件不再推动界面 / 换服务退掉旧服务 / 新服务 1 个 / 最后两个服务都干净        12 条
+
+事件测试怎么做到不跑真构造：SlideSyncService 用
+    (SlideSyncService)RuntimeHelpers.GetUninitializedObject(typeof(SlideSyncService))
+（不执行构造函数、不碰引擎/文件），事件字段用反射读、GetInvocationList().Length 数订阅者、
+DynamicInvoke 模拟引擎线程抛事件，再用 Dispatcher.UIThread.RunJobs() 让 Post 的刷新落地。
+
+运行结果（节选）：本次运行输出「断言 46 条：通过 46，失败 0 / 全部通过。」
+复现：cd %TEMP%\component-progress\harness; dotnet build -c Release; dotnet bin\Release\net8.0-windows\ComponentHarness.dll
+
+
+七、未验证项（老实列出来）
+------------------------------------------------------------------------
+1. **真机像素级效果未验证**（没部署、没启动 ClassIsland）。逻辑与元数据全验过，但"隐藏时
+   ComponentPresenter 的 Border 是否还有 1-2 像素的间距"只能靠 Avalonia 折叠语义推断
+   （IsVisible=false 不参与布局 ⇒ 期望尺寸 0）。如果用户反馈"角落有个小空档"，那是宿主
+   行/组件容器的 Margin，不是组件本身；解法是让用户在组件设置里把该组件边距调 0，或把组件
+   放在独立一行——不需要改代码。
+2. **字号键的实际取值未验证**：只验证了"DynamicResource 跟随资源变化"，没验证用户把
+   "覆盖字号"关掉时回落全局资源的观感。回落路径是宿主 ApplyStyles 里 Remove 键 + 全局默认，
+   属于宿主行为。
+3. **"只有一个组件实例"这个假设没验**：主界面 + 设置抽屉预览可能各有一个实例，每个都独立
+   订阅（本组件按实例订阅、按实例退订，逻辑上安全，但没在真机上数过实例数）。
+4. **没有设置控件**：这是刻意的（任务只要显示进度）。如果以后想加"显示成 12/24 还是第 12 页"、
+   "是否显示课件名"之类开关，走 AddComponent<T, TSettingsControl>() + 继承
+   ComponentBase<TSettings>，本组件的 FormatProgress/ShouldShow 已经是纯函数，改造成本低。
+5. **课堂切换/跨天**：进度完全来自 SlideSyncService（它负责课次/课件识别）；组件只做显示，
+   没有自己的时间/课表逻辑，所以课次相关行为等同于该服务已有行为，未额外验证。
+6. 图标字形 \uE8A5 只验证了"能解析成 IconSource"，没在真机上看过渲染效果；备选 \uE7C3 / \uE9D2。
+
+
+八、文件清单
+------------------------------------------------------------------------
+新增（唯一改动）：
+    ClassSlideSync.Plugin\Components\DeckProgressComponent.cs
+
+未改动（确认）：Plugin.cs、Core\*、Ui\*、Services\*、ClassSlideSync.Plugin.csproj、其他任何文件。
+临时产物（不在仓库里）：%TEMP%\component-progress\harness\（ComponentHarness.csproj + Program.cs）、
+%TEMP%\component-progress\cecil*.ps1（Cecil 取证脚本）。

@@ -1,0 +1,291 @@
+课件续页 — ClassIsland 自动化（Action / Rule）接入报告
+================================================================
+生成时间：2026-10-24 21:02（本机，Asia/Shanghai）
+仓库：C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin
+目标宿主：ClassIsland 2.1.0.1（ClassIsland.Core.dll / ClassIsland.Shared.dll 于
+          C:\Users\xzq\Desktop\github\ClassSlideSync\classisland\app-2.1.0.1-0）
+
+一、结论（先看这段）
+----------------------------------------------------------------
+1. 两条行动、一条规则已实现并编译通过：Release Rebuild 0 error（201 个警告全部来自
+   既有文件 PptBridge/SeewoBridge/NativeOverlayCard 等，Automation\*.cs 自身 0 警告）。
+2. 反射验收工程共 29 项断言，29 PASS / 0 FAIL：两条行动可构造、Id/Name 非空且带插件
+   前缀；规则在「未讲完 / 已讲完 / 过期 22 天 / 台账为空 / 最新已讲完而更早未讲完 /
+   21 天边界」六种台账上返回值正确；另验证了“跳开希沃伪键、文件已丢失”的挑选逻辑，
+   以及把 Plugin.Initialize 里那三行注册真正跑一遍（ServiceCollection + AddAction×2 +
+   AddRule）不抛异常、静态表里能查到。
+3. 官方开发文档没有自动化（Action/Rule）开发页：docs.classisland.tech/dev/automation/
+   返回 HTTP 404。规则集页只讲架构，规则提供方开发页是空壳。因此注册 API 的细节以
+   2.1.0.1 真实程序集的反射/IL（Mono.Cecil）为准，文档能对上的部分逐条摘录在第二节。
+4. 没启动 ClassIsland / PPT / WPS / 希沃；没碰 data 目录；没动 git；没加 NuGet；没部署。
+
+二、文档原文摘录（地址 + 原文 + 它决定了什么）
+----------------------------------------------------------------
+2.1 官方开发文档现状
+  URL：https://docs.classisland.tech/dev/automation/
+  结果：HTTP 404，页面正文 “404 / 页面不存在 / 这里什么也没有”。
+  同样 404 的还有 /dev/automation/action.html、/dev/actions/、docs-v1 的对应页。
+  sitemap.xml 里 dev 下只有 ruleset/、ruleset/rule-provider.html、rule-user.html；
+  而 rule-provider.html 只有标题「规则提供方」，正文为空。
+  → 结论：官方“自动化开发”文档尚未编写；行动/规则的真实契约只能从程序集读。
+
+  URL：https://docs.classisland.tech/dev/ruleset/
+  原文：“规则集的 API 主要分为两部分：规则集调用方和规则提供方。顾名思义，规则集调用方
+        接受用户设置的规则集，并调用规则集服务判断规则集是否成立，而规则提供方负责判断
+        某个规则是否成立。”
+  原文：“当规则提供方所提供的规则状态发生变化时……会通知规则集服务，此时规则集服务会
+        通过 StatusUpdated 事件通知各个规则集调用方。”
+  → 规则是一个“返回真/假”的提供方；我的规则只做判断、不主动通知（台账每 5 秒由引擎更新，
+    规则集会在状态刷新时重新求值，见第七节“没验证”）。
+
+2.2 插件入口
+  URL：https://docs.classisland.tech/dev/plugins/plugin-base.html
+  原文：“初始化方法传入了主机构造时所需的相关参数，注册、提醒提供方、服务等操作需要在这
+        个方法完成。”
+  → 注册必须放在 Plugin.Initialize(HostBuilderContext, IServiceCollection)，不能放构造函数。
+
+2.3 依赖注入 / 服务定位
+  URL：https://docs.classisland.tech/dev/basics/dependency-injection.html
+  原文：“如果您不确定此服务有没有注册，可以使用 IAppHost.TryGetService 方法尝试获取服务，
+        当获取失败时，会返回 null 而非抛出异常，例如：”
+        var service = IAppHost.TryGetService<ILessonsService>();
+  → 行动/规则里一律用 IAppHost.TryGetService<SlideSyncService>()，拿不到就安静返回。
+
+2.4 行动：API 参考
+  URL：https://api.docs.classisland.tech/api/ClassIsland.Core.Abstractions.Automation.ActionBase.html
+  原文：“行动提供方基类。” 方法签名：
+        protected virtual Task OnInvoke()
+  备注原文：“重写本方法时，请先调用基类的实现 base.OnInvoke();”
+  → 我的两个行动都 override OnInvoke，并在第一行调用 base.OnInvoke()。
+
+  URL：https://api.docs.classisland.tech/api/ClassIsland.Core.Attributes.ActionInfo.html
+  原文：“行动提供方信息。” 构造函数原文：
+        public ActionInfo(string id, string name, string? iconGlyph = null,
+                          bool addDefaultToMenu = true, string defaultGroupToMenu = "")
+  参数原文：id “行动提供方 ID。形如 "classisland.app.quit"。”
+            iconGlyph “行动提供方图标。形如 "\\ue9a8" FluentIcon Glyph 格式。支持留空。”
+            addDefaultToMenu “是否要在「添加行动」菜单添加默认项。默认为 true。”
+  → 我写成 [ActionInfo(Id, Name, Glyph)]，即 addDefaultToMenu 用默认 true（否则老师
+    在「添加行动」菜单里看不到这两条，只能靠搜索）；Id 带 ClassSlideSync.Plugin. 前缀。
+
+  URL：https://api.docs.classisland.tech/api/ClassIsland.Core.Extensions.Registry.ActionRegistryExtensions.html
+  原文：“注册行动提供方的 IServiceCollection 扩展。” / “注册一个行动提供方。”
+        public static IServiceCollection AddAction<TAction>(this IServiceCollection services)
+            where TAction : ActionBase
+  同页过时方法原文：
+        [Obsolete("注意！行动 v2 注册方法已过时，请参阅 ClassIsland 开发文档进行迁移。")]
+        public static IServiceCollection AddAction(this IServiceCollection services, string id, ...)
+  → 我用的是泛型 AddAction<TAction>()（源码 L20），不是过时的字符串重载。
+
+2.5 规则：API 参考
+  URL：https://api.docs.classisland.tech/api/ClassIsland.Core.Extensions.Registry.RulesetRegistryExtensions.html
+  原文：“注册规则的 IServiceCollection 扩展。” / “注册规则。”
+        public static IServiceCollection AddRule(this IServiceCollection services,
+            string id, string name = "", string iconGlyph = "",
+            RuleRegistryInfo.HandleDelegate? onHandle = null)
+  参数原文：id “规则ID，例如“classisland.example”。”
+            onHandle “规则处理程序。”
+  → 规则没有基类、没有特性，就是 id + name + glyph + 一个 bool 处理器。
+
+  反射补充（ClassIsland.Core.dll 2.1.0.1，Mono.Cecil 读 IL）：
+  - ClassIsland.Core.Abstractions.Automation 命名空间只有 ActionBase / ActionBase<TSettings> /
+    TriggerBase / TriggerBase<T>，**没有 RuleBase**；规则不需要继承任何类型。
+  - RuleRegistryInfo.HandleDelegate 的签名是 `bool Invoke(object settings)`。
+  - AddRule 内部：new RuleRegistryInfo(id, name, iconGlyph) → 泛型重载补 SettingsType /
+    SettingsControlType（control 重载还会 AddKeyedTransient<RuleSettingsControlBase, TSettingsControl>(id)）
+    → info.Handle = onHandle → IRulesetService.Rules.Add(id, info)；重复 Id 抛
+    InvalidOperationException("已注册ID为 <id> 的规则。")。
+  - AddAction<TAction>() 内部：RegisterActionInfo(typeof(TAction))（反射读 [ActionInfo]，
+    没有特性抛“未标注 ActionInfo 特性”，Id 重复抛“ID 已被占用”；按是否重写 OnRevert 设置
+    IsRevertable；按 AddDefaultToMenu/DefaultGroupToMenu 往添加行动菜单插入）
+    → services.AddKeyedTransient<ActionBase, TAction>(info.Id)。
+    这也解释了为什么行动是 keyed transient：每次触发都会拿到新实例。
+
+三、我用的是哪个基类 / 哪个注册方法 / 哪一行
+----------------------------------------------------------------
+行动一（打开上次未讲完的课件）
+  基类：ClassIsland.Core.Abstractions.Automation.ActionBase
+  特性：ClassIsland.Core.Attributes.ActionInfo
+  类：Automation\Actions.cs:22  public sealed class OpenUnfinishedDeckAction : ActionBase
+  特性行：Automation\Actions.cs:21  [ActionInfo(Id, Name, Glyph)]
+  Id：ClassSlideSync.Plugin.OpenUnfinishedDeck（Automation\Actions.cs:25）
+  入口：Automation\Actions.cs:29  protected override Task OnInvoke()
+  注册：Plugin.cs:56  services.AddAction<OpenUnfinishedDeckAction>();
+
+行动二（显示 / 隐藏悬浮卡片）
+  基类/特性同上
+  类：Automation\Actions.cs:92  public sealed class ToggleCardAction : ActionBase
+  特性行：Automation\Actions.cs:91  [ActionInfo(Id, Name, Glyph)]
+  Id：ClassSlideSync.Plugin.ToggleCard（Automation\Actions.cs:94）
+  入口：Automation\Actions.cs:98  protected override Task OnInvoke()
+  注册：Plugin.cs:57  services.AddAction<ToggleCardAction>();
+
+规则（上次课件没讲完）
+  基类：无（2.1 规则没有基类）；特性：无
+  类：Automation\Rules.cs:16  public static class UnfinishedDeckRule
+  Id：ClassSlideSync.Plugin.UnfinishedDeck（Automation\Rules.cs:18）
+  处理器：Automation\Rules.cs:42  public static bool Handle(object settings)
+  注册：Plugin.cs:58-62
+        services.AddRule(UnfinishedDeckRule.Id, UnfinishedDeckRule.Name,
+                         UnfinishedDeckRule.Glyph, UnfinishedDeckRule.Handle);
+
+服务定位（按文档用 TryGetService）
+  Automation\Actions.cs:78  IAppHost.TryGetService<SlideSyncService>()
+  Automation\Rules.cs:46    IAppHost.TryGetService<SlideSyncService>()
+
+四、实现说明（行为 + 为什么这么做）
+----------------------------------------------------------------
+4.1 行动一：打开上次未讲完的课件
+  - 只在台账里挑「未讲完 + 不超过 21 天 + 磁盘上确实存在 + 不是「希沃:xxx」伪键」的最新
+    一条（Automation\UnfinishedDecks.cs:61 NewestUnfinished）。条件必须和规则用同一把尺子，
+    否则会出现“规则说成立、行动却找不到文件”。
+  - 打开用 Process.Start(new ProcessStartInfo(path) { UseShellExecute = true })
+    （Automation\Actions.cs:62）：让系统默认程序决定是 PowerPoint 还是 WPS，插件不去猜。
+  - 打开后不立刻调 COM（套件还没加载完），而是把「待跳页」交给 PendingJump
+    （Automation\Actions.cs:73），后台每秒看一次引擎快照的 FilePath，认出来就调
+    engine.RequestJumpTo(path, endSlide)（Automation\Actions.cs:162）。后者和卡片按钮、
+    控制面板走同一条路径：只抬标志，真正的 COM 跳页仍由 SessionEngine 工作线程执行。
+  - 等待上限 120 秒（Automation\Actions.cs:121/148）；重复触发时取消上一次等待，避免
+    “连点两次，第二次被旧页覆盖”。
+  - OnInvoke 里用 Task.Run 起后台任务后立刻返回（Automation\Actions.cs:34）：打开 PPT 可能
+    几秒到几十秒，行动若在这里 await，同一套自动化里排在后面的行动会被一起卡住。
+  - 服务拿不到、台账为空、文件被移走、Process.Start 失败：全部只写台账日志，不抛。
+
+4.2 行动二：显示 / 隐藏悬浮卡片
+  - 做成一条“切换”行动（用户需求原文就是「让悬浮卡片显示 / 隐藏」）：已待命 → 隐藏，
+    否则 → 显示。理由：老师用它的动机只有“现在别挡着/现在要用”，当前 armed 状态就是
+    唯一需要的信息，不必在设置里再选一次。
+  - 判断在行动层（Automation\Actions.cs:107），真正动作调服务新增的最小公开方法：
+    ShowCardForAutomation / HideCardForAutomation（Services\SlideSyncService.cs:970/988）。
+    这两个方法只是把调用切回 UI 线程（AutomationOnUi，见 :1010），然后走既有的 Arm/Disarm
+    和 card.Expand()——没有复制第二套引擎/卡片逻辑。
+  - 全部包在 try/catch 里：自动化里抛异常会打断整套行动，而且老师看不到堆栈。
+
+4.3 规则：上次课件没讲完
+  - 语义（按用户原话）：取**全库最近一条记录**，要求 SlideCount > 0 && EndSlide < SlideCount，
+    且这条记录不超过 21 天。
+  - 为什么不是“最近一条未讲完的记录是否存在”：如果上节课已讲完、再上一节没讲完，后者会
+    错误地让规则成立，老师看到“明明讲完了，自动化还说没讲完”。
+  - 时间口径：有 EndedAt 用 EndedAt，否则 StartedAt（Automation\UnfinishedDecks.cs:34），
+    与 Ledger.Prune 的保留期口径一致；now - last <= 21 天（:45），时间往后偏不算过期。
+  - 拿不到服务 / 台账为空 / 解析失败：返回 false，不抛（规则是查询不是命令）。
+  - 行动与规则共用 UnfinishedDecks（:24 IsUnfinished / :45 IsFresh / :61 NewestUnfinished），
+    避免两边判定漂移。
+
+4.4 改动边界
+  - 只新增 Automation\ 三个文件；Plugin.cs 只加 using 和 3 行注册；Services\SlideSyncService.cs
+    只在文件末尾追加（961-1022 行），既有代码一行未重排、未改写。
+  - 未改 Ui\NativeOverlayCard.cs、Ui\ControlPanel.*、Core\SessionEngine.cs。
+
+五、文件与行号（改动清单）
+----------------------------------------------------------------
+新增：
+  Automation\Actions.cs（191 行）
+    :21  [ActionInfo] / :22 行动一类 / :29 OnInvoke / :32 base.OnInvoke()
+    :38 OpenInBackground / :44 挑记录 / :62 Process.Start / :73 PendingJump.Arm
+    :91  [ActionInfo] / :92 行动二类 / :98 OnInvoke / :100 base.OnInvoke()
+    :104-108 切换判断 / :119 PendingJump / :126 Arm / :143 Watch / :162 RequestJumpTo
+  Automation\Rules.cs（56 行）
+    :18-20 Id/Name/Glyph / :30 Evaluate / :33 ledger.Newest() / :42 Handle / :46 TryGetService
+  Automation\UnfinishedDecks.cs（101 行）
+    :17 MaxAgeDays=21 / :24 IsUnfinished / :34 LastActivity / :45 IsFresh
+    :61 NewestUnfinished / :85 ResolveExistingFile
+
+修改：
+  Plugin.cs
+    :11  using ClassSlideSync.Plugin.Automation;
+    :52-55 说明注释（为什么这样注册）
+    :56  services.AddAction<OpenUnfinishedDeckAction>();
+    :57  services.AddAction<ToggleCardAction>();
+    :58-62 services.AddRule(...)
+  Services\SlideSyncService.cs（只在末尾追加，961-1022）
+    :961 分段注释 / :970 ShowCardForAutomation / :988 HideCardForAutomation
+    :1000 AutomationReason / :1010 AutomationOnUi（Dispatcher.UIThread.CheckAccess/Post）
+    既有的 Arm/Disarm/ShowCardNow/Stop 未改动。
+
+六、验收
+----------------------------------------------------------------
+6.1 构建
+  命令：
+    & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build
+      'C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\ClassSlideSync.Plugin.csproj'
+      -c Release -t:Rebuild
+  结果：0 个错误；201 个警告。警告逐条来自 PptBridge / SeewoBridge / NativeOverlayCard
+  等既有文件；Automation\*.cs 与 Plugin.cs 的新增代码没有产生警告（构建输出按
+  'Automation\' 过滤为空）。
+
+6.2 反射验收（%TEMP%\automation-test\）
+  工程：C:\Users\xzq\AppData\Local\Temp\automation-test\AutomationTest\
+        AutomationTest.csproj + Program.cs（net8.0-windows，直接引用 ClassIsland.Core.dll /
+        ClassIsland.Shared.dll / 插件 Release dll；没加 NuGet）
+  台账：每个用例在 %TEMP%\automation-test\ledgers\run-<时间>-<随机>\<用例>\ledger.json
+        下现造，绝不读用户真台账。
+  结果：checks=29 failures=0。
+
+  行动（12 项）：两条行动的 [ActionInfo] 存在；Id/Name 非空；Id 以 ClassSlideSync.Plugin.
+  开头；Id 与公开 const 一致；Activator.CreateInstance 成功且是 ActionBase。
+
+  规则判定（6 项，真实读写 ledger.json）：
+    未讲完（EndSlide 8 / SlideCount 20，1 天前）              -> true
+    已讲完（20 / 20，1 天前）                                 -> false
+    未讲完但记录在 22 天前                                     -> false
+    台账为空                                                   -> false
+    最新一条已讲完、更早一条未讲完（同库）                       -> false
+    21 天边界内（20 天 23 小时 59 分前）                        -> true
+
+  行动挑选（5 项）：
+    不加文件条件：取全库最新未讲完（希沃伪键）                   -> 命中希沃记录
+    加文件条件：跳过伪键/已丢失文件，落到真实 WPS 文件           -> 命中该文件
+    ResolveExistingFile(希沃:xxx)                              -> ""
+    ResolveExistingFile(真实存在的文件)                        -> 非空绝对路径
+    ResolveExistingFile(不存在)                                -> ""
+
+  处理器健壮性（1 项）：无宿主服务时 Handle(object) 返回 bool，不抛。
+  注册流程（2 项）：ServiceCollection 上执行 AddAction×2 + AddRule 不抛；
+                    IActionService.ActionInfos 含两条、IRulesetService.Rules 含规则。
+  额外：规则 Id/Name 前缀检查 3 项。
+
+  运行方式（重要）：
+    $env:DOTNET_ROLL_FORWARD='LatestMajor'
+    ...\AutomationTest\bin\Release\net8.0-windows\AutomationTest.exe
+  原因：宿主 2.1.0.1 引用 System.Text.Json 9.0.0.0，本机只有 .NET 8 SDK/运行时
+  （8.0.25）和一个 10.0.12 运行时；在 .NET 8 进程里显式加载 STJ 9 会被运行时拒绝
+  （FileLoadException 0x80131621）。用 roll-forward 跑在 .NET 10 上即可，且这更接近
+  真实宿主（宿主不是 .NET 8）。测试工程里对 System.* 不做自定义 AssemblyResolve，
+  交给默认绑定。
+
+七、没验证的部分（真机没启动）
+----------------------------------------------------------------
+1. 没启动 ClassIsland，所以以下只有“注册器代码路径 + 独立进程实测”，没有宿主 UI 实测：
+   - 两条行动在「添加行动」菜单里是否真的出现、图标字形是否好看；
+   - keyed transient 实例化后 OnInvoke 在真实自动化线程上的行为；
+   - 规则在规则集编辑器里的显示名/图标、StatusUpdated 后多久重新求值。
+2. 没启动 PowerPoint / WPS：Process.Start 后“识别到文件 → RequestJumpTo → 真正跳页”
+   这条链只验证到“抬标志”，COM 跳页与 120 秒超时后的日志没在真机跑过。
+3. 未待命时触发行动一：仍然会打开文件，但引擎不存在，要等调度器进入待命（上课前 1 分钟）
+   后才可能跳页；超过 120 秒则放弃（日志会记）。这是刻意取舍，避免行动自己拉起一套引擎。
+4. 规则在服务未启动（AppStarted 之前）时返回 false；宿主启动早期若规则被求值，会短暂为假。
+5. 并发：连续触发行动一会取消上一次等待；行动二的状态读取不是原子的，两次同时切换可能
+   都执行同一个方向（概率极低，没有加锁）。
+6. 台账写入依赖既有的 Ledger.Save（引擎侧），自动化只读；没验证台账文件被外部程序占用/
+   损坏时的表现（既有 Load 已有损坏备份逻辑，但自动化路径没专门造这个用例）。
+7. 没测非中文系统区域设置/夏令时；记录时间按本地时间、InvariantCulture 解析，与既有
+   Ledger 一致。
+8. 没做“恢复（Revert）”：两条行动都不重写 OnRevert，ActionInfo 的 IsRevertable 会是 false，
+   自动化里不会出现“撤销”项——这是预期的（打开课件/切换卡片都不适合自动回滚）。
+
+八、复现命令
+----------------------------------------------------------------
+构建插件：
+  & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build
+    'C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\ClassSlideSync.Plugin.csproj'
+    -c Release -t:Rebuild
+
+构建并运行验收工程：
+  & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build
+    'C:\Users\xzq\AppData\Local\Temp\automation-test\AutomationTest\AutomationTest.csproj' -c Release
+  $env:DOTNET_ROLL_FORWARD='LatestMajor'
+  & 'C:\Users\xzq\AppData\Local\Temp\automation-test\AutomationTest\bin\Release\net8.0-windows\AutomationTest.exe'
+
+（注意：用 dotnet run 启动时 roll-forward 未生效，仍会落回 .NET 8 并报 STJ 9 加载失败；
+  所以先 build、再直接跑 exe。这是本机 SDK 版本组合的坑，不是插件代码问题。）

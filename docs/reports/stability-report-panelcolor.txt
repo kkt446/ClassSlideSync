@@ -1,0 +1,176 @@
+课件续页 2.1 插件 — 控制面板底色可改 +「收起药丸的长度」设置项
+日期：2026-10-24
+仓库：C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin
+构建：& 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build "C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\ClassSlideSync.Plugin.csproj" -c Release -t:Rebuild -m:1 -nodeReuse:false
+结果：0 个错误 / 197 个警告（历史报告里的基线是 200，未增加；本轮改动的 4 个文件自身 0 条 warning）
+
+======================================================================
+一、改了哪些文件、哪些行
+======================================================================
+
+1) Ui\ControlPanel.axaml（914 行）
+   - 1-17   窗口头：删掉 TransparencyLevelHint="AcrylicBlur, Transparent" 与
+            TransparencyBackgroundFallback="Transparent" 两行（这属性在才走亚克力合成）；
+            Background 只留 "#FFFFFFFF" 作第一帧与读坏时的兜底，真正颜色由代码刷；
+            新增 xmlns:pages（第 5 行）。
+   - 19-31  顶部注释改写：说明为什么刻意不加 TransparencyLevelHint、颜色由
+            ControlPanel.ApplyPanelBackground() 刷、暗底时正文会转浅色。
+   - 32-37  <Window.Resources> 挂 <pages:HexColorConverter x:Key="HexColor" />。
+   - 719-729 新增「收起药丸的长度」：SettingsExpander + Footer 里
+            <NumericUpDown Width="140" Minimum="96" Maximum="480" Increment="8"
+            Value="{Binding Settings.CollapsedTabLength, Mode=TwoWay}" />
+   - 741-758 新增「控制面板底色」：SettingsExpander + Footer 里
+            <ColorPicker Width="140" Height="32" IsAlphaVisible="True"
+            Color="{Binding Settings.PanelBackgroundColor, Mode=TwoWay,
+            Converter={StaticResource HexColor}}" />，右侧跟一个只读 TextBlock
+            显示存下来的原串（老师能看出 6 位/8 位的区别）。
+
+2) Ui\ControlPanel.axaml.cs（1390 行）
+   - 102-103  构造函数末尾：ApplyPanelBackground(); 并
+              this.settings.PropertyChanged += OnSettingsChanged;
+   - 131-149  static IBrush BrushFrom(string hex, IBrush fallback)：颜色解析（见第二节）。
+   - 151-154  static double RelativeLuminance(Color c)。
+   - 156-188  internal void ApplyPanelBackground()：解析底色 → Background = brush →
+              按亮度决定 RequestedThemeVariant（阈值 0.45，见第三节）。
+   - 190-200  void NudgeThemeResources()：换一个无关键的值触发资源重解析（见第三节）。
+   - 202-216  void OnSettingsChanged(...)：只认 PanelBackgroundColor；非 UI 线程 Post 回 UI 线程。
+   - 327      OnClosedDetach 里取消订阅（设置对象的寿命比窗口长）。
+   - 350-357  切到「设置」页签时再刷一次（官方设置页那边改完，这个窗口可能没收到事件）。
+   - 383-390  Reload() 末尾再刷一次（导入配置、宿主重载设置时兜底）。
+
+3) Views\SettingsPages\SlideSyncSettingsPage.axaml（484 行）
+   - 14-20   <ci:SettingsPageBase.Resources> 挂同一个 <local:HexColorConverter x:Key="HexColor" />。
+   - 351-361 新增「收起药丸的长度」SettingsExpander（IconSource &#xE89D;）+ 同样的
+             NumericUpDown（140 / 96 / 480 / 8）。
+   - 374-392 新增「控制面板底色」SettingsExpander（IconSource &#xE523;）+ ColorPicker
+             （140×32、IsAlphaVisible="True"）+ 右侧 #AARRGGBB 文本。
+             两个界面的 Description 与面板那边一字不差，都绑同一个 SyncSettings 实例。
+
+4) Views\SettingsPages\SlideSyncSettingsPage.xaml.cs（275 行）
+   - 235-275 public sealed class HexColorConverter : IValueConverter：
+             string "#AARRGGBB" ↔ Avalonia Color。两个设置界面共用（面板的
+             Window.Resources 也引用它，所以只有一份实现）。
+
+未改动（按要求）：Core\SyncSettings.cs、Core\Appearance.cs、Ui\NativeOverlayCard.cs、
+Automation\、Plugin.cs；窗口的 CornerRadius、阴影、TabControl 外观、面板几何记忆
+（PanelWidth/Height/Left/Top）、F11、Esc、导出记录、删记录、搜索全部保持原样。
+
+======================================================================
+二、颜色解析规则
+======================================================================
+
+字段：Core\SyncSettings.cs 的 PanelBackgroundColor（string，默认 "#FFFFFFFF"）。
+setter 自己会 Trim、补 '#'、统一转大写（ToUpperInvariant），所以代码里读到的一定是
+"#FFFFFF" 或 "#AARRGGBB" 这种大写串。
+
+解析（ControlPanel.BrushFrom）：
+  - 空白串        → 直接返回 fallback；
+  - 没有 '#'      → 自动补一个（老师手写 FFFFFF 也认）；
+  - 6 位 "#RRGGBB" → 不透明色；
+  - 8 位 "#AARRGGBB" → Alpha 在最前面（Avalonia 自己的口径）；
+  - Color.TryParse 失败（#ZZZZZZ、#12345 之类）→ 返回 fallback。
+  - fallback 固定是纯白 SolidColorBrush：写错一位不能让窗口变透明或变黑，
+    那样看起来像程序崩了。
+
+写回（HexColorConverter.ConvertBack）：一律输出 8 位大写 "#AARRGGBB"，和上面同一个口径。
+读回（Convert）：解析失败显示白色，与 BrushFrom 的兜底同色，于是面板和设置页那一小块
+颜色不会各显示各的。
+
+半透明：底色的 Alpha < FF 时窗口就是普通半透明窗口（没有亚克力合成），会直接透出背后
+的内容。想要"毛玻璃再压一层色"的老观感，这一版刻意没有。
+
+口径冲突提醒（下一轮别踩）：卡片那几个颜色字段走 Core\Appearance.cs:220 TryParseColor，
+那边 8 位按 "RRGGBBAA"（Alpha 在后）解释；面板底色这一条按 "#AARRGGBB"（Alpha 在前）。
+两套口径不能混用。
+
+======================================================================
+三、深底对比度怎么处理
+======================================================================
+
+做法：底色偏暗时把本窗口子树的主题变体切到 Dark（正文转浅色），偏亮时切回 Light
+（正文保持深色）。只动 ControlPanel 这一个窗口的 RequestedThemeVariant，不碰
+Application.Current.RequestedThemeVariant，宿主 ClassIsland 的主界面不受影响。
+
+为什么不"正文固定深色"：底色是老师自己配的，深色底 + 深色字必然不可读；而面板里
+正文/次要文字/列表项/状态条几乎都是 TextFillColorPrimary/SecondaryBrush 这类主题画刷，
+逐个改 Foreground 压不住（TabControl、SettingsExpander、Button 的模板里还有各自的画刷），
+改变体只有一处判断，并且能连带把开关、按钮、卡片一起换过来。
+
+阈值 0.45（ControlPanel.axaml.cs:169）：
+  RelativeLuminance 用朴素公式 (0.2126R + 0.7152G + 0.0722B)/255，没做 sRGB 线性化。
+  画刷颜色和阈值都是同一个公式算出来的，互相可比；朴素公式的副作用是深蓝/深红这类
+  颜色会被算得偏亮，判成"浅底"用深字 —— 方向是安全的（深字对深蓝仍然比白字清楚）。
+  0.45 是二分点的选择：中灰 #808080 亮度 0.500 判浅底，深字约 8.8:1；
+  若判成深底，白字对 #808080 只有约 3.9:1，反而更差。
+
+踩到的坑（重要）：只改 RequestedThemeVariant 不够。FluentAvalonia 的 SettingsExpander
+卡片（设置页每一行的底色）是启动时按当时的主题变体解析好、之后就冻住的画刷；运行中改
+窗口变体时文字会跟着变（ClassIsland 自己的 ThemeDictionaries 是变体感知的），卡片却还是
+浅色 —— 深底上就是"浅灰卡片 + 浅色正文"，白字压浅底，约 1.8:1，正是这条要求要避免的。
+实测：冷启动就是 Dark 时卡片是 #0DFFFFFF（正常深色档），运行中切变体后仍是 #B3FFFFFF。
+解法（ControlPanel.axaml.cs:190 NudgeThemeResources）：切完变体后往窗口 Resources 里塞一个
+换过值的无关键（PanelColorThemeNudge = 新 Guid），触发一次 ResourceChanged，那批画刷就按
+新变体重新解析（实测 #B3FFFFFF → #38FFFFFF）。必须 Post 到下一轮：变体本身是异步传播的，
+同一帧里重算还会读到旧变体。
+
+效果实测（离屏渲染取像素）：
+  - 默认 #FFFFFFFF：正文 #1B1C1E 系，白底，约 17:1；
+  - #FF1B1C1E：正文 #EDEDED，卡片混合后约 #4D4D4D，约 7:1（粗略估算，肉眼清楚）。
+
+======================================================================
+四、出图（离屏渲染）
+======================================================================
+
+方法：%TEMP%\panel-del2 的 harness（PanelDel2Tests，反射 Assembly.LoadFrom 插件 dll，
+AppBuilder.Configure<TestApp>().UsePlatformDetect().SetupWithoutStarting()），
+窗口 940×640、Position(-4000,-4000)、TransparencyLevelHint=None、
+RenderOptions.TextRenderingMode=Antialias（不然中文重影），最后
+RenderTargetBitmap(new PixelSize(940,640), new Vector(96,96)) → rtb.Render(window) → Save。
+
+三张交付图（已拷到 promo\panel-color\）：
+  1. panel-default-white.png —— 默认 #FFFFFFFF：纯白实心、无亚克力、三页签、左栏 3 份课件、
+     右侧详情与历史、底栏状态条。文字全深色，无异常。
+  2. panel-dark.png —— #FF1B1C1E：整窗深底，正文/标题/列表/状态条全部转浅色，搜索框
+     占位符、选项卡、按钮都跟着换；无白字压浅底。
+  3. panel-settings-rows.png —— 设置页签滚到新增两行：可见顺序
+     「收起标签宽度（滑块）→ 收起药丸的长度（200）→ 收起药丸的透明度 → 控制面板底色
+     （色块 + #FFFFFFFF）→ 显示内容分组」，行样式与相邻 SettingsExpander 一致。
+
+另附诊断图（不交付）：diag-inplace-dark.png 证明运行中把底色改深后，设置页卡片也跟着
+变深（nudge 生效）；diag-dark-from-start.png 是冷启动即 Dark 的对照组。
+
+harness 里的断言（24 条，全过）：默认值 #FFFFFFFF、TransparencyLevelHint 不含 AcrylicBlur、
+默认背景纯白且变体 Light、改深后背景是 #1B1C1E 且变体 Dark、#80FF0000 按 AARRGGBB 解析、
+小写 6 位补 #、坏串 #ZZZZZZ 回退白色、设置页 NumericUpDown 的 96/480/8 与当前值 200、
+ColorPicker 读到白色、ColorPicker 改深 → 设置串变 "#FF1B1C1E" 且窗口跟着变深、改回白 →
+"#FFFFFFFF"。
+
+======================================================================
+五、未验证项 / 已知取舍
+======================================================================
+
+1. 「收起药丸的长度」目前只是存进了设置，还没有接到药丸的渲染上：
+   Core\Appearance.cs:426 只把 CollapsedTabWidth 映射成 TabWidth，全仓库再没有第二个
+   地方读 CollapsedTabLength；真正画药丸的 Ui\NativeOverlayCard.cs 不在本轮允许改的范围。
+   → 也就是说"缩成药丸后默认长一点"这一半，要等下一轮在 Appearance/NativeOverlayCard
+   里接线才会真的变长。本轮做到的是"能改、能存、两个界面同步显示"。
+
+2. ClassIsland 官方设置页没有出图：那个页面是 ci:SettingsPageBase，构造要宿主 Plugin
+   实例，离屏 harness 起不来。只验证了 XAML 编译通过 + 两处绑的是同一个 SyncSettings
+   实例（绑定路径一致）。真机上 SettingsExpander 里 ColorPicker 的外观仍需看一眼。
+
+3. 没跑真机（按要求没启动 ClassIsland / WPS / PowerPoint / 希沃），所以配色在真实
+   显示器、高 DPI、多屏下的观感未验证。
+
+4. 半透明底色（Alpha < FF）在真机上透出桌面/课件的观感未验证 —— 离屏渲染背后是空的。
+
+5. 冷启动即深色（宿主本来就是 Dark 变体）与"运行中切深色"两条路径的卡片色不完全一样：
+   前者 #0DFFFFFF（FluentAvalonia 原生深色档），后者 nudge 后 #38FFFFFF。两种都读得清，
+   但严格说不是同一个值；如果以后要求像素级一致，得在窗口 Loaded 时也补一次 nudge。
+
+6. 纯白底色时，ColorPicker 按钮里的色块与卡片底色同色，只能靠 1px 外框和右侧
+   "#FFFFFFFF" 文本辨识；改成深色/彩色后整块按钮就是所选颜色。这是刻意不额外画色块
+   （避免和真实的颜色预览打架）。
+
+7. 本轮期间仓库里有其他 agent 同时在改文件（Automation、Plugin.cs、SlideSyncService 等），
+   若他们后续改动碰到这 4 个文件，本报告的结论需要重跑一次 Rebuild 与出图。

@@ -567,7 +567,9 @@ namespace ClassSlideSync.Plugin.Core
             {
                 PutQuiet(folder, newDeck);
                 res.Kind = RemapKind.Exact;
-                res.NewSlide = oldSlide;
+                // 页数没变也要夹一次：老台账里存过比 SlideCount 大的页码（旧版把"翻到的最远页"
+                // 记进 EndSlide），直接透传会让卡片跳到一个不存在的页。MapPage 那条路径是夹过的。
+                res.NewSlide = Math.Min(Math.Max(oldSlide, 1), newDeck.Count);
                 res.Confidence = 1.0;
                 res.Note = "课件没改过，页码不变";
                 return res;
@@ -972,7 +974,11 @@ namespace ClassSlideSync.Plugin.Core
             name = (name ?? "").ToLowerInvariant();
             // "课件 - 副本"、"课件（1）"、"课件-拷贝"、"作业 copy"、"课件 v2" 都是另存为留下的尾巴。
             name = Regex.Replace(name, @"[\s\-_（(【\[]*(副本|拷贝|复件|copy)[\s\-_）)】\]]*", "", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-            name = Regex.Replace(name, @"[\s\-_（(【\[]*\d{1,2}[\s\-_）)】\]]*$", "", RegexOptions.CultureInvariant);
+            // 只剥「另存为」留下的编号尾巴：必须带分隔符（"课件 1"、"课件-2"）或被括号包住（"课件(1)"）。
+            // 以前是无条件剥掉尾部 1~2 位数字，"第3课1" 和 "第3课2" 会被归一成同一个名字、
+            // 相似度 1.0，于是一份课件的记录被关联到另一份上（老师会看到别人的页码）。
+            name = Regex.Replace(name, @"[\s\-_・·]+\d{1,2}$", "", RegexOptions.CultureInvariant);
+            name = Regex.Replace(name, @"[（(【\[]\s*\d{1,2}\s*[）)】\]]$", "", RegexOptions.CultureInvariant);
             name = Regex.Replace(name, @"[\s\-_]*v\d+$", "", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
             return Normalize(name);
         }

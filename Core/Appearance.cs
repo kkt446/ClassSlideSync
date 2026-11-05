@@ -217,7 +217,13 @@ namespace ClassSlideSync.Plugin.Core
             return fallback;
         }
 
-        /// <summary>#RRGGBB 或 #RRGGBBAA（Alpha 在最后，见类注释）。</summary>
+        /// <summary>
+        /// #RRGGBB 或 #AARRGGBB —— Alpha 在**首位**。
+        /// 2026-11-05 审计发现这里和设置页写入端用了两套字节序：写入端（SlideSyncAppearanceViewModel /
+        /// HexColorConverter）按 Avalonia 的 Color.TryParse 约定写 #AARRGGBB，这里却把后两位当 alpha，
+        /// 老师一动颜色选择器，通道就整体错位一格（不透明天蓝 #FF1E90FF 读成紫红），而且写入恒为 8 位
+        /// → HasExplicitAlpha 永远为 true → 不透明度滑块失效。统一成 #AARRGGBB。
+        /// </summary>
         public static bool TryParseColor(string s, out int r, out int g, out int b, out int a)
         {
             r = g = b = 0; a = 255;
@@ -227,10 +233,19 @@ namespace ClassSlideSync.Plugin.Core
             if (s.Length != 6 && s.Length != 8) return false;
             try
             {
-                r = Convert.ToInt32(s.Substring(0, 2), 16);
-                g = Convert.ToInt32(s.Substring(2, 2), 16);
-                b = Convert.ToInt32(s.Substring(4, 2), 16);
-                if (s.Length == 8) a = Convert.ToInt32(s.Substring(6, 2), 16);
+                if (s.Length == 8)
+                {
+                    a = Convert.ToInt32(s.Substring(0, 2), 16);
+                    r = Convert.ToInt32(s.Substring(2, 2), 16);
+                    g = Convert.ToInt32(s.Substring(4, 2), 16);
+                    b = Convert.ToInt32(s.Substring(6, 2), 16);
+                }
+                else
+                {
+                    r = Convert.ToInt32(s.Substring(0, 2), 16);
+                    g = Convert.ToInt32(s.Substring(2, 2), 16);
+                    b = Convert.ToInt32(s.Substring(4, 2), 16);
+                }
                 return true;
             }
             catch { return false; }

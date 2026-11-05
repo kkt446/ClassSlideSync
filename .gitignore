@@ -9,6 +9,12 @@ cipx/
 shots/
 *.latest.dll
 
+# 本地审计与测试报告（只在本机留档，不发布）
+docs/reports/
+stability-report-*.txt
+research-*.txt
+*.log
+
 # 编辑器
 .vs/
 .idea/

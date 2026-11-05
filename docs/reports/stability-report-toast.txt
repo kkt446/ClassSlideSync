@@ -1,0 +1,249 @@
+课件续页 2.x · 下课提醒「操作中心横幅」稳定性报告
+====================================================
+
+日期：2026-10-24　机器：Windows 11 build 26200（用户态，普通账户 xzq，无管理员权限）
+仓库：C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin
+需求原话：「看看能不能在插件里内置，启用过一次插件就安装这个依赖，要横幅。」
+
+结论（TL;DR）
+-------------
+* 横幅能力做成了随插件发布的独立小工具 `Tools\ToastHelper\ToastHelper.exe`，插件项目本身
+  **没有**加任何 NuGet、TargetFramework 仍是 `net8.0-windows`（ClassIsland 动态加载要求）。
+* 插件第一次启用时（`Plugin.Initialize`）后台跑一次 helper 的 `--register-only`，helper 自己把
+  HKCU 的 AppUserModelId 键和开始菜单快捷方式写好，然后插件写 `toast-installed.txt` 记账；
+  之后每次启动看到标记文件对得上就直接跳过，符合「启用过一次就装好」。
+* 横幅发不出去时（helper 不在 / helper 坏了 / 系统关了通知 / 超时）一律**静默返回 false**，
+  下课提醒退回原来的托盘气泡；再不行就只记一行日志。录制与 UI 完全不受影响。
+* 实测：helper 弹横幅 `exit=0`、操作中心历史里能读回逐字一致的 toast XML；
+  插件侧三个用例（helper 正常 / 缺失 / 坏掉）行为全部符合预期。
+* **横幅的肉眼可见性没能验证**：验证时这台机器正处于「右上角有全屏游戏 + QQ 在被人用」的状态，
+  连系统自带的 PowerShell AUMID 做对照实验也拍不到横幅（见 §6.4）。投递链路已证，显示层受
+  当时桌面状态压制，不是 helper 的问题。
+
+1. 要解决什么
+-------------
+原来的下课提醒走 `Core\TrayNotifier.cs`（`Shell_NotifyIcon(NIF_INFO)` 托盘气泡）。Win11 上这条
+路径基本等于「悄悄往通知中心塞一条历史」，不弹横幅、没声音，老师根本看不见。
+用户明确要的是 Windows 操作中心里的**横幅（toast）**。
+
+2. 为什么横幅必须放在独立小工具里
+---------------------------------
+弹 toast 要用 `Windows.UI.Notifications.ToastNotificationManager` + `Windows.Data.Xml.Dom`，
+这属于 WinRT 投影，`net8.0-windows10.0.19041.0` 起才有；而插件的 TFM 被 ClassIsland 的
+`EnableDynamicLoading` 钉死在 `net8.0-windows`，改不了（改了宿主加载不了），也不允许给插件加
+NuGet。于是：
+
+* `Tools\ToastHelper\` 是一个独立 csproj（`WinExe`，`net8.0-windows10.0.19041.0`，
+  `SupportedOSPlatformVersion=10.0.17763.0`），自带 WinRT 投影，插件侧一行 WinRT 代码都不沾。
+* 插件只通过**命令行**跟它通信（进程隔离，崩了也炸不到 ClassIsland）。
+
+3. helper：命令行协议、退出码、自注册
+------------------------------------
+文件：`Tools\ToastHelper\`（`Program.cs` / `ToastRegistration.cs` / `ToastShow.cs` / `ShellLink.cs` / `Log.cs`）
+
+3.1 命令行
+    ToastHelper.exe --title "…" --body "…" [--aumid <id>] [--log <文件>]
+                    [--register-only] [--no-register] [--help]
+  * `--title/--body`：横幅两行文字。`--body` 为空视为参数错误。
+  * `--log`：把过程追加写进文件（默认不写，因为 helper 可能住在不可写的插件目录里）。
+  * `--register-only`：只做自注册，不弹（插件首次启用时用这个）。
+  * `--no-register`：跳过自注册直接弹（诊断用，区分「登记不对」和「系统通知不通」）。
+  * 默认 AUMID：`ClassSlideSync.Plugin.Toast`。
+
+3.2 退出码（插件据此决定回退）
+    0  Ok                     横幅已交给系统（Show 没抛异常）
+    10 BadArguments           参数不对
+    20 RegistrationFailed     自注册失败（写 HKCU / 建快捷方式 / 读回校验任一步失败）
+    30 ShowFailed             CreateToastNotifier / Show 抛异常
+    31 NotificationsDisabled  系统里这个应用的通知被关掉了（ToastNotifier.Setting != Enabled）
+    40 Unexpected             其他未预期异常
+
+3.3 自注册做了什么（全部用户态，不需要管理员）
+  a) 注册表：`HKEY_CURRENT_USER\Software\Classes\AppUserModelId\ClassSlideSync.Plugin.Toast`
+       DisplayName = REG_SZ "课件续页"
+       IconUri     = REG_SZ "<helper 所在目录>\icon.png"
+     写完立刻读回校验（值不相等就算失败）。
+  b) 开始菜单快捷方式：`%APPDATA%\Microsoft\Windows\Start Menu\Programs\课件续页通知.lnk`
+       TargetPath = <helper 所在目录>\ToastHelper.exe
+       属性 System.AppUserModel.ID = ClassSlideSync.Plugin.Toast
+     用 `IShellLinkW` + `IPropertyStore`（PKEY_AppUserModel_ID = 9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3 / 5）
+     直接写，不依赖 PowerShell。
+     已存在且 target/AUMID 都对 → 复用，不重建（幂等）；对不上 → 重建。
+  这两步是 Win32 程序能弹 toast 的前提：系统得能按 AUMID 认出「是哪个应用」。
+  注册表与快捷方式都落在 HKCU 和用户自己的开始菜单里，所以**不需要提权**，也不会写插件目录
+  （ClassIsland 的插件目录不保证可写）。
+
+3.4 两个真实 bug（都已修，留档）
+  * `ShellLink.cs` 共享冲突：`IPersistFile.Save` 之后 COM 对象还占着 .lnk，紧接着
+    `SHGetPropertyStoreFromParsingName` 读回报 `hr=0x80070020`（ERROR_SHARING_VIOLATION），
+    被误判成注册失败（exit 20）。修法：Save 之后先 `Marshal.ReleaseComObject(pf/link)` 再写属性，
+    读回加重试；属性写入 `SetValue/Commit` 都返回 S_OK 但本进程暂时读不回来时，记一行日志并
+    **按成功处理**（shell 属性缓存问题，不影响实际生效——已用 Shell.Application 独立验证）。
+  * `ToastShow.cs` 的 `ToastNotifier.Setting` 是坑：对一个从没发过通知的 AUMID，读 `Setting`
+    会抛 `COMException hr=0x80070490`（ERROR_NOT_FOUND），但 `Show()` 照样成功。原实现直接判失败
+    导致 exit 30。改成 try/catch 忽略该异常，只有明确读到「非 Enabled」才返回 31；
+    `CreateToastNotifier`、`Show` 各自单独 catch 并记录 HRESULT，日志里能分清是哪一段挂了。
+
+3.5 横幅本身
+  ToastGeneric + `duration="long"` + appLogoOverride（icon.png）+ 默认提示音，
+  超时时间 = 现在 + 2 小时；文本经 `SecurityElement.Escape`。Show 成功后读一次
+  `ToastNotificationManager.History.GetHistory(aumid)` 把条数写进日志，作为「真进系统了」的证据。
+
+4. 插件侧
+---------
+4.1 `Plugin.cs`（Initialize 里，注册服务之前）
+    `ToastNotifier.InstallOnce(PluginConfigFolder);`
+    只做一次检查：算出 helper 路径 → 后台 `Task.Run` 里判断
+      · helper 不存在 → 记日志「用托盘气泡」，结束；
+      · `PluginConfigFolder\toast-installed.txt` 里 version=1 且 helper 路径一致 → 直接置 ready；
+      · 否则跑 `ToastHelper.exe --register-only --log <cfg>\toast-helper.log`，exit=0 才置 ready
+        并写标记文件（version/helper/installed 三行）。
+    为什么开线程：Initialize 在 ClassIsland 启动链上，不能为一条通知拖慢启动。
+
+4.2 `Core\ToastNotifier.cs`（新增，301 行）
+    `IsReady` / `InstallOnce(cfg)` / `Show(title, body)`，全 static、全 internal。
+    * helper 路径 = 插件 dll 所在目录 + `ToastHelper\ToastHelper.exe`
+      （用 `Assembly.Location`，**不能**用 `AppContext.BaseDirectory`——那是 ClassIsland 进程目录）。
+    * `Show` 里：`_ready` 为假 → false；连续失败 ≥3 次 → 本次会话不再试（免得每次下课白起进程）；
+      进程 8 秒超时 → Kill + false；helper 突然消失 → `_ready=false` + false；所有异常吞掉。
+    * helper 用 `UseShellExecute=false, CreateNoWindow=true` 起，参数按 Windows 命令行规则加引号
+      （标题里有引号也不会被拆成两个参数）。
+    * 自己的日志：`PluginConfigFolder\toast-plugin.log`（>512KB 停写）、`toast-helper.log`（helper 侧）。
+    * `PluginConfigFolder` 为空时退到 `%LOCALAPPDATA%\ClassSlideSync.Plugin`，避免相对路径把文件
+      撒进 ClassIsland 的进程目录。
+
+4.3 回退链（`Services\SlideSyncService.cs` 的 `MaybeNotifyClassEnd`，约 465-470 行）
+    ```
+    if (ToastNotifier.Show(title, text))            ledger.Log("notify: toast " + text);
+    else if (TrayNotifier.Show(title, text))        ledger.Log("notify: balloon " + text);
+    else                                            ledger.Log("notify: 系统不让弹（横幅与托盘气泡都失败）");
+    ```
+    文案没动：`title = "课件续页 · <科目>"`，`text = "「<课件名>」记到第 N 页，还剩 M 页"`。
+
+5. 打包：helper 怎么跟着 .cipx 走
+--------------------------------
+`ClassSlideSync.Plugin.csproj` 里加了两个 target（插件 TFM 与依赖都没动）：
+  * `BuildToastHelper`（BeforeTargets=Build，带 Inputs/Outputs 增量）：
+    `<Exec Command="&quot;$(DOTNET_HOST_PATH)&quot; build &quot;Tools\ToastHelper\ToastHelper.csproj&quot; -c $(Configuration)" />`
+    为什么用 Exec 起子进程而不是 MSBuild 任务：MSBuild 任务会把主工程的全局属性
+    （TargetFramework 等）带进子工程，helper 的 TFM 会被覆盖成 net8.0-windows，WinRT 投影就编不出来。
+  * `CopyToastHelper`（AfterTargets=Build）：把 helper 的整个输出目录拷到
+    `bin\Release\net8.0-windows\ToastHelper\`，并把目标登记进 `FileWrites`（Rebuild/Clean 会清掉旧货）。
+  另外保留了 `Compile/AvaloniaXaml/AvaloniaResource/EmbeddedResource/None Remove="tools\**"`，
+  否则主工程的默认通配对把 helper 的 .cs 和 obj 里的生成文件一起吞进来（CS0579 重复特性）。
+
+构建后输出目录实测（7 个文件，全部进 .cipx）：
+    ToastHelper.exe                  151,552
+    ToastHelper.dll                   17,920
+    ToastHelper.deps.json              1,085
+    ToastHelper.runtimeconfig.json       340
+    icon.png                          32,770
+    WinRT.Runtime.dll                528,944
+    Microsoft.Windows.SDK.NET.dll 24,877,600
+体积影响（实测，必须说清楚）：helper 解包后约 **24.4 MB**，其中 `Microsoft.Windows.SDK.NET.dll`
+一个就 23.7 MB。但打包是 zip（deflate），实际 `.cipx` 只从 0.14 MB 涨到 **6.93 MB**
+（`Microsoft.Windows.SDK.NET.dll` 压到 6.43 MB，`WinRT.Runtime.dll` 528 KB → 187 KB，
+`ToastHelper.exe` 151 KB → 68 KB）。
+后续可优化方向（本次没做）：CsWinRT 裁剪投影 / 改成手写 `RoGetActivationFactory` 的 COM 互操作，
+只保留 `ToastNotificationManager`、`XmlDocument` 几个接口，可把 helper 压到几百 KB、.cipx 回到 1 MB 以内。
+
+6. 验证证据
+-----------
+6.1 helper 自身（全部 exit=0，工作副本在 `%TEMP%\thsandbox\`，日志 `*.log` 同名）
+  * 首启全流程（先删 HKCU 键与 .lnk 再跑 `--register-only`）：
+      「已登记 HKCU\Software\Classes\AppUserModelId\ClassSlideSync.Plugin.Toast（DisplayName=课件续页,
+        IconUri=…\icon.png）」
+      「已创建开始菜单快捷方式: C:\Users\xzq\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\课件续页通知.lnk」
+      「注册检查通过（AUMID + 开始菜单快捷方式）」
+  * 幂等：第二次跑输出「开始菜单快捷方式已就绪」，同样 exit 0。
+  * 假标题假正文（用户批准的那一次）：
+      `--title "课件续页 · 通知自检" --body "这是一条测试横幅，不会重复出现"`
+      日志：「notifier.Setting=Enabled」「Show() 返回，没有抛异常」「操作中心历史条数=3」。
+  * 独立验证 AUMID 真的写进了快捷方式（不是 helper 自说自话）：
+      `(New-Object -ComObject Shell.Application).Namespace("%APPDATA%\Microsoft\Windows\Start Menu\Programs")
+        .ParseName('课件续页通知.lnk').ExtendedProperty('System.AppUserModel.ID')`
+      → `ClassSlideSync.Plugin.Toast`
+  * 独立验证通知真进了系统（读回操作中心历史，逐字一致）：
+      `ToastNotificationManager.History.GetHistory('ClassSlideSync.Plugin.Toast')`
+      里 4 条，最后一条内容：
+      `<toast duration="long"><visual><binding template="ToastGeneric"><text>课件续页 · 通知自检</text>
+       <text>这是一条测试横幅，不会重复出现</text><image placement="appLogoOverride" hint-crop="circle"
+       src="file:///C:/Users/xzq/AppData/Local/Temp/thsandbox/icon.png"/></binding></visual>
+       <audio src="ms-winsoundevent:Notification.Default"/></toast>`
+  * 旁证：`HKCU\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\ClassSlideSync.Plugin.Toast`
+      出现 `LastNotificationAddedTime`、`PeriodicNotificationCount`（说明系统按这个 AUMID 记了账）。
+
+6.2 插件侧三例（用 `%TEMP%\toastselftest\` 的临时控制台，反射直接调插件里已编译的
+    `Core\ToastNotifier` + `Core\TrayNotifier`，不启动 ClassIsland）
+    A helper 正常：       `mode=A ready=True toast=True tray=True`  exit 0
+       —— 插件代码走完「InstallOnce → helper 自注册 → 写标记 → Show 成功」的完整链路，
+          日志：「横幅：helper 自注册完成（HKCU + 开始菜单快捷方式）」，标记文件三行齐全：
+          version=1 / helper=…\A\ToastHelper\ToastHelper.exe / installed=2026-10-24 22:00:47。
+       同一目录再跑一次（模拟插件第二次启动）：
+          日志变成「横幅：标记文件说已经登记过（…\toast-installed.txt），跳过」，
+          `ready=True toast=True`，helper 只被拉起一次（弹横幅那一次）——「启用过一次就装好」成立。
+    B helper 缺失：       `mode=B ready=False toast=False tray=True` exit 0
+       —— 日志：「横幅：helper 不在（…\B\ToastHelper\ToastHelper.exe），用托盘气泡」，
+          `TrayNotifier.Show` 仍返回 true（托盘气泡照发）。
+    C helper 坏掉：       `mode=C ready=False toast=False tray=True` exit 0
+       —— 把 helper 换成一个立刻退出的 exe 冒充，日志：
+          「横幅：helper 登记失败 exit=-1，用托盘气泡」，然后托盘气泡成功。
+    这就是「exe 不存在时插件仍能正常发托盘气泡」的实测证据。
+
+6.3 构建
+    * helper：`dotnet build Tools\ToastHelper\ToastHelper.csproj -c Release` → 0 警告 0 错误。
+    * 插件：`dotnet build ClassSlideSync.Plugin.csproj -c Release -t:Rebuild` → **0 error**
+      （202 个警告全是仓库里原有的 nullable 警告，集中在 `Views\*\ViewModel`、`Core\SyncSettings.cs`
+      等文件，`ToastNotifier.cs` 一条都没有；本机历史上那些文件本来就这样）。
+      输出目录里 `ToastHelper\` 7 个文件齐全（说明两个 target 生效了）。
+    * 另外单独把 `Core\ToastNotifier.cs` 拎进一个空的 net8.0-windows 工程编译（Nullable 同样开启）
+      → `0 个警告 0 个错误`，证明这个新文件本身干净。
+    * **打包实测**：`pwsh -ep bypass -File .\Pack-Cipx.ps1`（`-p:CreateCipx=true`，SDK 自带的
+      CreateCipx 目标就是 `ZipDirectory` 整个输出目录）→ `cipx\ClassSlideSync.Plugin.cipx`
+      **6,926,978 字节，14 个条目**，其中：
+        ToastHelper/ToastHelper.exe                  151,552 → 68,062
+        ToastHelper/ToastHelper.dll                   17,920 →  8,969
+        ToastHelper/ToastHelper.deps.json              1,085 →    356
+        ToastHelper/ToastHelper.runtimeconfig.json       340 →    212
+        ToastHelper/icon.png                          32,770 → 32,491
+        ToastHelper/WinRT.Runtime.dll                528,944 → 187,308
+        ToastHelper/Microsoft.Windows.SDK.NET.dll 24,877,600 → 6,434,843
+      即 helper 与插件 dll 同包发布，老师装 .cipx 就有了。
+    * 注意：验证期间这个仓库里有另一个 agent 在并发改 `Ui\ControlPanel.axaml.cs` 和
+      `Services\SlideSyncService.cs`，插件构建会间歇性变红，报的全是那两个文件里的错
+      （例如 CS0103 `ClampToVisibleScreen`/`HintText`、CS0029 `ThemeUpdated` 事件签名不匹配），
+      与本次横幅改动无关；对方落地后重建即回到 0 error（本报告最后的构建就是在 0 error 状态）。
+
+6.4 横幅「肉眼出现」这件事：没验证成功，原因如下
+    * 用 `Graphics.CopyFromScreen` 连拍右上角（470x230，20 帧 @200ms + 8 帧 @700ms + 对照拼图），
+      全部没有横幅；`ms-actioncenter:` 也没能打开操作中心。
+    * 对照实验：用系统自带的 PowerShell AUMID（`{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe`）
+      弹一条已知能用的 toast，同样拍不到横幅 → 说明是这台机器当时的通知显示状态在压制横幅
+      （截图时右上角有全屏游戏窗口、QQ 正在被真人使用，Windows 11 的「玩游戏/全屏时勿扰」会自动生效；
+      `Notifications\QuietHours\QuietHoursServiceState=0`，全局无通知策略键）。
+    * 因此证据链止步于「系统收下了这条通知」：`Show()` 没抛异常（exit 0）+ 操作中心历史读回逐字一致
+      + 系统按 AUMID 记了 `LastNotificationAddedTime`。真实横幅需要用户不在游戏/勿扰时再跑一次确认。
+    * 复现命令（任意用户态命令行，helper 需在可写位置，不要从插件目录里跑注册）：
+        "%TEMP%\toastselftest\A\ToastHelper\ToastHelper.exe" --title "课件续页 · 通知自检" --body "这是一条测试横幅，不会重复出现" --log "%TEMP%\toast-manual.log"
+
+7. 目前机器上留下了什么（可手工清掉）
+------------------------------------
+  * HKCU：`Software\Classes\AppUserModelId\ClassSlideSync.Plugin.Toast`（DisplayName=课件续页，
+    IconUri=%TEMP%\toastselftest\A\ToastHelper\icon.png）
+  * 开始菜单：`%APPDATA%\Microsoft\Windows\Start Menu\Programs\课件续页通知.lnk`
+    （2,617 字节，TargetPath=%TEMP%\toastselftest\A\ToastHelper\ToastHelper.exe，AUMID=ClassSlideSync.Plugin.Toast）
+  * 说明：这两处现在指向**验证用的临时副本**。正式装上 .cipx 后，插件第一次启用会重跑
+    `--register-only` 把路径改成真实插件目录（标记文件里记的 helper 路径对不上就会重跑）。
+    想彻底清掉：
+      reg delete "HKCU\Software\Classes\AppUserModelId\ClassSlideSync.Plugin.Toast" /f
+      del "%APPDATA%\Microsoft\Windows\Start Menu\Programs\课件续页通知.lnk"
+
+8. 没验证 / 已知限制
+--------------------
+  * 没在真实 ClassIsland 里加载插件跑一遍（铁律：不启动 ClassIsland）。插件侧用反射控制台验证，
+    走的正是编译出来的同一份 dll。
+  * .cipx 只验证了「被打出来且 helper 在内」，没真丢进 ClassIsland 导入（不部署）。
+  * `exit=31`（系统通知被关）与「helper 超时被杀」两条分支只是代码路径存在，没有构造实测。
+  * 只在 Windows 11 26200 上验证；Windows 10 的 toast 行为（尤其 AUMID 与快捷方式要求）没测。
+  * 多显示器 / 高 DPI 下的横幅位置没测（由系统决定，helper 不参与）。
+  * `Microsoft.Windows.SDK.NET.dll` 24 MB 的体积代价见 §5。

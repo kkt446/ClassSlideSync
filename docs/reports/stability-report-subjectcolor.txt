@@ -1,0 +1,194 @@
+========================================================================
+课件续页 · 药丸按科目着色 + 药丸页码开关 · 稳定性报告
+========================================================================
+日期：2026-10-25 12:5x
+需求原话：
+  ·「9(药丸不是有个进度条吗，每科改颜色，设置可以调每科对应的颜色)」
+  ·「3(设置里记得加悬浮窗缩成药丸时页码关闭)」
+结论：两项都已实现；-t:Rebuild 0 error；反射 harness 79 条断言 79 PASS / 0 FAIL；
+      7 张药丸实拍图逐张看过。设置界面（两处）只过了 XAML 编译校验，没做界面截图（原因见第五节）。
+事前确认：_backup-20261025-1232.zip 存在（7,462,534 字节，2026/10/25 12:32:20）。
+         未触碰安装目录 C:\Users\xzq\Desktop\github\ClassSlideSync\classisland\。
+         未部署、未启动 ClassIsland/WPS、未动 git、未加 NuGet 包。
+
+------------------------------------------------------------------------
+一、改动清单（只动允许的 6 个文件）
+------------------------------------------------------------------------
+1) Core\SyncSettings.cs  —— 配置侧
+   :58   bool showPillPageNumbers = true;                     新字段（默认开＝显示页码）
+   :79   ObservableCollection<SubjectColor> subjectColors …    新字段（逐科配色表）
+   :86   subjectColors.CollectionChanged += OnSubjectColorsChanged;
+   :88   SeedDefaultSubjectColors();                           构造时灌一套预设色
+   :340  public bool ShowPillPageNumbers { get; set; }         属性（Set→PropertyChanged→自动落盘）
+   :471  public ObservableCollection<SubjectColor> SubjectColors  属性（setter 里逐行解/挂通知）
+   :556  internal static bool SubjectNamesOverlap(a, b)        「语文/阅读」「数学+几何」靠它匹配
+   :566  internal static readonly string[] DefaultColorSubjects  14 科：语数英物化生政史地科学信息音美体
+   :576  internal static readonly string[] DefaultColorHexes     一组同明度/饱和度的协调预设色
+   :588  public string FindSubjectColor(string subjectName)    先精确、再拆段求交集；未匹配返回 ""
+   :629  internal void SeedDefaultSubjectColors()              表空时重灌；「恢复预设色」按钮调它
+   :636  OnSubjectColorsChanged / :640 :653 三个通知钩子（增删改都会 Raise(nameof(SubjectColors))）
+   :811  public sealed class SubjectColor : INotifyPropertyChanged
+         Subject / Color / Options(internal) / UseDropdown / UseTextBox
+         Color 只存 #RRGGBB：8 位时尾部 FF 当 #RRGGBBAA 取前 6 位，否则当 #AARRGGBB 丢前 2 位
+   （另：static string Normalize 放宽成 internal，给 Appearance 侧复用）
+
+2) Core\Appearance.cs  —— 画的时候用的只读快照
+   :301  public bool ShowPillPageNumbers = true;
+   :307  public List<SubjectColorPair> SubjectColors
+   :313  public sealed class SubjectColorPair { Subject, R, G, B }
+   :323  public bool PillAccentFor(string subject, out int r, out int g, out int b)
+         命中科目返回 true；未匹配/空/null 返回 false（调用方回落到 look 的强调色）
+   :357  Describe() 增加 pillpages={21} colors={22}（诊断页/日志能看到当前状态）
+   :494  Resolve 里 a.ShowPillPageNumbers = s.ShowPillPageNumbers;
+   :495  a.SubjectColors = ResolveSubjectColors(s);
+   :508  static List<SubjectColorPair> ResolveSubjectColors(SyncSettings s)
+         设置表非空就用设置表；表为空（老配置/用户删空）回落到内置 14 色预设
+
+3) Ui\NativeOverlayCard.cs  —— 绘制侧
+   :476  internal static bool PillPageTextEnabled(CardAppearance look, int textLines)
+         = look.ShowPillPageNumbers && textLines > 0
+   :486  internal static int[] PillBarAccent(CardAppearance look, CardState st)
+         命中科目返回 {r,g,b}，否则 null（null 时进度条仍用主题强调色）
+   :500  internal static string PillSubject(CardState st)
+         三条来源：① Files 里 IsCurrent 那项的 Subject ② st.Context 里 " · " 之前那段
+         ③ Context 本身就是一个科目名（经 CardFileList.LooksLikeSubject 放行）
+         "未标注科目" 当作没科目，继续往下试
+   :2276-2282  药丸绘制段新增：var barColor = accent; int[] subjectAccent = PillBarAccent(look, st);
+               if (subjectAccent != null) barColor = Color32.FromArgb(255, …);
+   :2285  bool showPages = PillPageTextEnabled(look, textLines) && （原来的高度够不够判断）
+   :2317  g.FillRounded(barColor, …)   ← 原来写死 accent 的那一行
+   说明：页数/页码两行数字（蓝 #1F6FEB / 红 #D64545）保持原样，只把「进度条填充」换成科目色，
+         符合需求「进度条每科改颜色」；关掉页码后腾出的高度全部给进度条。
+
+4) Views\SettingsPages\SlideSyncSettingsPage.axaml（插件设置页）
+   :384-393  「药丸里显示页码」SettingsExpander + ToggleSwitch → Settings.ShowPillPageNumbers
+   :395-438  「各科目进度条颜色」SettingsExpander：
+             ItemsControl ItemsSource="{Binding Settings.SubjectColors}"
+             DataTemplate x:DataType="core:SubjectColor"（照抄上面学科文件夹那段的写法，
+             因为插件是动态加载，模板里不能用 $parent[…]）
+             每行 = ComboBox(Options/Subject) / TextBox(Subject) / ColorPicker(IsAlphaVisible=False,
+             Color 走 HexColor 转换器) / 删除按钮(OnRemoveSubjectColor)
+             底部 = 添加一行(OnAddSubjectColor)、恢复预设色(OnResetSubjectColors)
+
+5) Views\SettingsPages\SlideSyncSettingsPage.xaml.cs
+   :69   ApplySubjectInput 里加一段：给每行配色也塞 Options/UseDropdown
+   :86   RefreshSubjects 里把配色表里的科目名也并进下拉候选（只增不删，理由同原来的写法）
+   :122  同上（第二处收集 all 的地方）
+   :254  void OnAddSubjectColor    → Settings.SubjectColors.Add(new SubjectColor())
+   :266  void OnRemoveSubjectColor → 按 Tag 取行，Remove
+   :279-287 void OnResetSubjectColors → Clear() + SeedDefaultSubjectColors() + RefreshSubjects()
+
+6) Ui\ControlPanel.axaml / .axaml.cs（控制面板的「设置」页签，绑的是同一个 SyncSettings 实例）
+   axaml :741-748  同上「药丸里显示页码」
+   axaml :750-791  同上「各科目进度条颜色」（x:Name="SubjectColorList"、x:CompileBindings="True"、
+                   20 空格缩进、无 IconSource、二级文字 FontSize="12"，与面板其它行保持一致）
+   cs    :1232 RefreshSubjects / :1261 收集配色表科目 / :1291 ApplySubjectInput / :1300 配色行循环
+   cs    :1363 OnAddSubjectColor / :1375 OnRemoveSubjectColor / :1388 OnResetSubjectColors
+
+没碰：Core\SessionEngine.cs、Core\Ledger.cs、Automation\*、Core\PptBridge.cs、Core\SeewoBridge.cs。
+
+------------------------------------------------------------------------
+二、构建
+------------------------------------------------------------------------
+& 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build "…\ClassSlideSync.Plugin\ClassSlideSync.Plugin.csproj" -c Release -t:Rebuild
+  → 218 Warning / 0 Error，用时约 5-6 秒；产物
+    bin\Release\net8.0-windows\ClassSlideSync.Plugin.dll（409,088 字节）
+为什么必须 -t:Rebuild：增量构建不重编 XAML，历史上出过 No precompiled XAML found 崩溃。两处 XAML 都是这次新加的，重编是硬要求。
+新增的 18 条警告（200 → 218）逐条看过，没有一条来自新代码：多为既有代码行号平移后重新露出的
+nullable 提示（例如 NativeOverlayCard.cs(2207,123) CS8625 fileRowKeys[i] = null），
+以及 PillBarAccent(look, st) 允许 st 为 null 引发的 CS8604（已在该方法内先判 null）。
+两条 AVLN3001 是既有 XAML 的风格提示，不是本次新增。
+
+------------------------------------------------------------------------
+三、自测：%TEMP%\card-subjectcolor\ 反射 harness
+------------------------------------------------------------------------
+位置：C:\Users\xzq\AppData\Local\Temp\card-subjectcolor\
+      Harness.csproj（net8.0-windows，无 PackageReference，不引插件类型）
+      Program.cs（纯反射：AssemblyLoadContext.Default.LoadFromAssemblyPath + Resolving 事件，
+                 先查 harness 目录/插件目录，再按插件 deps.json 映射到 %USERPROFILE%\.nuget\packages）
+      harness-log.txt（本次全量日志）
+跑法：bin\Release\net8.0-windows\SubjectColorHarness.exe → exit 0
+
+断言 79 条：79 PASS / 0 FAIL
+  1. 科目 → 颜色映射 ……………………………………………… 17 条
+     · 构造后自动 14 行预设；语文=#E03131、数学=#1971C2、物理=#0CA678、英语=#7048E8
+     · 未匹配科目「机器人」/空串/null → ""（上层回落强调色）
+     · 前后空格被忽略；「语文/阅读」「数学+几何」能匹配；语文和数学不互相匹配
+     · 颜色串规整：缺 # 补上、小写转大写、#RRGGBBAA 与 #AARRGGBB 都丢掉 alpha、非法串被拒
+  2. CardAppearance.Resolve …………………………………………… 15 条
+     · ShowPillPageNumbers 默认 true；SubjectColors 解析出 14 行
+     · PillAccentFor(语文/数学) 命中；「机器人」/""/null 未命中（false = 回落强调色）
+     · 改语文颜色后立刻生效；把设置表清空后仍回落内置表；SeedDefaultSubjectColors 能灌回 14 行
+     · PillPageTextEnabled：开+6 行=true、开+0 行=false、关+6 行=false、再打开恢复 true
+  3. 当前科目的来源 …………………………………………………… 8 条
+     · 来源① Files.IsCurrent → 「数学」
+     · 来源② 无 Files 时取 Context「英语 · 第 3 节」的 " · " 前段 → 「英语」
+     · Context 只有「语文」也能取；「未标注科目」被跳过继续取 Context → 「地理」
+     · 什么都没有 → ""；st 为 null 不炸
+     · PillBarAccent(数学)=#1971C2；未匹配科目=null
+  4. 药丸几何 …………………………………………………………… 7 条
+     · PillFillHeight(200,3,10)=60、(200,1,10)=20、(200,10,10)=200（满）、(200,0,10)=0
+     · 只讲一页也看得见：PillFillHeight(200,1,100000)=2
+     · 96/144 dpi 下按同一比例缩放（±1px）
+  5. 真机出图（药丸态）……………………………………… 31 条（每张图 4-5 条像素断言）
+  6. 收尾 ……………………………………………………………… 1 条
+     · 144 dpi 下药丸物理尺寸按 1.5 倍放大（96dpi 32x200 → 144dpi 48x300），几何不变形
+
+真机出图怎么做的（不启动 ClassIsland）：反射 new NativeOverlayCard()
+  → Configure(look, showOnStart:true, autoHide:true, seconds:1, showPanel:false)
+  → Apply(CardState) → Start() → 轮询私有 hwnd → （144dpi 镜头直接改私有 dpi 字段 + ApplyLook()）
+  → Expand() + PostMessage(WM_APP_HIDE) 逼它收成药丸 → SetWindowPos(-4000,-4000)
+  → PrintWindow(PW_RENDERFULLCONTENT) → GetDIBits → 手写 BMP → PowerShell 最近邻放大 4 倍存 PNG
+像素判据不是硬编码采样点（第一版因此全取到 #EEEEEE 而误报），而是整图统计某色像素数：
+  语文红 #E03131 / 数学蓝 #1971C2 / 页码蓝 #1F6FEB / 主题强调色 #FF9D11，各色互相排斥。
+
+------------------------------------------------------------------------
+四、出图（图在哪）
+------------------------------------------------------------------------
+%TEMP%\card-subjectcolor\bin\Release\net8.0-windows\shots\*.bmp（原始）
+同一批已放大 4 倍存 PNG，并复制到插件的 shots\ 下方便直接打开：
+  ClassSlideSync.Plugin\shots\subjectcolor-pill-96-yuwen-pages-on.png     32x200  语文红 569px / 页码蓝 6px
+  ClassSlideSync.Plugin\shots\subjectcolor-pill-96-yuwen-pages-off.png    32x200  语文红 892px / 页码蓝 0
+  ClassSlideSync.Plugin\shots\subjectcolor-pill-96-shuxue-pages-on.png    32x200  数学蓝 569px / 强调色 0
+  ClassSlideSync.Plugin\shots\subjectcolor-pill-96-nomatch-pages-on.png   32x200  强调色 569px / 数学蓝 0
+  ClassSlideSync.Plugin\shots\subjectcolor-pill-144-shuxue-pages-on.png   48x300  数学蓝 1315px / 页码蓝 19px
+  ClassSlideSync.Plugin\shots\subjectcolor-pill-144-shuxue-pages-off.png  48x300  数学蓝 2069px / 页码蓝 0
+  ClassSlideSync.Plugin\shots\subjectcolor-pill-96-yuwen-alpha80.png      32x200  （75% 透明那张）
+逐张肉眼确认：箭头 ❮ 在顶、灰色轨道、科目色（红/蓝/橙）从底往上填到 30%；
+页码开着时下面有蓝色页码数字，关掉后只剩箭头 + 更长的进度条、一个数字都没有；
+144 dpi 那张与 96 dpi 比例一致，圆角、轨道、填充宽度都没有变形。
+（药丸底色偏浅是因为 harness 用的是默认 ClassIslandTheme，不是老师当前主题，属正常。）
+
+------------------------------------------------------------------------
+五、没做到 / 需要老师留意的地方
+------------------------------------------------------------------------
+1. 两个设置界面只过了 Avalonia XAML 编译校验，没做界面截图。
+   harness 是纯反射、不引任何 NuGet，而 SettingsPageBase 来自 ClassIsland.Core
+   （插件 csproj 里 ExcludeAssets=runtime，输出目录没有 ClassIsland.dll），要真机渲染
+   设置页得给 harness 装 Avalonia + ClassIsland 依赖，超出了这次「不加 NuGet」的边界。
+   风险点自评：新加的控件（SettingsExpander / ToggleSwitch / ComboBox / TextBox / ColorPicker /
+   Button）和绑定写法都是照抄同文件里已有的行（含 HexColor 转换器、Options/UseDropdown 那套），
+   编译期已经校验过类型、属性（IsAlphaVisible 等）和 Click 处理器存在，运行期炸的概率低。
+   唯一没被编译期校验的是普通反射绑定的路径字符串（Settings.ShowPillPageNumbers、
+   Settings.SubjectColors、UseDropdown/UseTextBox/Subject/Color），这些名字与 C# 成员逐字对过。
+2. 药丸宽度在关掉页码后刻意保持不变（只多给进度条高度），避免老师一开关药丸就变宽变窄、
+   贴着屏幕边缘时位置乱跳。如果希望关页码后药丸也变窄，需要再改 ComputePillWidth。
+3. PrintWindow 抓不到分层窗口的 alpha，所以 75% 透明那张图看起来和不透明一样；
+   透明度本身没改过，沿用原来的 PillAlpha 逻辑。
+4. 插件里本来就没有 WM_DPICHANGED 处理（dpi 只在窗口创建时 DpiOf() 取一次），
+   所以 144dpi 是用反射改私有 dpi 字段 + ApplyLook() 模拟的；跨屏拖动时 dpi 不刷新是既有行为，
+   不是这次引入的。
+5. 科目识别依赖课件「有标记科目」或课表给了 subject：两者都没有时进度条回落主题强调色
+   （例如「未标注科目」的旧课件、临时拖进来的 PDF）。这是设计如此，不是 bug。
+6. 「恢复预设色」会清掉老师自己改过的颜色（按钮语义就是还原），没有二次确认弹窗。
+7. 未做老配置迁移测试（模拟升级场景）：因为新字段都有默认值、配色表为空时自动回落内置 14 色，
+   理论上老 settings.json 直接可用，但没有真的拿一份旧配置文件跑一遍。
+
+------------------------------------------------------------------------
+六、过程里踩到的两个坑（记下来给后面的人）
+------------------------------------------------------------------------
+· LooksLikeSubject 不在 CardFileGroups 而在 ClassSlideSync.Plugin.Core.CardFileList:373；
+  写成 CardFileGroups.LooksLikeSubject 会 CS0117 编不过。
+· 第一版 PillSubject 遇到「未标注科目」直接 return ""，导致明明有课表科目也不上色；
+  改成 break 继续走 Context 分支才对。
+========================================================================

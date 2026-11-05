@@ -1,0 +1,378 @@
+「课件讲到第 N 页」自动化触发器 —— 实现与取证报告
+========================================================================
+生成时间：2026-10-25 12:43（Asia/Shanghai）
+目标程序集：ClassIsland 2.1.0.1（C:\Users\xzq\Desktop\github\ClassSlideSync\classisland\app-2.1.0.1-0\）
+上游需求：用户原话「4(自动化，当讲到x面时)」——讲到第 N 页时启动自动化。
+开工前置检查：_backup-20261025-1232.zip 存在（7,462,534 字节，2026/10/25 12:32:20）。
+安装目录 classisland\ 仅读取程序集做取证，未写入任何文件。
+
+
+一、结论（先看这段）
+------------------------------------------------------------------------
+1. ClassIsland 2.1.0.1 **确实有触发器（trigger）机制**，不是"只有 rule + action"。
+   基类 ClassIsland.Core.Abstractions.Automation.TriggerBase / TriggerBase<T>，
+   注册扩展 ClassIsland.Core.Extensions.Registry.TriggerRegistryExtensions.AddTrigger，
+   与行动同构的双泛型重载 AddTrigger<TTrigger, TSettingsControl>() 可用。
+   ⇒ 不需要退回"用 rule 轮询模拟"的替代方案（该方案的代价见第九节，备查）。
+
+2. 已落地：新增触发器 ClassSlideSync.Plugin.SlidePageReached
+   （显示名「课件讲到第 N 页」），带一个真正能在自动化界面里编辑的纯 C# 设置控件。
+   注册点在 Plugin.cs:87：
+       services.AddTrigger<SlidePageReachedTrigger, SlidePageReachedSettingsControl>();
+
+3. 构建：0 error（-c Release -t:Rebuild）。
+4. 自测：61 条断言全部通过（%TEMP%\auto-trigger\harness，反射宿主，不启动 ClassIsland/WPS）。
+5. 用户要的语义全部实现：N 可配 1-999 默认 1；可选「仅放映中的课件 / 任何课件」；
+   同一节课同一份课件只触发一次，换课件或换课次后重新允许触发。
+
+
+二、官方文档取证（先查文档，再查程序集）
+------------------------------------------------------------------------
+文档站开发区**没有触发器/自动化页**，所以本报告的 API 依据是「api.docs 参考页 + 程序集元数据」。
+实测（web_fetch）：
+
+  https://docs.classisland.tech/dev/                      HTTP 200
+      开发文档首页。侧边栏「规则集」只有 /dev/ruleset/ 一个条目，
+      **没有任何触发器（自动化）的开发页**。
+  https://docs.classisland.tech/dev/ruleset/             HTTP 200
+      只讲规则集调用方/规则提供方 + StatusUpdated，全文没有触发器内容。
+  https://docs.classisland.tech/dev/automation/          HTTP 404
+      页面正文就是「404 页面不存在 / 这里什么也没有」，为此条专门复核过一次。
+  https://api.docs.classisland.tech/api/ClassIsland.Core.Abstractions.Automation.TriggerBase.html  HTTP 200
+      确认「自动化触发器基类」，方法 Trigger() / TriggerRevert() / Loaded() / UnLoaded()、
+      属性 AssociatedWorkflow；源码链接 ClassIsland.Core/Abstractions/Automation/TriggerBase.cs#L9。
+  https://api.docs.classisland.tech/api/ClassIsland.Core.Abstractions.Automation.TriggerBase-1.html HTTP 200
+      `public abstract class TriggerBase<T> : TriggerBase where T : class`，
+      `protected T Settings { get; }`（TriggerBase.cs#L52 / L57）。
+  https://api.docs.classisland.tech/api/ClassIsland.Core.Extensions.Registry.TriggerRegistryExtensions.html HTTP 200
+      两个 AddTrigger 重载的原文，源码链接 TriggerRegistryExtensions.cs#L20 / L34。
+
+⇒ 文档只能给到「有这个类型」，**注册方法名、设置控件是否需要 ISettingsControl、事件可见性
+   这些细节文档里都没有**，全部靠下面的程序集反射实测确定。
+
+
+三、程序集反射取证（%TEMP%\auto-trigger\probe，直接加载真实 ClassIsland.Core.dll）
+------------------------------------------------------------------------
+1) 基类
+   ClassIsland.Core.Abstractions.Automation.TriggerBase（abstract : object）
+     protected void Trigger()
+     protected void TriggerRevert()
+     public override Loaded() / UnLoaded()  —— 程序集里是 **abstract**（必须 override）；
+                                              api.docs 写成 virtual，是文档滞后。
+     object SettingsInternal { get; set; }  —— 访问器 nonpublic
+     Workflow AssociatedWorkflow { get; }
+     event EventHandler Triggered / TriggeredRevert
+        ⚠ **add 访问器是 nonpublic**：外部程序集不能 `trigger.Triggered += ...`（探针里直接写会
+          编译报 CS0103「名称不存在」）。但它们是 field-like event，底层存在同名非公开字段，
+          反射 GetField("Triggered", Public|NonPublic|Instance).SetValue(实例, 委托) 可以订阅
+          （探针实测：订阅后调用 Trigger() ⇒ 收到 1 次；TriggerRevert() ⇒ 收到 1 次）。
+          这一点对**插件自己**没影响（插件只调 protected Trigger()，订阅方是宿主），
+          只影响自测——harness 就是用反射字段订阅来数"到底触发了几次"。
+
+   ClassIsland.Core.Abstractions.Automation.TriggerBase<T> where T : class（abstract，ctor protected）
+     protected T Settings { get; }   —— 内部就是 (T)SettingsInternal
+     实测：给基类 SettingsInternal 塞 SetB{Page=42} 后读 TriggerBase<SetB>.Settings，拿到同一个对象。
+     实测：SettingsInternal 为 null 时 Settings **返回 null、不抛异常**
+           （行动的 ActionBase 在这种情况下抛 ArgumentNullException，触发器宽松一些；
+            即便如此，插件代码仍对 Settings 包了 try/catch 兜底）。
+
+2) 注册 API —— 名字就是 AddTrigger，两个重载
+   ClassIsland.Core.Extensions.Registry.TriggerRegistryExtensions
+     public static IServiceCollection AddTrigger<TTrigger>(this IServiceCollection services)
+         where TTrigger : TriggerBase
+     public static IServiceCollection AddTrigger<TTrigger, TSettings>(this IServiceCollection services)
+         where TTrigger : TriggerBase
+         where TSettings : TriggerSettingsControlBase
+   实测生成的 ServiceDescriptor：
+     AddTrigger<T>()      → ServiceType=TriggerBase,                                   ServiceKey=<TriggerInfo.Id>, Transient
+     AddTrigger<T,S>()    → 上面那条 + ServiceType=TriggerSettingsControlBase,         ServiceKey=<同一个 Id>,     Transient
+   ⇒ 与 AddAction<TAction, TSettingsControl>() 完全同构：设置控件以同一 Id 注册成 keyed transient。
+     宿主按 Id 取触发器实例、按同一 Id 取设置控件实例。
+
+   实测失败模式（对写插件有用）：
+     * 重复 Id：抛 InvalidOperationException("此自动化触发器id <id> 已经被占用。")
+       抛点 TriggerRegistryExtensions.cs:51（Register 内），AddTrigger<T,S> 在其 :36 调用它。
+       Id 去重表是**进程级静态**，换一个 ServiceCollection 也照样拦。
+     * 缺 [TriggerInfo]：抛 InvalidOperationException("无法注册自动化触发器 <类型名>，因为此控件有注册信息。")
+       （消息是宿主复制粘贴的笔误，实质=缺注册信息特性）。⇒ TriggerInfo 是必需的。
+
+3) 特性 ClassIsland.Core.Attributes.TriggerInfo : Attribute
+     ctor(string id, string name, string iconGlyph = "")
+     Id / Name / IconGlyph 只读；TriggerType / SettingsControlType 有 nonpublic setter（由 Register 填充）
+   ⚠ 与 ActionInfo 不同：**没有 addDefaultToMenu / defaultGroupToMenu 参数**，
+     所以触发器没有「分组」概念，插件里那个 AutomationGroups.Plugin = "课件续页" 常量在触发器上用不到
+     （触发器会统一进宿主的触发器列表，按 Name 显示）。
+
+4) 设置控件基类（ClassIsland.Core.Abstractions.Controls）
+     TriggerSettingsControlBase : Avalonia.Controls.UserControl（abstract，ctor protected）
+        public TriggerSettingsControlBase GetInstance(TriggerInfo info, ref object settings)
+        protected object SettingsInternal { get; set; }
+        protected virtual void OnPropertyChanged(string)
+        protected bool SetField<T>(ref T field, T value, string name)
+     TriggerSettingsControlBase<T> : TriggerSettingsControlBase（abstract）
+        public T Settings { get; }
+   ⇒ 不需要实现 ISettingsControl 之类的接口：继承 TriggerSettingsControlBase<T> 就够了，
+     宿主打开触发器设置抽屉时按 Id 取控件 → 调 GetInstance → 把 settings 塞进 SettingsInternal。
+
+5) **时序坑（实测，必须遵守）**：DI 工厂不做设置注入。
+   new ServiceCollection().AddTrigger<T,S>() → BuildServiceProvider() →
+   GetRequiredKeyedService<TriggerBase>(Id).SettingsInternal == null，
+   GetRequiredKeyedService<TriggerSettingsControlBase>(Id).SettingsInternal == null。
+   ⇒ 注入是宿主后续（Workflow / TriggerSettings.GetInstance）做的。
+     插件侧必须在 Settings 为 null 时回落默认值，并且界面不能在构造函数里读 Settings（那时必为 null）。
+
+6) 其它相关类型
+   ClassIsland.Core.Models.Automation.TriggerSettings : ObservableRecipient
+     string Id / object Settings / TriggerInfo AssociatedTriggerInfo / TriggerBase TriggerInstance / event Unloading
+   IAutomationService
+     List<TriggerInfo> RegisteredTriggers（宿主就是用它给触发器列表喂数据，我们的 Id 会出现在这里）
+     ObservableCollection<Workflow> Workflows / IReadOnlyList<string> Configs / SaveConfig / RefreshConfigs
+   ClassIsland.Core.Controls.Automation.TriggerSettingsControl / TriggerSettingsControlPresenter（宿主自动装配用）
+
+
+四、注册点
+------------------------------------------------------------------------
+Plugin.cs:87（在 services.AddRule(...) 之后，同一个 Initialize 里）
+    // 2026-10-25 用户第 4 条需求：「自动化，当讲到 x 面时」——不是行动，是**触发条件**，
+    // 所以要注册成触发器而不是 AddAction。触发器与行动同构：AddTrigger<TTrigger, TSettingsControl>()
+    // 按 [TriggerInfo] 里的 Id 把触发器和它的设置控件各注册成一条 keyed transient；
+    // 只写 AddTrigger<TTrigger>() 就没有设置界面（页码没法填）。取证见 stability-report-trigger.txt。
+    services.AddTrigger<SlidePageReachedTrigger, SlidePageReachedSettingsControl>();
+
+已有的 Plugin.LogAutomationRegistrations 会反射 IAutomationService 并把含 "ClassSlideSync" 的条目
+写进台账日志（Plugin.cs:94 附近，AppStarted 时调用），所以注册成功之后
+台账日志里会多出触发器这一条，真机排查时可以直接看日志确认。
+
+
+五、实现说明
+------------------------------------------------------------------------
+文件：Automation\SlidePageTrigger.cs（231 行）
+文件：Automation\TriggerSettingsControls.cs（162 行）
+
+1) 设置数据（SlidePageReachedSettings，POCO，公共无参构造 + 两个可读写属性）
+     int  Page    = 1      // 讲到第几页，使用时夹到 1-999（不改写用户填的数字）
+     bool AnyDeck = false  // false = 只认正在放映的课件；true = 打开着的课件翻到这一页也算
+
+2) 触发器本体
+     [TriggerInfo("ClassSlideSync.Plugin.SlidePageReached", "课件讲到第 N 页", "\uE945")]
+     public sealed class SlidePageReachedTrigger : TriggerBase<SlidePageReachedSettings>
+         const int MinPage = 1, MaxPage = 999;
+         const int MaxRemembered = 64;                  // 去重记录上限
+         readonly HashSet<string> fired（OrdinalIgnoreCase）+ readonly object gate;
+         public int FireCount { get; private set; }     // 真的调过几次 Trigger()，自测用
+         public SlideProgress? LastFired { get; private set; }
+
+     override void Loaded()
+         Hook()（取 SlideSyncService、订阅 SlideProgressChanged）
+         + 立刻用当前快照 Consider 一次
+           —— 理由：触发器可能是在课件已经停在第 N 页之后才被加上/重新加载的，
+              那时不该等老师再翻一页。
+     override void UnLoaded() → Unhook()（必须退订，工作流重新加载时不能挂两份回调）
+     public bool Consider(SlideProgress progress)   // 判定一次；public 是为了自测能直接喂快照
+         progress == null                          → false
+         !DeckOpen || Current <= 0                 → false（没课件 / 这一拍没读到页码）
+         !Showing && !AnyDeck                      → false（只是打开着，没在放映）
+         Current != TargetPage()                   → false
+         fired.Contains(key)                       → false（同一节课同一份课件只触发一次）
+         否则 fired.Add(key) → Fire() → true
+         整段 try/catch：自动化里抛异常会打断整条工作流，异常只记台账、返回 false。
+     void Fire(...)
+         FireCount++ / LastFired = 快照 / 记台账 "trigger fire: ..." / 调 protected Trigger()
+         **不调 TriggerRevert()**：这是"讲到了"的一次性事件，没有"不再讲到"的对应状态，
+         调用 revert 会让宿主把工作流也回滚一次，语义不对。
+     int TargetPage() = Math.Clamp(Settings?.Page ?? 1, 1, 999)   // Settings 为 null 时回落 1
+     bool AnyDeck()   = Settings?.AnyDeck == true
+     SlidePageReachedSettings? TrySettings()  包 try/catch 读 Settings
+
+3) 去重键（同一节课同一份课件只触发一次的实现）
+     键 = 课次 + "|" + 课件
+     课次：SlideProgress.LessonKey（"科目|节名|节号"，由课表读数拼出）
+           为空时退到 SlideProgress.DayKey（yyyy-MM-dd）——没课表时同一天同一份课件也只触发一次，
+           第二天再讲同一份课件会重新触发。
+     课件：课件完整路径 → 文件名 → "#" + 当前页（三级退让；路径拿不到时宁可放宽也不永不触发）
+     ⚠ fired 是**实例字段**不是静态字段：每个工作流有自己的触发器实例，
+       两个工作流都配了「第 5 页」时应该各触发一次，不能被彼此吃掉。
+     ⚠ 记录超过 64 条直接 Clear()：等于"忘了以前触发过"，最多让同一份课件多触发一次，
+       比让集合无限长好（老师一学期几百份课件，正常远到不了 64 条并发活跃记录）。
+
+4) 线程
+     SlideProgressChanged 在引擎线程上抛（SlideSyncService.PublishProgress 里同步调用订阅方）。
+     Consider 的判重段有 lock(gate)，不会因为并发心跳重复触发（自测 C27 用 20 线程验证）。
+     Trigger() 是同步调用（宿主的 Triggered 处理链同步跑完）。
+
+
+六、设置控件字段（自动化界面里能编辑什么）
+------------------------------------------------------------------------
+文件：Automation\TriggerSettingsControls.cs
+类：public sealed class SlidePageReachedSettingsControl : TriggerSettingsControlBase<SlidePageReachedSettings>
+写法：纯 C# 搭界面（不写 .axaml）——插件工程的 XAML 编译项不是通配的，新增 .axaml 必须改 .csproj，
+      而本次改动范围不含工程文件。
+
+控件结构（Content = StackPanel，Spacing 8）：
+  1. TextBlock「讲到第几页」                        （FontWeight=SemiBold）
+  2. TextBox pageBox                                 Width=120，Watermark="1 - 999"
+  3. TextBlock 提示：「1 - 999，默认 1。同一节课的同一份课件只触发一次：老师翻回这一页再看一遍
+     不会重复触发，换课件或换下一节课后重新算。」      （FontSize=12，Opacity=0.7，MaxWidth=420）
+  4. CheckBox anyDeckBox  文案「任何课件都算（不限于正在放映的那一份）」（TextWrapping=Wrap）
+  5. TextBlock 提示：「不勾 = 只认正在放映的那份课件（推荐，避免编辑视图里翻页把自动化点着）。
+     勾上 = 演示软件里打开着的课件翻到这一页也算。」
+
+交互：
+  pageBox.TextChanged  → int.TryParse 成功则 settings.Page = Clamp(1..999)
+                         解析失败（空/非数字）保持原值，不写回
+  pageBox.LostFocus    → NormalizePage()：把输入框里显示的字符串改成夹过范围的值
+                         （老师填 0 或 5000 时要看得到它变成了几）
+  anyDeckBox.Click     → settings.AnyDeck = IsChecked == true
+  AttachedToVisualTree → LoadFromSettings()：把 settings 回填到两个控件
+                         时序理由见第三节第 5 条：宿主先 new 控件、后注入 SettingsInternal，
+                         构造函数里读 Settings 只能读到 null。
+  bool loading         → 回填期间置真，防止"读设置"被 TextChanged 当成"老师改设置"再写回去
+  TrySettings()        → 包 try/catch 读 Settings，为 null 时控件只是静默不回填，不抛
+
+
+七、数据源（Services\SlideSyncService.cs 新增只读访问器，本文件属于本次允许改动范围）
+------------------------------------------------------------------------
+设计原则：触发器**不自己盯** PowerPoint/WPS。引擎已经在盯了，再盯一遍就是双份 COM 轮询，
+还会出现"卡片显示第 5 页、触发器以为第 3 页"两份真相。这里只把引擎推来的状态抄成只读快照。
+
+新增内容（均在本文件内）：
+  SlideSyncService.cs:1011  void OnStateChanged(CardState st)
+  SlideSyncService.cs:1017  PublishProgress(st);      ← 插在 try 块第一句（卡片可能为 null 就 return 之前，
+                                                        卡片被收起时也要知道页码）
+  SlideSyncService.cs:1193  public SlideProgress Progress            （永不返回 null，兜底 EmptyProgress）
+  SlideSyncService.cs:1202  public event Action<SlideProgress>? SlideProgressChanged
+                            只在「签名变化」时抛一次（同一页的重复心跳不抛），订阅方必须是快的且自己吞异常
+  SlideSyncService.cs:1205  void PublishProgress(CardState st)
+                            current 优先取 CardState.Current，为 0 时退到引擎快照 PptSnapshot.Current；
+                            count 同理；整段 try/catch（触发器出事不能把引擎线程带下去）
+  SlideSyncService.cs:1241  static string LessonKeyOf(LessonTag tag)  → "科目|节名|节号"，无课表读数返回 ""
+  SlideSyncService.cs:1362  public sealed class SlideProgress
+                            只读属性 DeckOpen / Showing / DeckPath / DeckName / Current / SlideCount /
+                            LessonKey / DayKey；方法 Signature()（变化指纹）、Describe()（日志一句话）
+                            构造时 null 字符串折成空串 —— 触发器不用每次判空
+  ⚠ SlideProgress 是**命名空间级类型**（ClassSlideSync.Plugin.Services.SlideProgress），不是嵌套在
+    SlideSyncService 里：第一次写成嵌套导致 5 处 CS0246，已整体去一级缩进搬到命名空间末尾。
+
+
+八、自测
+------------------------------------------------------------------------
+宿主：C:\Users\xzq\AppData\Local\Temp\auto-trigger\harness\（Harness.csproj + Program.cs）
+方式：Assembly.LoadFrom 加载 bin\Release\net8.0-windows\ClassSlideSync.Plugin.dll，
+      引用安装目录里的真实 ClassIsland.Core 2.1.0.1（与插件编译用的是同一批 DLL），
+      **不启动 ClassIsland、不启动 WPS/PowerPoint、不碰安装目录**。
+      结果写 result.txt，退出码 = 有失败 ? 1 : 0。
+运行：
+  & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build "$env:TEMP\auto-trigger\harness\Harness.csproj" -c Release -v:q -nologo
+  $env:DOTNET_ROLL_FORWARD='LatestMajor'
+  & "$env:TEMP\auto-trigger\harness\bin\Release\net8.0-windows\TriggerHarness.exe"
+
+结果：**通过 61 / 断言 61，退出码 0**。
+
+覆盖（分组）：
+  A 注册（15）：类型存在/public/sealed、基类正确、[TriggerInfo] 存在、Id/Name/IconGlyph、
+                MinPage/MaxPage 常量、AddTrigger<T,S> 不抛、注册出 TriggerBase 描述符（Key=Id、Transient）、
+                注册出 TriggerSettingsControlBase 描述符、控件基类正确、容器能按 Id 解析出触发器、
+                容器能按 Id 解析出控件、重复 Id 抛 InvalidOperationException（反证去重表里真有这个 Id）、
+                Plugin.cs 源码里确有这一行。
+  B 设置 POCO（4）：公共无参构造、默认 Page=1、默认 AnyDeck=false、两属性可读写。
+  C 触发判定（27）：
+      N 边界：999 触发；1000 夹到 999；0 夹到 1；-5 夹到 1。
+      只触发一次：同一课件喂 3 次仍 1 次；翻走再翻回（5→3→5→1）仍 1 次；
+                  路径大小写不同算同一份（只 1 次）；路径空退文件名；路径与文件名都空退页码兜底。
+      跨课件/跨课次重置：换课件 +1；换 LessonKey +1；没有课表时换天 +1。
+      不触发：页码不符、Current=0、DeckOpen=false、非放映且未勾「任何课件」、快照 null。
+      勾「任何课件」时非放映也触发。
+      70 份不同课件都触发（记录超 64 条清空不影响判定、不抛）。
+      真的调了 Trigger()（Triggered 事件次数 == FireCount）、从不调 TriggerRevert()、LastFired 正确。
+      Loaded()/UnLoaded() 在没有宿主服务时不抛。
+      20 线程同时喂同一快照只触发一次。
+  D 设置控件（8）：可构造且 Content 非空；回填 Page=42 → 输入框显示 42；输入 7 → Page=7；
+                   输入 5000 → 夹回 999；输入 abc → 保留上次有效值；
+                   勾选/取消勾选 → AnyDeck 跟着变（用真实 RoutedEventArgs(Button.ClickEvent) 触发）；
+                   面板里两段说明文字都在。
+  E 数据源（7）：SlideProgress 是 Services 命名空间内的 public sealed；null 字符串折空串；
+                 Signature 随页码变；Describe 带页码与状态；服务确有 Progress 属性 + SlideProgressChanged 事件；
+                 OnStateChanged 心跳里调用了 PublishProgress 且在所有 "卡片为空就 return" 之前；
+                 Progress 永不返回 null。
+
+自测里踩到的两个坑（已解决，记录以免下次重踩）：
+  * Avalonia 的 TextBox 把 TextChanged 排到 UI 线程的下一次循环，赋值当场不同步触发；
+    harness 改完 Text 要 Dispatcher.UIThread.RunJobs() 才等价于"老师真的敲了字"。
+    这不影响真机（宿主本来就有 UI 循环），但意味着**设置是异步提交的**，
+    紧接着读 Settings 的代码不能假设它已经是最新值（本插件没有这种代码）。
+  * Triggered/TriggeredRevert 的 add 访问器是 nonpublic，只能反射塞字段（见第三节第 1 条）。
+
+
+九、「如果 2.1.0.1 没有触发器」的备选方案（本次**没有采用**，仅备查）
+------------------------------------------------------------------------
+触发机制存在，所以不需要。若将来某个版本砍掉了触发器，代价最小的替代是：
+用现有的规则（AddRule，UnfinishedDeckRule 那套）+ 一个内置定时器轮询「当前页」，
+在规则里比较"上次记录的页 != 本次页且 == N"来模拟触发。
+代价（也是它不如真触发器的原因）：
+  1. 轮询周期本身就是漏触发/重复触发的来源（页翻得快会整页跳过）；
+  2. 规则是"条件"，本身没有"触发一次"的语义，得自己维护"已触发"状态（等于把本报告第五节
+     的去重逻辑再写一遍，且放在规则里没有工作流实例隔离，多工作流互相吃掉记录）；
+  3. 规则 Evaluate 是无状态的纯函数式约定（现有 UnfinishedDeckRule.Evaluate(ledger, now) 就是），
+     在里面塞可变状态会破坏这个约定；
+  4. 老师看到的界面也不对：需求是"当讲到第 N 页这个事件发生时启动自动化"，
+     用规则只能做成"当讲到第 N 页时条件成立"，需要老师自己再配一个"卡片可见性变化"之类的触发。
+
+
+十、未验证项（真机才能确认的部分，必须如实列出）
+------------------------------------------------------------------------
+1. **真机自动化界面未截图、未点过**：本环境被明确要求不部署、不启动 ClassIsland，
+   所以「触发器列表里能看到『课件讲到第 N 页』、点进去能编辑页码」只有 API 层面的证据
+   （A8-A15：注册描述符 + 容器解析 + 控件可构造 + 文本/勾选框事件写回设置），
+   没有真实宿主界面的截图。
+2. **图标字形 U+E945（Segoe Fluent Icons LightningBolt）**只是从字体映射表里挑的，
+   没在真机字体下确认渲染成闪电而不是豆腐块；改 Automation\SlidePageTrigger.cs:56 的 Glyph 即可换。
+3. **真实翻页时序**：trigger 依赖 SlideSyncService.PublishProgress 用的 CardState.Current / 引擎快照。
+   真机 PowerPoint/WPS 翻页时这两者是否会短暂为 0、跳页时是否漏过目标页，
+   以及 WPS 放映窗口识别不到的已知问题上页码是否还更新（旧报告里 WPS 的部分本来就标了未验证），
+   都只能在真机复验。触发器本身对此是保守的：Current<=0 一律不触发。
+4. **Trigger() 在引擎线程上同步调用时，宿主是否会把它切到 UI 线程**未验证。
+   本插件的行动（AutomationOnUi）自己会切线程，第三方行动是否安全取决于宿主；
+   如果真机发现某行动在引擎线程上报错，修法是在 Fire() 里改成 Dispatcher.UIThread.Post(Trigger)
+   （代价是触发延迟一拍，且自测的同步计数断言要跟着改成等待）。
+5. **工作流保存/重载后的 Settings 反序列化**未验证：宿主把 SlidePageReachedSettings 存成 JSON 再读回，
+   新增字段时老配置的兼容性由宿主的序列化器决定（我们的两个字段都有默认值，理论上安全）。
+6. **多个工作流各配一个「第 N 页」触发器**时各触发一次（实例字段隔离）是设计意图，
+   harness 只在单实例上验证过行为，多工作流并发未在真机验证。
+7. 去重记录上限 64 条 + 超限 Clear() 的行为已用 70 份课件验证不抛、不影响后续触发，
+   但"清空后同一份课件会再触发一次"这个理论副作用没有在真机上构造出真实场景。
+
+
+十一、改动文件清单（严格在允许范围内）
+------------------------------------------------------------------------
+新增  Automation\SlidePageTrigger.cs          触发器 + 设置 POCO（231 行）
+新增  Automation\TriggerSettingsControls.cs   触发器设置控件（纯 C#，162 行）
+改动  Services\SlideSyncService.cs            只加「触发器数据源」段 + OnStateChanged 里一行
+                                              PublishProgress(st);（未改任何既有逻辑）
+改动  Plugin.cs                               只加 1 行注册 + 上面那段注释（Plugin.cs:83-87）
+
+未改动（按约束核对）：Core\SessionEngine.cs、Core\Ledger.cs、Core\SyncSettings.cs、
+Ui\NativeOverlayCard.cs、Ui\ControlPanel.*（两个文件均未由我编辑）、.csproj、git 仓库。
+未部署、未启动 ClassIsland/WPS、未新增 NuGet 包、未动安装目录。
+
+
+十二、构建
+------------------------------------------------------------------------
+命令：
+  & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build "…\ClassSlideSync.Plugin.csproj" -c Release -t:Rebuild
+结果：**0 个错误**（既有 warning 未新增：CS8618/CS8612/CS8625 等是 Core\ 里既有的可空性提示）。
+
+过程中出现过一次假报错，记录以免误判为本次改动引入：
+  某一轮 -t:Rebuild 报 3 条
+  `Ui/ControlPanel.axaml(777/783/784) Avalonia error AVLN3000: Unable to find suitable setter or adder
+   for property Click ... argument System.Runtime:System.String`。
+  该文件不在本次改动范围，查证结论是**别的改动正在同一个工作区里并发写**：
+  Ui\ControlPanel.axaml 在 12:39:16 加进了「科目颜色」那一节（备份 zip 里是 63,234 字节，
+  当时是 67,595 字节），对应的 3 个 Click 处理函数在 12:40:01 才写进 Ui\ControlPanel.axaml.cs
+  （OnAddSubjectColor / OnRemoveSubjectColor / OnResetSubjectColors，当前在 .cs 的 1363-1388 行）。
+  我那次构建正好落在这两个写操作之间，XAML 编译器按字符串解析 Click 就报 AVLN3000。
+  等那次编辑收尾后重跑 Rebuild：0 error。⇒ 与触发器改动无关，本次也未编辑该文件。
+
+附带一条：同一个工作区里似乎还有别的进程在跑 Rebuild（自测第一次跑时正好撞上
+bin\Release\net8.0-windows\ClassSlideSync.Plugin.dll 被删又重建的那一秒，harness 报
+「插件产物不存在」退出码 2），重跑即通过。以后在同一工作区并行构建时，
+"构建完立刻跑 harness" 这一步要留一点余量或重跑一次。

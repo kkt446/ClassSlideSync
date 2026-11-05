@@ -41,7 +41,6 @@ namespace ClassSlideSync.Plugin.Core
     {
         readonly string dir;
         readonly string fileName;
-        readonly string tempName;
 
         /// <summary>
         /// The ledger lives in the plugin's own config folder, which ClassIsland creates and
@@ -58,7 +57,6 @@ namespace ClassSlideSync.Plugin.Core
         {
             dir = string.IsNullOrWhiteSpace(dataFolder) ? "data" : Path.GetFullPath(dataFolder);
             fileName = Path.Combine(dir, "ledger.json");
-            tempName = Path.Combine(dir, "ledger.tmp");
         }
 
         public string Root { get { return dir; } }
@@ -100,38 +98,83 @@ namespace ClassSlideSync.Plugin.Core
             set { lock (Sync) byFile = value ?? new Dictionary<string, List<SessionRecord>>(); }
         }
 
+        /// <summary>这次没能读成磁盘上的台账（IO 失败或真损坏）。只读模式下永不覆盖它。</summary>
+        bool readOnly;
+
         public static Ledger Load(string dataFolder)
         {
             var l = new Ledger(dataFolder);
+            string json;
             try
             {
                 if (!File.Exists(l.fileName)) return l;
-                var json = File.ReadAllText(l.fileName, Encoding.UTF8);
+                json = File.ReadAllText(l.fileName, Encoding.UTF8);
+            }
+            catch (Exception ex)
+            {
+                // 读不到 ≠ 文件坏了。多开、杀软扫描、网盘/同步盘瞬时锁文件抛的都是 IO 异常；
+                // 旧代码在同一段 catch 里也走「改名 + 空台账」，紧随其后的 Save 会把真数据整本覆盖，
+                // 讲了一学期的历史就这么没了。IO 失败一律当作「这次先不读」，并禁止本次运行写盘。
+                l.readOnly = true;
+                l.Log("ledger load failed (io): " + ex.GetType().Name + " " + ex.Message
+                    + " -- 本次不覆盖台账文件");
+                return l;
+            }
+            try
+            {
                 var loaded = JsonSerializer.Deserialize<Ledger>(json);
                 if (loaded != null && loaded.ByFile != null) l.ByFile = loaded.ByFile;
+                else if (json.Trim().Length > 0) throw new JsonException("deserialized to null");
             }
-            catch
+            catch (Exception ex)
             {
-                // A corrupt ledger must never stop ClassIsland from starting; begin clean.
-                // 但坏文件不能就这么算了：下一次 Save 会把它整个覆盖，讲了一学期的历史就永久没了。
-                // 先改名留档，万一只是一行坏了，老师还能人工拣回几十条。
-                try
-                {
-                    if (File.Exists(l.fileName))
-                        File.Move(l.fileName, l.fileName + ".corrupt-"
-                            + DateTime.Now.ToString("yyyyMMdd-HHmmss", System.Globalization.CultureInfo.InvariantCulture));
-                }
-                catch { }
-                l.ByFile = new Dictionary<string, List<SessionRecord>>();
+                l.Log("ledger load failed (parse): " + ex.GetType().Name + " " + ex.Message);
+                l.QuarantineCorrupt();
             }
             return l;
+        }
+
+        /// <summary>
+        /// 把坏台账改名留档。名字带毫秒：旧代码只精确到秒，同一秒内触发两次时 File.Move 撞名失败，
+        /// 被空 catch 吞掉后坏文件留在原位、紧接着被 Save 覆盖。改名失败就退成只读模式。
+        /// </summary>
+        void QuarantineCorrupt()
+        {
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            for (int i = 0; i < 4; i++)
+            {
+                try
+                {
+                    if (!File.Exists(fileName)) return;
+                    string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss-fff", inv);
+                    string target = fileName + ".corrupt-" + stamp
+                        + (i == 0 ? "" : "-" + i.ToString(inv));
+                    if (File.Exists(target)) continue;
+                    File.Move(fileName, target);
+                    Log("ledger quarantined: " + Path.GetFileName(target));
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    Log("ledger quarantine failed: " + ex.GetType().Name + " " + ex.Message);
+                    readOnly = true;
+                    return;
+                }
+            }
+            readOnly = true;
+            Log("ledger quarantine failed: name collision, staying read-only");
         }
 
         static readonly object saveLock = new object();
 
         public void Save()
         {
-            // saveLock 仍然守"两个实例同时写同一本台账"；Sync 守"序列化和内存改动撞车"。
+            if (readOnly)
+            {
+                Log("ledger save skipped (read-only: 上次加载失败，不能覆盖磁盘上的台账)");
+                return;
+            }
+            // saveLock 守"同一进程内两次落盘交错"；跨进程靠下面每次落盘一个独一无二的临时文件名。
             // 顺序固定 saveLock → Sync，和 Prune 的顺序一致（Prune 不持 Sync 调 Save）。
             lock (saveLock)
             {
@@ -150,18 +193,33 @@ namespace ClassSlideSync.Plugin.Core
                     Log("ledger save failed (serialize): " + ex.GetType().Name + " " + ex.Message);
                     return;
                 }
+                // 临时文件名必须每次唯一：旧代码恒用 ledger.tmp，两个实例（或多开的教学端）
+                // 交错时，A 的 File.Replace 会把 B 写了一半的内容换装成 ledger.json，
+                // B 自己的 Replace 又因目标被换走抛 FileNotFoundException，两次落盘全废。
+                string tmp = Path.Combine(dir, "ledger."
+                    + Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                    + "." + Guid.NewGuid().ToString("N").Substring(0, 8) + ".tmp");
                 try
                 {
                     Directory.CreateDirectory(dir);
                     // Write-then-rename: an interrupted save must not leave a half-written ledger.
-                    File.WriteAllText(tempName, json, new UTF8Encoding(false));
-                    if (File.Exists(fileName)) File.Replace(tempName, fileName, null);
-                    else File.Move(tempName, fileName);
+                    File.WriteAllText(tmp, json, new UTF8Encoding(false));
+                    try
+                    {
+                        if (File.Exists(fileName)) File.Replace(tmp, fileName, null);
+                        else File.Move(tmp, fileName);
+                    }
+                    catch (FileNotFoundException)
+                    {
+                        // 另一个实例刚好把 ledger.json 挪走/删掉：Replace 要求目标存在，退成 Move。
+                        File.Move(tmp, fileName);
+                    }
                 }
                 catch (Exception ex)
                 {
                     // 磁盘满、目标被别的程序独占、ledger.json 被设成只读 —— 这些都会让这次落盘
                     // 失败而内存里一切正常，重启后整本台账回到上一次成功的状态。留日志是唯一线索。
+                    try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
                     Log("ledger save failed (write): " + ex.GetType().Name + " " + ex.Message);
                 }
             }
@@ -209,7 +267,11 @@ namespace ClassSlideSync.Plugin.Core
                 // 只能退一步按相对路径尾部认领；否则这批旧记录永远读不出来（页数、历史全丢）。
                 string bare = "";
                 string raw = (path ?? "").Trim();
+                // 只认「裸文件名」这种历史遗留（早期版本把演示文稿1 这种名字直接当键存过）。
+                // 带目录的相对路径不再参与后缀匹配：否则 …\A\第3课.pptx 的查询会认领 …\B\第3课.pptx
+                // 那个桶，两份不同课件从此共用一本台账。
                 if (raw.Length > 0 && !Path.IsPathRooted(raw) &&
+                    raw.IndexOf('\\') < 0 && raw.IndexOf('/') < 0 &&
                     !raw.StartsWith(SeewoBridge.KeyPrefix, StringComparison.Ordinal))
                 {
                     bare = "\\" + raw.Replace('/', '\\').TrimEnd('\\').ToLowerInvariant();
@@ -627,10 +689,30 @@ namespace ClassSlideSync.Plugin.Core
             {
                 lock (Sync)
                 {
+                    // 同名多桶（不同目录里各有一个「第3课.pptx」）不能按显示名一锅端：
+                    // 那会把老师没勾的那份一起删掉，而且没有撤销入口。只在显示名唯一时才按名字兜底。
+                    var nameCount = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var kv in byFile)
+                    {
+                        string n = DisplayName(kv.Key);
+                        if (n.Length == 0) continue;
+                        int c;
+                        nameCount.TryGetValue(n, out c);
+                        nameCount[n] = c + 1;
+                    }
+
                     Dictionary<string, List<SessionRecord>> next = null;
                     foreach (var kv in byFile)
                     {
-                        if (!wanted.Contains(kv.Key) && !wantedNames.Contains(DisplayName(kv.Key))) continue;
+                        bool exact = wanted.Contains(kv.Key);
+                        if (!exact)
+                        {
+                            string n = DisplayName(kv.Key);
+                            int c = 0;
+                            exact = n.Length > 0 && wantedNames.Contains(n)
+                                && nameCount.TryGetValue(n, out c) && c == 1;
+                        }
+                        if (!exact) continue;
                         next = next ?? new Dictionary<string, List<SessionRecord>>(byFile);
                         next.Remove(kv.Key);
                         removed += kv.Value == null ? 0 : kv.Value.Count;

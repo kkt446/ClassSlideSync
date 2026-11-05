@@ -1,0 +1,444 @@
+ClassSlideSync Linux 页码来源 — 实现与验证报告
+================================================
+
+生成时间：2026-10-31（Asia/Shanghai）
+仓库：C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin
+WSL：UbuntuCi（Ubuntu 24.04.5 LTS，root，/root/plugin）
+目标框架：net8.0，ClassIslandPluginSdkVersion 2.1.0.1
+
+结论
+----
+1. 新增 Core/LinuxSlideSource.cs：读 ~/.local/share/classslidesync/current.json，
+   10 秒过期，任何 IO/JSON 异常都吞掉并记日志；Maintain() 建目录并写中文 README.txt。
+2. 新增 LibreOffice Impress 适配器（Python + UNO），已在 WSL + Xvfb 下实测：
+   10 页课件进入放映、翻到第 4 页后，适配器写出
+   {"file":".../纯页码课件.pptx","page":4,"total":10,"showing":true,...}；
+   同一份 JSON 被 LinuxSlideSource 的独立探针读回 page=4,total=10,showing=true，
+   过期/坏 JSON/文件不存在/恢复四种场景全部 PASS。
+3. 新增 WPS Linux 的 JS 加载项示例。该路径没有在真实 WPS Linux 上跑过，
+   README.md 顶部已用醒目文字注明，详见第 6 节。
+4. Windows Release 构建 0 error；WSL 内 Linux Release 构建 216 warning / 0 error。
+5. 未改动 Ui/NativeOverlayCard.cs、Ui/ICardSink.cs、Ui/LinuxCardWindow.cs。
+   验证期间同事的 LinuxCardWindow 落地，SlideSyncService 里已有的 ApplyExternal 接线
+   属于并行改动；本报告只声明自己新增的接口/定时器/文件，见第 2 节。
+
+1. 改动文件与行号
+------------------
+以下行号以本报告生成时的文件为准。
+
+1.1 新增：Core/LinuxSlideSource.cs（480 行）
+  - 34-61   LinuxSlideSource 类、StaleSeconds=10、DataDirectory/CurrentJsonPath/ReadmePath、
+            LogSink、Current 快照。
+  - 70-92   public static bool TryRead(out string file, out int page, out int total, out bool showing)
+            成功才返回 true；四个 out 参数先置默认值，任何异常都只记日志并返回 false。
+  - 98-212  public static bool TryReadDetailed(out LinuxSlideRead read)
+            文件不存在/空/坏 JSON/缺 file/page 负数/updated 缺失或不可解析/超过 10 秒，
+            逐项拒绝；updated 用 InvariantCulture + AssumeUniversal|AdjustToUniversal 解析；
+            未来超过 60 秒只记一次日志，不判过期。
+  - 193-198 过期判断：age > StaleSeconds，日志格式「bridge: 数据过期 N 秒（路径）」。
+  - 219-253 public static void Maintain()
+            Directory.CreateDirectory + 幂等写 README.txt（内容相同不重写，UTF-8 无 BOM）；
+            建目录/写文件失败只记日志，绝不抛。
+  - 308-327 ResolveDataDirectory()
+            优先 XDG_DATA_HOME，否则 Environment.GetFolderPath(LocalApplicationData)，
+            再拼 classslidesync；对应 Linux 的 ~/.local/share/classslidesync。
+  - 366-419 BuildReadme()
+            中文协议说明，含字段表、10 秒过期、两个适配器路径。
+  - 425-479 LinuxSlideRead：Ok/File/Page/Total/Showing/App/Updated/Age + Describe()。
+
+1.2 修改：Plugin.cs（297 行）
+  - 43-49   注释更新：Linux 做三件事（日志、只读设置页、页码源），Windows 路径不变。
+  - 50-92   非 Windows 分支：
+            55-57  Ledger 日志（read-only settings page + Linux page source）
+            58     services.AddSettingsPage<PlatformUnavailablePage>()
+            64-70  DataFolder/Settings 加载、new SlideSyncService、注册 Settings/Service
+            73     LinuxSlideSource.Maintain()
+            77-84  AppBase.Current.AppStarted 里 Service.Start()，异常写日志
+            86-90  整个接线失败的兜底日志
+            91     return（不注册卡片/组件/行动/触发器/教程）
+  - Windows 分支从 94 行起保持原样。
+
+1.3 修改：Services/SlideSyncService.cs（1920 行）
+  - 57-64    新增 linuxTimer / linuxTickBusy / volatile linuxPage / lastLinuxKey 字段。
+  - 128-144  新增 public LinuxSlideRead LinuxPage 和 event Action<LinuxSlideRead> LinuxPageChanged。
+  - 175-181  Start() 在 started=true 后：非 Windows 走 StartLinux() 并 return，
+             不加载主题、不读课表、不建 NativeOverlayCard、不建引擎/看门狗。
+  - 210-225  StartLinux()：Ledger.Load、日志出口、Maintain、500ms Timer 立即首读。
+  - 231-269  LinuxTick()：重入闸；TryReadDetailed；成功时更新快照，按
+             file|page|total|showing 变化才写日志/抛事件；失败且原快照 Ok 时清空并写
+             「linux source: 数据中断…」；整拍 try/catch。
+  - 271-296  PublishLinuxPage()：先抛 LinuxPageChanged（订阅方异常吞掉），
+             非 Windows 时 read.Ok && !armed 触发 Arm("Linux 页码源：检测到放映")，
+             再 PushLinuxPage(read)。
+  - 1635-1652 Stop() 非 Windows 早退：DisarmLinux、dispose linuxTimer、清快照/key、
+             摘 LogSink；不碰 scheduler/theme/Disarm。
+  说明：930-1065 的 ArmLinux/DisarmLinux/PushLinuxPage/ApplyExternal 接线，以及
+  983-996 的 c.ApplyExternal(...)，是同事的 LinuxCardWindow 落地后并行接入的；
+  我没有编辑 Ui 下任何文件，也没有改这部分的行为，只保留 LinuxPage/LinuxPageChanged
+  作为稳定的对外接口，供设置页/测试/卡片订阅。
+
+1.4 新增：tools/linux-adapters/libreoffice/
+  - slidesync_lo.py（395 行）
+    42    DEFAULT_HOST = "127.0.0.1"（避免 localhost 先解析到 ::1）
+    88    write_json_atomic：临时文件 + fsync + os.replace
+    101   UnoBridge：UnoUrlResolver 连 socket，2 秒重连
+    188   pick_document：优先放映中的文档，其次 current，最后第一份 PresentationDocument
+    228   read_state：XPresentation2.isRunning、当前页、总页、文档 URL
+    304   main：--host/--port(2002)/--interval(1.0)/--out/--once/--quiet
+    关键行为：放映页优先 controller.getCurrentSlideIndex()+1；拿不到时用编辑视图
+    getCurrentPage() 在 DrawPages 里找 1 基序号；没有演示文档时本拍不写文件，
+    让 updated 自然过期。
+  - run.sh（3 行）
+    exec /usr/bin/python3 "$(dirname "$0")/slidesync_lo.py" "$@"
+  - README.md（169 行）
+    安装 python3-uno、--accept 只在启动时生效、独立 profile 命令、ss 验证、
+    run.sh 参数、协议表、限制、systemd user unit 示例，以及
+    「为什么用 127.0.0.1 而不是 localhost」的 IPv4/IPv6 说明。
+
+1.5 新增：tools/linux-adapters/wps/
+  - main.js（251 行）
+    31    ClassSlideSyncDataDir：wps.Env.GetHomePath() + /.local/share/classslidesync
+    92    ClassSlideSyncWrite：wps.FileSystem.writeFileString
+    109   ClassSlideSyncReadState：ActivePresentation / SlideShowWindows / SlideIndex
+    189   ClassSlideSyncTick：每秒写一次
+    213   ClassSlideSyncStart：setInterval(1000)
+    236   ClassSlideSyncOnLoad：加载 1.5 秒后自动开始
+  - ribbon.xml（34 行）：功能区「课件页码」选项卡，开始/停止/立即写一次三个按钮。
+  - publish.xml.example（13 行）：jsaddons 根目录的注册文件示例，type="wpp"。
+  - README.md（143 行）：安装到 ~/.local/share/Kingsoft/wps/jsaddons/、publish.xml
+    写法、验证、ALT+F12 排障、已知限制；顶部有「这条路径没有在 WPS Linux 上实测过」。
+
+1.6 新增：test/ 下的验证工具
+  - test/lo_drive.py（144 行）：WSL 驱动。UNO 连接 → loadComponentFromURL →
+    pres.start() → 等 isRunning → gotoSlide(getByIndex(3))（第 4 页）→ 调
+    slidesync_lo.py --once → 校验 JSON → 可选跑 LinuxSlideSource 探针 → 截图。
+    支持 VERIFY_HOME、RUN_PLUGIN_PROBE、HOLD_SECONDS。
+  - test/lo_probe.py（32 行）：UNO 组件列表探针，连上 LibreOffice 后列出当前打开的
+    component（url/是否 PresentationDocument/标题），用于确认「放映中的文档是哪一份」。
+  - test/wsl-e2e.log（33 行）：2026-10-31 08:05:00 那次隔离实测的完整日志。
+  - LinuxSlideSource 探针工程不在仓库里，位于 WSL /tmp/probe/LinuxSourceProbe.csproj
+    （用 <Compile Include="/root/plugin/Core/LinuxSlideSource.cs" /> 引用源文件）。
+  - 说明：test/ 是验证辅助，不参与插件运行时；主工程 csproj 未改。
+
+2. JSON 协议
+------------
+2.1 路径
+  默认：
+    ~/.local/share/classslidesync/current.json
+  等价实现：
+    Environment.GetFolderPath(SpecialFolder.LocalApplicationData)/classslidesync/current.json
+    在 Linux 上 .NET 会尊重 $XDG_DATA_HOME；无条件时是 ~/.local/share。
+  适配器也尊重 --out 与 $XDG_DATA_HOME，便于隔离排障。
+
+2.2 内容
+  {
+    "file": "/home/teacher/课件/第3节.pptx",
+    "page": 4,
+    "total": 10,
+    "showing": true,
+    "updated": "2026-10-31T07:00:00Z",
+    "app": "libreoffice"
+  }
+
+  字段      类型     含义
+  file      string   课件绝对路径（LibreOffice 端把 file:///... 转成系统路径并 unquote）
+  page      int      当前页，从 1 开始；0 表示还没拿到
+  total     int      总页数
+  showing   bool     true=正在全屏放映；false=只是打开了文档/编辑态
+  updated   string   UTC 时间，ISO-8601（Z 结尾）；心跳字段
+  app       string   libreoffice 或 wps
+
+2.3 过期与容错
+  - updated 超过 10 秒（StaleSeconds）→ TryRead 返回 false，日志
+    「bridge: 数据过期 N 秒（路径）」。
+  - updated 缺失/不可解析 → 同样按过期处理。
+  - 未来时间超过 60 秒只记「请检查系统时间」，不当成过期。
+  - 文件不存在、空文件、坏 JSON、缺 file、page/total 为负、IO 异常 → false + 日志，
+    绝不抛。
+  - 插件每 500ms 读一次；同一页的重复读不重复写 app.log，只有换文件/换页/
+    放映态变化/数据中断才记一行。
+  - 适配器停止写后，最多 10 秒卡片回到「无页码」。
+
+2.4 写入原子性
+  - LibreOffice 适配器：临时文件 + fsync + os.replace，插件不会读到半截 JSON。
+  - WPS 适配器：wps.FileSystem 没有 rename，writeFileString 直接覆盖；极端情况下
+    可能读到半截，LinuxSlideSource 会丢弃这一拍并在 500ms 后重试。
+
+3. LibreOffice Impress 适配器：安装与运行
+-----------------------------------------
+3.1 安装（Ubuntu/Debian）
+  sudo apt update
+  sudo apt install -y libreoffice-impress python3-uno
+  /usr/bin/python3 -c "import uno; print('uno ok')"
+
+  注意：unoconv 是文档转换工具，不提供实时页码，不是本适配器的依赖；
+  本次 WSL 验证镜像里装了它，但适配器没有调用。
+
+3.2 让 LibreOffice 带 UNO socket 启动
+  --accept 只在启动时生效；已经在运行的实例不会因为再执行一次命令就开端口。
+  推荐先退出，再一条命令打开课件并监听：
+
+    pkill -f soffice || true
+    soffice --impress \
+      --accept="socket,host=127.0.0.1,port=2002;urp;" \
+      "/home/teacher/课件/第3节.pptx"
+
+  不想和日常实例抢配置时用独立 profile：
+
+    soffice --impress \
+      -env:UserInstallation=file:///tmp/lo-slidesync-profile \
+      --accept="socket,host=127.0.0.1,port=2002;urp;" \
+      "/home/teacher/课件/第3节.pptx"
+
+  验证端口：
+    ss -ltnp | grep 2002
+
+  为什么写 127.0.0.1：LibreOffice 只监听 IPv4；部分系统把 localhost 先解析成 ::1，
+  适配器会报 Connection refused。--accept 和适配器两边都用 127.0.0.1 最稳。
+
+3.3 启动适配器
+  cd tools/linux-adapters/libreoffice
+  ./run.sh
+  # 或
+  /usr/bin/python3 slidesync_lo.py
+
+  常用：
+    ./run.sh --port 2003
+    ./run.sh --interval 0.5
+    ./run.sh --out /tmp/current.json
+    ./run.sh --once
+    ./run.sh --quiet
+
+  --once 最适合排障：读一次、打印 JSON、退出。返回码 0=成功，3=连上了但没有演示文档。
+
+3.4 行为
+  - 每秒轮询；放映态用 XPresentation2.isRunning() 判断；当前页优先
+    XSlideShowController.getCurrentSlideIndex()+1。
+  - 编辑态也写，showing=false，page 是当前编辑页。
+  - 没有演示文档时不写新文件，让 updated 自然过期。
+  - LibreOffice 退出/重启后每 2 秒重连，不需要重启适配器。
+
+4. WPS Linux 适配器：安装与运行
+-------------------------------
+4.1 安装
+  mkdir -p ~/.local/share/Kingsoft/wps/jsaddons/ClassSlideSync
+  cp main.js ribbon.xml ~/.local/share/Kingsoft/wps/jsaddons/ClassSlideSync/
+
+  然后在 jsaddons 根目录（不是 ClassSlideSync/ 里面）放 publish.xml：
+
+    cp publish.xml.example ~/.local/share/Kingsoft/wps/jsaddons/publish.xml
+    # 编辑 publish.xml，把 /home/teacher 换成实际家目录
+
+  示例：
+    <?xml version="1.0" encoding="UTF-8"?>
+    <jsplugins>
+      <jspluginonline enable="enable_dev"
+                      type="wpp"
+                      name="ClassSlideSync"
+                      url="file:///home/teacher/.local/share/Kingsoft/wps/jsaddons/ClassSlideSync/" />
+    </jsplugins>
+
+  type="wpp" 只加载到 WPS 演示进程；url 必须指向目录且以 / 结尾。
+  部分版本用 jsplugins.xml，优先 publish.xml，具体见 wps/README.md。
+
+4.2 验证
+  完全退出 WPS 再启动，打开 10 页 .pptx，进入放映、翻到第 4 页：
+
+    cat ~/.local/share/classslidesync/current.json
+
+  期望 page=4,total=10,showing=true,app="wps"。
+  加载 1.5 秒后自动开始；功能区「课件页码」也可以手动开始/停止/立即写一次。
+  排障：ALT+F12 打开 JS 调试器，逐条确认 wps.WppApplication()、
+  Application.ActivePresentation、SlideShowWindows.Item(1).View.Slide.SlideIndex、
+  wps.Env.GetHomePath()、wps.FileSystem.writeFileString。
+
+4.3 这条路径的状态
+  ★ 没有在真实 WPS Linux 上实测。
+  - 验证环境只有 LibreOffice，没有安装 WPS Linux。
+  - main.js/ribbon.xml 按 WPS 公开的 JS 加载项 API 编写，没有在 WPS 进程里跑过。
+  - 各发行版 WPS Linux 对 jsaddons 的支持不一致，有的版本没有该目录。
+  - publish.xml/jsplugins.xml 的字段在不同 WPS 版本也可能不同。
+  因此 WPS 适配器应当当作「待验证的参考实现」；能实测的只有 LibreOffice 那条路。
+  以上内容在 tools/linux-adapters/wps/README.md 顶部和正文第 5 节都有说明。
+
+5. WSL 实测（LibreOffice，已通过）
+----------------------------------
+5.1 环境
+  - Ubuntu 24.04.5 LTS，root，/root/plugin
+  - 内核 6.18.54.1-microsoft-standard-WSL2
+  - LibreOffice Impress 4:24.2.7-0ubuntu0.24.04.7
+  - python3-uno 4:24.2.7-0ubuntu0.24.04.7
+  - Python 3.12.3
+  - unoconv 0.7-2ubuntu1（已装，未使用）
+  - Xvfb 2:21.1.12-1ubuntu1.9
+  - dotnet 8.0.133
+  - 该 WSL 没有 WSLg（DISPLAY 为空，/mnt/wslg 不存在），所以用 Xvfb :99。
+
+5.2 安装命令
+  DEBIAN_FRONTEND=noninteractive apt-get install -y libreoffice-impress python3-uno unoconv
+  DEBIAN_FRONTEND=noninteractive apt-get install -y xvfb xauth x11-apps imagemagick
+
+  安装日志：WSL /tmp/apt-libreoffice.log、/tmp/apt-xvfb.log
+
+5.3 课件与启动
+  课件：/root/plugin/test/纯页码课件.pptx（10 页，37299 字节）
+  Xvfb：Xvfb :99 -screen 0 1280x800x24
+  LibreOffice：
+    export DISPLAY=:99 HOME=/root LANG=C.UTF-8
+    soffice --impress --norestore --nologo \
+      -env:UserInstallation=file:///tmp/lo-slidesync-profile \
+      --accept="socket,host=127.0.0.1,port=2002;urp;" \
+      "/root/plugin/test/纯页码课件.pptx"
+
+  驱动：
+    VERIFY_HOME=/tmp/classslidesync-verify RUN_PLUGIN_PROBE=1 \
+      /usr/bin/python3 /root/plugin/test/lo_drive.py
+
+  驱动做的事：UNO 连接 → loadComponentFromURL → pres.start() → 等 isRunning →
+  gotoSlide(doc.getDrawPages().getByIndex(3))（0 基 3 = 第 4 页）→ 调真正的
+  slidesync_lo.py --once（不传 --host/--port，测默认 127.0.0.1:2002）→
+  校验 JSON → 用同一 XDG_DATA_HOME 跑 LinuxSlideSource 探针。
+
+5.4 实测输出（2026-10-31 08:05:00，逐字摘自日志）
+  [drive] loaded, pages=10 url=file:///root/plugin/test/%E7%BA%AF%E9%A1%B5%E7%A0%81%E8%AF%BE%E4%BB%B6.pptx
+  [drive] presentation running
+  [drive] slide count=10 index=0
+  [drive] after goto index=3
+  [drive] adapter rc=0
+  [drive] adapter stdout: {"file": "/root/plugin/test/纯页码课件.pptx", "page": 4, "total": 10, "showing": true, "updated": "2026-10-31T08:05:00Z", "app": "libreoffice"}
+  [drive] current.json: {"file":"/root/plugin/test/纯页码课件.pptx","page":4,"total":10,"showing":true,"updated":"2026-10-31T08:05:00Z","app":"libreoffice"}
+  PASS maintain-dir  /tmp/classslidesync-verify/classslidesync
+  PASS maintain-readme  /tmp/classslidesync-verify/classslidesync/README.txt
+  PASS fresh-read  page=4 total=10 showing=True file=/root/plugin/test/纯页码课件.pptx
+  PASS fresh-snapshot  纯页码课件.pptx 第 4/10 页（放映中，libreoffice）
+  PASS stale-rejected  ok=False
+  PASS bad-json-rejected  ok=False
+  PASS missing-rejected  ok=False
+  PASS restored-read  page=4
+  RESULT ALL PASS
+
+  日志中「数据过期 215597102 秒」是探针故意写了 updated=2020-01-01 的用例；
+  「JsonReaderException: 't' is an invalid start...」是探针故意写坏 JSON 的用例，
+  两者都是预期结果，不是实测故障。
+
+5.5 证据路径
+  - WSL 完整日志：/tmp/slidesync-e2e.log
+  - 仓库内副本：test/wsl-e2e.log（33 行）
+  - 截图：/tmp/slidesync-shot.png，仓库内 test/wsl-slideshow-page4.png
+    说明：Xvfb + LibreOffice VCL 下截到的是 1280x800 黑图（263 字节），
+    不能作为「看到第 4 页」的视觉证据；页码证据以 UNO 日志和 JSON 为准。
+  - 早期踩坑截图：test/wsl-screen.png（LibreOffice 的 stale lock 对话框，
+    「Document file ... is locked for editing by yourself」）。该问题通过
+    pkill soffice + 删除 test/.~lock.* + 换 profile 解决，不影响最终结果。
+
+5.6 一个环境干扰（如实记录）
+  验证期间，默认路径 ~/.local/share/classslidesync/current.json 被另一个进程
+  周期性覆盖，内容为：
+    {"file":"/root/课件/浮层卡片测试.pptx","page":13,"total":18,"showing":true,...}
+  约每 12 秒刷新一次；ps 里看不到对应进程，疑似同事/宿主侧通过 \\wsl$ 写同一路径。
+  为了避免把别人的数据误判成自己的测试结果，最终验证改用：
+    --out /tmp/classslidesync-verify/classslidesync/current.json
+    XDG_DATA_HOME=/tmp/classslidesync-verify
+  上面 5.4 的所有结果都来自这个隔离目录。默认路径本身也仍可用，只是会被外部写入者
+  覆盖；如果现场出现「页码不是自己课件的」，先检查是否有第二个适配器在写同一个文件。
+
+5.7 失败的尝试（供排障）
+  - 第一次 soffice 启动约 12 秒后崩溃：/tmp/soffice.log 末尾
+    「Unspecified Application Error」「Fatal exception: Signal 6」「X IO Error」。
+    原因是 Xvfb/显示环境不稳；重建 Xvfb + 新 profile 后稳定。
+  - 用 localhost 连 2002 报 Connection refused，ss 显示 127.0.0.1:2002 在听；
+    改用 127.0.0.1 解决（已写进两个 README）。
+  - LibreOffice 残留锁文件导致 loadComponentFromURL 卡在「locked for editing」
+    对话框；清理 .~lock.* 并换 profile 解决。
+  - pyuno 没有 uno.queryInterface；要用 pres.queryInterface(uno.getTypeByName(...))。
+  - XSlideShowController.gotoSlide 的参数是 XDrawPage，不是页码；必须传
+    doc.getDrawPages().getByIndex(3)。
+
+6. 未验证 / 已知限制
+--------------------
+1) WPS Linux 整条路径未实测（没有 WPS Linux 环境）。main.js、ribbon.xml、
+   publish.xml 的 API 名称、加载项目录、注册字段都只是按公开文档写的。
+   这是本任务最大的未验证项。
+2) 没有在真实 ClassIsland Linux 宿主进程里启动插件并观察 LinuxCardWindow 的
+   实际显示。已做的是：LinuxSlideSource 独立探针 + 服务 500ms 读文件逻辑的编译
+   与代码路径检查；卡片 UI 的最终观感需要同事在 UbuntuCi 的 /root/ci-linux 里
+   实际跑一次。ClassIsland 宿主本身未在本次验证中重启。
+3) Xvfb 下放映截图是黑屏，没有「第 4 页画面」的视觉截图；页码正确性由
+   UNO 的 getCurrentSlideIndex 日志和 JSON 证明。
+4) WPS 适配器写文件不是原子的（没有 rename），极端情况下可能闪一帧无页码；
+   已文档化。
+5) 适配器只能连「启动时带 --accept」的 LibreOffice 实例；老师双击打开的实例
+   没有 socket，需要统一用带 --accept 的启动方式。
+6) 默认 current.json 可能被多个适配器/测试同时写；生产环境应保证只有一个写者。
+7) WPS 侧没有做 node --check（WSL 未装 node）；XML 已用 Python ElementTree
+   解析通过。
+
+7. 构建与静态检查
+------------------
+7.1 Windows
+  命令：
+    & 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build ClassSlideSync.Plugin.csproj -c Release -t:Rebuild
+  结果：
+    已成功生成。
+    0 个错误
+  说明：其余输出是仓库既有的 nullable 警告（含 PptBridge.cs:166 CS8618），
+  不是本次改动引入的错误。
+
+7.2 Linux（WSL）
+  同步：
+    tar -C /mnt/c/Users/xzq/Documents/deepseek-harness/default-workspace/ClassSlideSync.Plugin \
+      --exclude=bin --exclude=obj -cf - . | tar -C /root/plugin -xf -
+  构建：
+    cd /root/plugin && dotnet build -c Release -t:Rebuild
+  结果：
+    216 Warning(s)
+    0 Error(s)
+
+7.3 适配器静态检查
+  - /usr/bin/python3 -m py_compile tools/linux-adapters/libreoffice/slidesync_lo.py test/lo_drive.py test/lo_probe.py → PY_OK
+  - bash -n tools/linux-adapters/libreoffice/run.sh → SH_OK
+  - Python ElementTree 解析 tools/linux-adapters/wps/ribbon.xml、publish.xml.example → XML_OK
+  - WSL 没有 node，未执行 node --check main.js。
+
+8. 交付清单
+------------
+新增：
+  Core/LinuxSlideSource.cs
+  tools/linux-adapters/libreoffice/slidesync_lo.py
+  tools/linux-adapters/libreoffice/run.sh
+  tools/linux-adapters/libreoffice/README.md
+  tools/linux-adapters/wps/main.js
+  tools/linux-adapters/wps/ribbon.xml
+  tools/linux-adapters/wps/publish.xml.example
+  tools/linux-adapters/wps/README.md
+  test/lo_drive.py
+  test/lo_probe.py
+  test/wsl-e2e.log
+修改：
+  Plugin.cs（43-92）
+  Services/SlideSyncService.cs（57-64、128-144、175-181、210-296、1635-1652）
+未改：
+  Ui/NativeOverlayCard.cs
+  Ui/ICardSink.cs
+  Ui/LinuxCardWindow.cs
+  ClassSlideSync.Plugin.csproj
+  Windows 宿主目录、WPS 安装、git 仓库
+
+9. 快速复核命令
+----------------
+  # 1) 看协议说明
+  cat ~/.local/share/classslidesync/README.txt
+
+  # 2) 起 LibreOffice（带 socket）
+  pkill -f soffice || true
+  soffice --impress -env:UserInstallation=file:///tmp/lo-check \
+    --accept="socket,host=127.0.0.1,port=2002;urp;" "/path/10页.pptx"
+
+  # 3) 只读一次
+  tools/linux-adapters/libreoffice/run.sh --once
+
+  # 4) 想看 500ms 读逻辑：在 WSL 里
+  XDG_DATA_HOME=/tmp/check dotnet run --project /tmp/probe/LinuxSourceProbe.csproj
+  # 探针工程把 Core/LinuxSlideSource.cs 以 Compile Include 引入，见本报告 5.4。
+
+报告结束。

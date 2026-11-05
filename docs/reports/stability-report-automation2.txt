@@ -1,0 +1,218 @@
+课件续页插件 · 自动化增强（automation2）稳定性报告
+=====================================================
+生成时间：2026-10-25 00:1x（Asia/Shanghai）
+仓库：C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin
+目标：让「发一条 Windows 提示」可自定义；新增 4 个实用行动；不启动任何被控应用、不部署、不改 git、不加 NuGet。
+
+结论
+----
+1. 固定命令 -t:Rebuild：0 个错误（198 个警告，均为既有类别，见第五节）。
+2. 反射测试工程 %TEMP%\automation2：通过 61 条，失败 0 条。
+3. 未启动 ClassIsland / WPS / PowerPoint / 希沃白板；未向 data\Plugins\ 复制任何 dll；未执行 git 命令；未新增 NuGet 包。
+4. 仍有「必须宿主才能看到」的部分未验证：行动设置抽屉的真实渲染与宿主侧保存，见第六节。
+
+一、改动文件与行号
+------------------
+1) Automation\NotifyTemplate.cs（新增，112 行）
+   - 15-34  public sealed class NotifyActionSettings：通知设置 POCO（4 个公共 get/set 属性 + 默认值）。
+   - 37-110 public static class NotifyTemplate：
+       * 43-57  public static string Render(string? template, SessionRecord? record)
+       * 59-110 public static SessionRecord? Resolve(Ledger? ledger, string? currentFilePath)
+   - 纯函数，不依赖宿主；测试可直接调用。
+
+2) Automation\ActionSettingsControls.cs（新增，267 行）
+   - 23-68  public abstract class PluginActionSettingsControl<TSettings> : ActionSettingsControlBase<TSettings> where TSettings : class
+            提供受保护的 TrySettings()（包住 Settings getter 的 ArgumentNullException）、Label/Hint/Editor 等静态辅助。
+   - 72-195 public sealed class NotifyActionSettingsControl：
+       * maskBox（标题）、contentBox（多行正文）、durationBox（3-120 秒）、topmostBox（置顶）
+       * TextChanged / LostFocus / Click 写回 Settings；OnAttachedToVisualTree 时从 Settings 灌入，loading 标志防回灌。
+   - 198-265 public sealed class JumpToPageSettingsControl：pageBox（1-999）。
+   - 说明：csproj 没有 AvaloniaResource 的 **\*.axaml 默认 glob，新增 .axaml 必须改工程文件（不在允许清单），
+     所以设置控件用纯 C# 程序化搭建，只新增 .cs。
+
+3) Automation\DeckActions.cs（新增，299 行）
+   - 15-25   public sealed class JumpToPageSettings { public int Page { get; set; } = 1; }
+   - 29-95   JumpToPageAction : ActionBase<JumpToPageSettings>（OnInvoke 在 36-92）
+             Id=ClassSlideSync.Plugin.JumpToPage，Name=跳到指定页，Glyph=\uE7C3。
+   - 98-167  OpenDeckFolderAction : ActionBase（OnInvoke 在 105-164）
+             Id=ClassSlideSync.Plugin.OpenDeckFolder，Name=打开课件所在文件夹，Glyph=\uE8B7。
+   - 170-231 ClearDeckHistoryAction : ActionBase（OnInvoke 在 177-228）
+             Id=ClassSlideSync.Plugin.ClearDeckHistory，Name=清除当前课件的记录，Glyph=\uE74D。
+   - 234-298 internal static class DeckActions：
+       * ResolveDeckPath：engine.Last.FilePath 优先，否则 ledger.Newest().FilePath；
+       * OpenFolder：先 IAppHost.TryGetService<IUriNavigationService>() 再 Navigate(new Uri(folder))，
+         失败回退 Process.Start(new ProcessStartInfo(folder){UseShellExecute=true})；
+       * SafeName：日志里只留文件名。
+
+4) Automation\UtilityActions.cs（273 行，仅重写 NotifyAction 段）
+   - 23-137  NotifyAction 由非泛型 ActionBase 改为 ActionBase<NotifyActionSettings>；
+       * 32      [ActionInfo(Id, Name, Glyph, true, AutomationGroups.Plugin)]
+       * 35-38   Id=ClassSlideSync.Plugin.Notify，Name=发一条 Windows 提示，Glyph=\uE8BD
+       * 43-81   OnInvoke（async）：TrySettings() 失败回落默认设置；标题空则用「课件续页」；正文渲染占位符；
+                 置顶时先 Toast 再回退 Tray，否则先 Tray 再回退 Toast；LastShowSucceeded 记录结果并写日志。
+       * 83-92   ShowToastAsync：把 ToastNotifier.Show 放到 Task.Run 里等，最坏 8 秒也不卡 UI 线程。
+       * 99-112  ResolveRecord：service.Engine.Last.FilePath + service.Ledger 交给 NotifyTemplate.Resolve。
+       * 114-124 TrySettings：try/catch 包 Settings（反射直接 new 时 getter 会抛）。
+       * 126-136 Log：service?.Ledger?.Log，自身再 catch。
+   - 147 起  OpenPanelAction 未改（B2 直接复用，没有新增重复类）。
+   - 195 起  JumpLastPageAction 未改（原有行动保留）。
+   - 已 grep 全仓，无代码再引用旧 NotifyAction.Title / NotifyAction.Message。
+
+5) Core\TrayNotifier.cs（208 行）
+   - 102-152 Show 增加可选参数 durationSeconds=15：
+       * Math.Clamp(durationSeconds, 3, 120)，timeoutMs = seconds * 1000；
+       * NOTIFYICONDATAW.uTimeoutOrVersion = timeoutMs；
+       * 摘图标的 Timer 改为 timeoutMs（原来固定 15000）。
+   - 注释写明：Vista+ 气泡停留由系统通知设置决定（uTimeout 被忽略），但托盘图标保留时间仍按此走；
+     托盘气泡没有「置顶」标志，置顶只能映射到 Toast 横幅。
+
+6) Plugin.cs（150 行，只动注册区）
+   - 66-76  注册区：
+       services.AddAction<NotifyAction, NotifyActionSettingsControl>();
+       services.AddAction<OpenPanelAction>();
+       services.AddAction<JumpLastPageAction>();
+       services.AddAction<JumpToPageAction, JumpToPageSettingsControl>();
+       services.AddAction<OpenDeckFolderAction>();
+       services.AddAction<ClearDeckHistoryAction>();
+   - 未改 Initialize 的其他逻辑；OpenUnfinishedDeckAction/ToggleCardAction 注册仍在 64-65。
+
+二、设置类字段表
+----------------
+NotifyActionSettings（Automation\NotifyTemplate.cs:15）
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| Mask | string | "课件续页" | 通知标题；OnInvoke 里 Trim 后为空则回退「课件续页」 |
+| Content | string | "来自自动化" | 通知正文；支持 {deck}/{page}/{total}/{remaining} |
+| DurationSeconds | int | 10 | 停留秒数；UI 与 Tray 均 clamp 到 3-120 |
+| IsTopmostEnabled | bool | false | true 时优先走 Toast 横幅（近似「置顶」） |
+
+JumpToPageSettings（Automation\DeckActions.cs:15）
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| Page | int | 1 | 目标页码；OnInvoke 里 clamp 到 1-999 |
+
+设置保存/加载机制（ClassIsland 2.1.0.1，Cecil 反射确认）：
+- 行动继承 ActionBase<TSettings> 后，ActionItem.Settings（JsonElement）由 ActionBase.GetInstance 用 System.Text.Json
+  反序列化成 TSettings，再 set_SettingsInternal；行动与设置控件共享同一个 settings 实例。
+- 只调用 AddAction<TAction>() 时没有设置控件；必须用 AddAction<TAction, TSettingsControl>()，它会在同一个
+  ActionInfo.Id 下再注册 keyed ActionSettingsControlBase，ClassIsland 打开设置抽屉时按 Id 取控件。
+- 这是旧版「没法自定义发啥」的根因：旧 NotifyAction 只有普通 CLR 属性 Title/Message，既没有 TSettings，
+  也没有注册设置控件。
+
+内建 classisland.showNotification 的形状（Cecil + Default.json.bak 对照）：
+- 行动：ClassIsland 内建 NotificationAction : ActionBase<NotificationActionSettings>；
+- 设置控件：ClassIsland.Controls.ActionSettingsControls.NotificationActionSettingsControl :
+  ActionSettingsControlBase<NotificationActionSettings>，由 AddAction<TAction, TSettingsControl> 注册；
+- Default.json 里它的 Settings 字段：Content、Mask、IsContentSpeechEnabled、IsMaskSpeechEnabled、
+  IsAdvancedSettingsEnabled、IsSoundEffectEnabled、IsTopmostEnabled、CustomSoundEffectPath、IsEffectEnabled、
+  MaskDurationSeconds=5、ContentDurationSeconds=10、IsWaitForCompleteEnabled、IsActive。
+- 我们的映射：Mask→Mask、Content→Content、IsTopmostEnabled→IsTopmostEnabled；
+  内建把标题/正文的停留时长拆成两个字段，我们按用户要求合成一个 DurationSeconds（默认 10，与内建的
+  ContentDurationSeconds 对齐）；语音、音效、等待完成等字段本期不做，避免引入音频/语音依赖。
+- 没有直接复用内建 NotificationAction / INotificationHostService：那需要注册 notification provider 与 channel，
+  并受系统 Toast 开关影响；本项目已有 ToastNotifier/TrayNotifier 两条可用通道，复用它们风险更低。
+
+三、行动 Id 表（共 8 个，分组均为「课件续页」）
+-----------------------------------------------
+| 类 | Id | Name | 设置 |
+|---|---|---|---|
+| OpenUnfinishedDeckAction（既有） | ClassSlideSync.Plugin.OpenUnfinishedDeck | 打开未讲完的课件 | 无 |
+| ToggleCardAction（既有） | ClassSlideSync.Plugin.ToggleCard | 显示/隐藏悬浮卡片 | 无 |
+| NotifyAction（改造） | ClassSlideSync.Plugin.Notify | 发一条 Windows 提示 | NotifyActionSettings |
+| OpenPanelAction（既有，B2 复用） | ClassSlideSync.Plugin.OpenControlPanel | 打开课件续页控制面板 | 无 |
+| JumpLastPageAction（既有） | ClassSlideSync.Plugin.JumpLastPage | 跳回上次页码 | 无 |
+| JumpToPageAction（新增） | ClassSlideSync.Plugin.JumpToPage | 跳到指定页 | JumpToPageSettings |
+| OpenDeckFolderAction（新增） | ClassSlideSync.Plugin.OpenDeckFolder | 打开课件所在文件夹 | 无 |
+| ClearDeckHistoryAction（新增） | ClassSlideSync.Plugin.ClearDeckHistory | 清除当前课件的记录 | 无 |
+
+所有行动都带 [ActionInfo(Id, Name, Glyph, true, AutomationGroups.Plugin)]，AutomationGroups.Plugin = "课件续页"。
+
+四、实现要点与安全边界
+----------------------
+1. 占位符：
+   - {deck}：Path.GetFileNameWithoutExtension(record.FilePath)；
+   - {page}：record.EndSlide（>0 才输出，否则空串）；
+   - {total}：record.SlideCount（>0 才输出）；
+   - {remaining}：max(0, total - page)，仅当两者都有效；
+   - 大小写不敏感；未知占位符原样保留；record 为 null 时四个占位符全部替换为空串，不抛异常。
+   - 数据源：当前放映课件路径对应的 Ledger.Last(path)；没有则 Ledger.Newest()；再没有则 null。
+2. 通知：
+   - 置顶勾选：ToastNotifier.Show（操作中心横幅）优先，失败回退 TrayNotifier.Show；
+   - 未勾选：TrayNotifier.Show（托盘气泡）优先，失败回退 Toast；
+   - 两路都失败只写日志，不影响自动化主流程。
+3. 跳到指定页：只调 service.RequestJump(page)（Services\SlideSyncService.cs:982-985 → 私有 RequestJump(null, slide)），
+   后者只写 pending（filePath 为空时归一化成 ""），不会启动 PowerPoint/WPS，符合「不启动被控应用」铁律。
+4. 打开课件所在文件夹：Service 没有公开的「打开文件夹」方法，且 Services\SlideSyncService.cs 在禁改清单；
+   因此在新行动里复制其 944-976 的两步实现（IUriNavigationService.Navigate → Process.Start 回退），没有改服务文件。
+5. 清除记录：只调 Ledger.RemoveMany(new[]{ path })，只删台账记录、不删课件文件；RemoveMany 内部自带 try/catch 且会写
+   "history: removed N record(s) by hand"。
+6. 空服务/空数据：所有 OnInvoke 先 TryService()，null 时写日志后 return；最外层再 try/catch，绝不把异常抛给宿主。
+7. 没动禁止文件：Ui\NativeOverlayCard.cs、Ui\ControlPanel.axaml*、Core\SessionEngine.cs、Core\PptBridge.cs、
+   Core\SeewoBridge.cs、Views\SettingsPages\*、Services\SlideSyncService.cs 均未修改。
+
+五、构建与测试
+--------------
+构建命令（固定）：
+& 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build C:\Users\xzq\Documents\deepseek-harness\default-workspace\ClassSlideSync.Plugin\ClassSlideSync.Plugin.csproj -c Release -t:Rebuild
+
+最终结果（原始尾行）：
+    198 个警告
+    0 个错误
+警告均为既有类别（nullable CS86xx、未使用字段 CS0414、XAML 可达性 AVLN3001 等），本次未新增 error。
+
+测试工程：%TEMP%\automation2\（automation2.csproj + Program.cs，net8.0-windows，无 NuGet 引用）
+运行方式：
+& 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' build "$env:TEMP\automation2\automation2.csproj" -c Release
+& 'C:\Users\xzq\.dotnet-sdk8\dotnet.exe' "$env:TEMP\automation2\bin\Release\net8.0-windows\automation2.dll"
+
+测试用 Assembly.LoadFrom 加载插件 dll；依赖（ClassIsland.Core/Shared、Avalonia 等）由
+AssemblyLoadContext.Default.Resolving 依次从插件 bin、ClassIsland app-2.1.0.1-0 目录、测试 base dir 解析。
+只加载程序集，不启动 ClassIsland 宿主。
+
+最终输出：通过 61 条，失败 0 条。
+断言分布：
+- 34 条：8 个行动各 4 条（ActionInfo 存在、Id 非空、Name 非空、分组 == "课件续页"），加 1 条「找到 8 个行动」，
+        加 1 条「8 个 Id 互不重复」→ 1 + 8*4 + 1 = 34。
+- 8 条：NotifyActionSettings 默认值（4 字段）+ 改值后 JSON 序列化/反序列化往返（4 字段）。
+- 5 条：NotifyTemplate.Render
+        * 无记录：模板 "ABCDE" → "ABCDE"；
+        * 有记录：deck=三角函数、EndSlide=7、SlideCount=20 → "三角函数|7/20|13"；
+        * 大小写不敏感："{DECK}|{Page}" 正常替换；
+        * 无效页码：EndSlide=0、SlideCount=20 → "/20/"；
+        * null 模板 → ""。
+- 8 条：8 个行动 OnInvoke 在服务为 null 时不抛异常（Notify 通过反射把 SettingsInternal 设为 Content=""，避免真弹窗）。
+- 6 条：两个设置控件各 3 条（类型存在、基类泛型参数正确、可无参构造，满足 DI 要求）。
+合计 34 + 8 + 5 + 8 + 6 = 61。
+
+测试还确认：
+- 8 个行动全部能被 Assembly.LoadFrom 后的插件程序集找到并构造；
+- ActionInfo 的实际类型全名是 ClassIsland.Core.Attributes.ActionInfo（不是 ActionInfoAttribute）；
+- 两个设置控件继承 ActionSettingsControlBase<T> 且 T 正确，说明 AddAction<TAction, TSettingsControl> 的泛型配对无误。
+
+六、没能验证的部分（必须宿主 / 必须真机）
+------------------------------------------
+1. 行动设置抽屉的真实 UI：按铁律不能启动 ClassIsland，所以只验证了「控件类型可构造、泛型参数正确、设置 JSON 往返」，
+   没有验证 Fluent 主题下的排版、暗色模式、高 DPI、滚动与输入焦点；也没有验证宿主点击「保存」后写回
+   Automations JSON 的完整链路（该链路由 ClassIsland 的 ActionBase.GetInstance/ActionItem 序列化负责，已由 Cecil 读 IL 确认）。
+2. 真实通知的展示效果：测试中把正文置空，未实际弹窗（避免干扰用户）。因此以下只能等真机：
+   - 托盘气泡在 Win10/Win11 上的实际样式与停留；
+   - 「置顶」的实际视觉效果（Shell 气泡没有置顶 API，代码里映射为操作中心 Toast 横幅，Toast 本身是否盖住全屏窗口由系统决定）；
+   - uTimeoutOrVersion 在 Vista+ 被系统忽略，DurationSeconds 目前能确定影响的是托盘图标/气泡的保留时间；
+   - ToastHelper 固定 `<toast duration="long">`，其命令行协议（--title/--body/--log、退出码 0/31）未改动，故 Toast 的停留时长
+     没有随 DurationSeconds 变化。
+3. 依赖真实服务的路径：跳到指定页、打开文件夹、清除记录只验证了「服务为 null 不抛」；没有用真实课件跑通
+   RequestJump 的实际跳转、IUriNavigationService/Process.Start 的实际打开、RemoveMany 对真实台账的删除。
+   其中 RequestJump 已读源码确认只写 pending，不会启动 PPT/WPS。
+4. 打开文件夹的实现是复制 Service 私有逻辑（944-976），若以后 Service 增加公开 API，建议收敛到一处；
+   当前为了不改 Services\SlideSyncService.cs 才这样处理。
+5. 未部署：没有把 dll 复制到 C:\Users\xzq\Desktop\github\ClassSlideSync\classisland\data\Plugins\；
+   未做真实插件加载测试。
+6. 既有 198 个警告未处理（按任务要求只保证 0 error）。
+
+七、回滚方式
+------------
+删除新增的 Automation\NotifyTemplate.cs、Automation\ActionSettingsControls.cs、Automation\DeckActions.cs；
+把 Automation\UtilityActions.cs 的 NotifyAction 段恢复为旧的非泛型版本；
+把 Core\TrayNotifier.cs 的 Show 恢复为 (string title, string text) 且 Timer 固定 15000；
+把 Plugin.cs 的注册区恢复为原来的 5 行 AddAction。
+（未使用 git，故不提供 commit 回滚。）
