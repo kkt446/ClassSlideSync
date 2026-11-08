@@ -120,6 +120,12 @@ docs/reports/                   本地审计与测试报告（不入库）
 
 ## 更新日志
 
+### 1.2.5.0（2026-11-08）
+
+- 修掉「PowerPoint（Office 2024 LTSC / 点击运行版）打开课件后插件识别不到，卡片一直停在『正在识别课件…』」（issue #1）：重新启用运行对象表（ROT）枚举来发现并择优附着演示实例
+- 修掉两处 COM 接口 vtable 槽位错位（`IMoniker.Hash` 被误放到末尾、`IRunningObjectTable.GetObject` 落到了 `GetTimeOfLastChange` 的槽位）——这正是 2026-10-24 识别课件时闪退（coreclr 访问冲突）的根因；此前为绕开闪退把 ROT 枚举整个关掉，致使 LTSC 上只剩 `GetActiveObject`、附着不上老师开着的课件
+- 槽位顺序已对照 Windows SDK `objidl.idl` 与 .NET `ComTypes` 校正；隔离环境验证：ROT 枚举 → `GetDisplayName` → `GetObject` → 附着 → 读课件全链路通过，无访问冲突
+
 ### 1.2.4.1（2026-11-05）
 
 - 修掉「台账文件坏一次，全部记录被清空」：坏文件改名留档为 `ledger.json.corrupt-时间戳`，不会再被空台账覆盖；文件被占用（杀软、网盘同步）时进入只读，不再反复重试

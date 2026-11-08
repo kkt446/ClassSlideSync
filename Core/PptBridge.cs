@@ -66,12 +66,19 @@ namespace ClassSlideSync.Plugin.Core
         [ComImport, Guid("00000010-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
         interface IRunningObjectTable
         {
+            // 槽位顺序必须严格按 objidl.idl（已对照 Wine objidl.idl 与 .NET ComTypes.IRunningObjectTable）：
+            //   Register / Revoke / IsRunning / GetObject / NoteChangeTime / GetTimeOfLastChange / EnumRunning
+            // 原来把 NoteChangeTime、GetTimeOfLastChange、IsRunning 排在 GetObject 前面，于是 GetObject 落到
+            // 了 GetTimeOfLastChange 的槽位：它往 out 对象指针里写了一个 FILETIME（8 字节时间戳），marshaler
+            // 再把这 8 字节当成 IUnknown* 去 QueryInterface → coreclr 访问冲突。这才是 2026-10-24 崩溃栈顶
+            // 那一帧的真因（当时误判成"对文件 moniker 取 RCW 弄坏引用"，其实是 vtable 错位）。EnumRunning
+            // 恰好在末尾槽位没受影响，所以 DumpRot 能跑、TryFindBestInstance 一调 GetObject 就崩。
             void Register(int grfFlags, [MarshalAs(UnmanagedType.Interface)] object punkObject, [MarshalAs(UnmanagedType.Interface)] object pmkObjectName);
             void Revoke(int dwRegister);
-            void NoteChangeTime(int dwRegister, ref System.Runtime.InteropServices.ComTypes.FILETIME pfiletime);
-            void GetTimeOfLastChange([MarshalAs(UnmanagedType.Interface)] object pmkObjectName, out System.Runtime.InteropServices.ComTypes.FILETIME pfiletime);
             void IsRunning([MarshalAs(UnmanagedType.Interface)] object pmkObjectName);
             void GetObject([MarshalAs(UnmanagedType.Interface)] object pmkObjectName, [MarshalAs(UnmanagedType.Interface)] out object ppunkObject);
+            void NoteChangeTime(int dwRegister, ref System.Runtime.InteropServices.ComTypes.FILETIME pfiletime);
+            void GetTimeOfLastChange([MarshalAs(UnmanagedType.Interface)] object pmkObjectName, out System.Runtime.InteropServices.ComTypes.FILETIME pfiletime);
             void EnumRunning([MarshalAs(UnmanagedType.Interface)] out IEnumMoniker ppenumMoniker);
         }
 
@@ -88,8 +95,14 @@ namespace ClassSlideSync.Plugin.Core
         interface IMoniker
         {
             void GetClassID(out Guid pClassID);
-            // IMoniker 继承 IPersistStream：这三个成员不写，后面所有槽位整体错位，
-            // GetDisplayName 会落到 CommonPrefixWith 上（2026-10-24 的闪退就是这么来的）。
+            // IMoniker 继承 IPersistStream，槽位必须严格按 objidl.idl 的顺序排：
+            //   IPersist: GetClassID
+            //   IPersistStream: IsDirty / Load / Save / GetSizeMax
+            //   IMoniker: BindToObject … IsEqual / **Hash** / IsRunning … GetDisplayName … IsSystemMoniker
+            // 任何一个成员漏写或挪位，后面所有槽位整体错位，GetDisplayName 就会调到别的方法
+            // （参数个数/含义都不同），COM 把指针写进托管 out 槽 → coreclr 访问冲突（2026-10-24 闪退）。
+            // 关键坑：Hash 不是最后一个，它在 IsEqual 之后、IsRunning 之前；IsSystemMoniker 才是末尾。
+            // 顺序已对照 .NET 运行时 System.Runtime.InteropServices.ComTypes.IMoniker 校正。
             [PreserveSig] int IsDirty();
             void Load(object pStm);
             void Save(object pStm, bool fClearDirty);
@@ -100,6 +113,7 @@ namespace ClassSlideSync.Plugin.Core
             void ComposeWith(IMoniker pmkRight, bool fOnlyIfNotGeneric, out IMoniker ppmkComposite);
             void Enum(bool fForward, out IEnumMoniker ppenumMoniker);
             void IsEqual(IMoniker pmkOtherMoniker);
+            void Hash(out int pdwHash);
             void IsRunning(object pbc, object pmkToLeft, object pmkNewlyRunning);
             void GetTimeOfLastChange(object pbc, object pmkToLeft, out System.Runtime.InteropServices.ComTypes.FILETIME pFileTime);
             void Inverse(out IMoniker ppmk);
@@ -109,7 +123,6 @@ namespace ClassSlideSync.Plugin.Core
             // HRESULT 失败时 out 里是垃圾指针，交给 marshaler 翻译就是 0xc0000005，所以自己看。
             void ParseDisplayName(object pbc, object pmkToLeft, [MarshalAs(UnmanagedType.LPWStr)] string pszDisplayName, out int pchEaten, out IMoniker ppmkOut);
             void IsSystemMoniker(out int pdwMksys);
-            void Hash(out int pdwHash);
         }
 
         [ComImport, Guid("0000000e-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -121,11 +134,16 @@ namespace ClassSlideSync.Plugin.Core
         static readonly string[] MonikerProgIds = { "PowerPoint.Application", "Kwpp.Application", "WPP.Application" };
 
         /// <summary>
-        /// 2026-10-24 关掉 ROT 遍历：本机上对 moniker 调 GetDisplayName 会稳定 AV
-        /// （coreclr.dll +0x2fdc，崩溃栈 GetDisplayName -> DumpRot -> Step）。
-        /// 实例发现改由 GetActiveObject 承担；要多实例择优选谁时再说。
+        /// ROT 遍历重新开启（2026-11-08，修 issue #1：PowerPoint LTSC 2408 64 位识别不到课件）。
+        /// 2026-10-24 关掉它，是因为当时手写的 IMoniker vtable 错位，GetDisplayName 实际调到了
+        /// 别的方法 → coreclr.dll +0x2fdc 访问冲突。根因是把 Hash 误当成"最后一个"挪到了末尾；
+        /// 正确位置在 IsEqual 之后、IsRunning 之前（见上方 IMoniker 声明，已对照 .NET
+        /// ComTypes.IMoniker 校正）。槽位对齐后 GetDisplayName 落在真正的槽位上，ROT 遍历安全。
+        /// 只走 GetActiveObject 在 LTSC / 点击运行版 Office 上会 "nothing answered"——老师开着
+        /// 课件却附着不上，卡片永远停在 "PowerPoint / 正在识别课件…"。必须靠 ROT 枚举择优附着。
+        /// 万一某台机器仍崩，可临时改回 false 退守 GetActiveObject（但会重现 issue #1）。
         /// </summary>
-        const bool RotWalkEnabled = false;
+        const bool RotWalkEnabled = true;
         static readonly string[] LiveProgIds = { "PowerPoint.Application", "Kwpp.Application", "WPP.Application", "wpp.Application" };
 
         /// <summary>
@@ -705,8 +723,8 @@ namespace ClassSlideSync.Plugin.Core
         {
             // 平台护栏：纯诊断输出，非 Windows 直接给一句说明，不去碰 ROT。
             if (!PlatformGuard.IsWindows) { PlatformGuard.Announce("ppt-bridge:dump-rot"); return "platform: skipped (non-windows) ppt-bridge:dump-rot"; }
-            // ROT 遍历已关（见 RotWalkEnabled 的注释），这里只报状态，不再碰 moniker。
-            if (!RotWalkEnabled) return "ROT walk disabled: moniker.GetDisplayName AVs on this machine (2026-10-24)";
+            // RotWalkEnabled 关闭时只报状态、不碰 moniker（见 RotWalkEnabled 的注释）。
+            if (!RotWalkEnabled) return "ROT walk disabled (RotWalkEnabled=false)";
             var sb = new StringBuilder();
             IBindCtx ctx = null; IRunningObjectTable rot = null; IEnumMoniker en = null;
             try
@@ -725,8 +743,9 @@ namespace ClassSlideSync.Plugin.Core
                         i++;
                         string name = null;
                         name = MonikerName(monikers[0], ctx);
-                        // 只打名字。以前这里还会对每个 moniker 调 rot.GetObject，而 ROT 里混着文件/包等非自动化 moniker，
-                        // 对着它们取 RCW 会把引用弄坏（GetObject 正是 2026-10-24 崩溃栈顶的那一帧）。
+                        // 只打名字，不对 moniker 调 rot.GetObject：DumpRot 是纯诊断，取 RCW 只会徒增引用 churn。
+                        // （2026-10-24 崩溃栈顶虽是 GetObject，但真因是 IRunningObjectTable vtable 错位——
+                        //   GetObject 落到了 GetTimeOfLastChange 槽位，已在接口声明处校正，不是"文件 moniker"的锅。）
                         sb.AppendLine("[" + i + "] " + name);
                     }
                     finally
