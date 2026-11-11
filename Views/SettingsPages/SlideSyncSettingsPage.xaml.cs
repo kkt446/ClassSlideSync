@@ -15,6 +15,7 @@ using ClassIsland.Core.Attributes;
 using ClassIsland.Platforms.Abstraction;
 using ClassIsland.Shared;
 using ClassSlideSync.Plugin.Core;
+using ClassSlideSync.Plugin.Ui;
 
 namespace ClassSlideSync.Plugin.Views.SettingsPages;
 
@@ -37,6 +38,9 @@ public partial class SlideSyncSettingsPage : SettingsPageBase
         Plugin = plugin;
         Appearance = new SlideSyncAppearanceViewModel(plugin.Settings, plugin.Service);
         InitializeComponent();
+        // “高级选项”里是嵌套 SettingsExpander：FluentAvalonia 2.4.1 的 FluentV2 展开动画
+        // 会在外层展开时对尚未合成的最内层 Border 解引用而崩（详见 ExpanderAnimationFix）。
+        ExpanderAnimationFix.DisableForChildren(AdvancedPanel);
         // XAML 里只给了 x:Name，没写 Click=：这台机器上的 Avalonia XAML 编译器解析不了那个事件
         // 处理器（AVLN3000），改成构造时挂，效果一样且不依赖代码生成。
         if (OpenPanelButton != null) OpenPanelButton.Click += OnOpenControlPanel;

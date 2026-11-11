@@ -398,7 +398,9 @@
             <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE713;}"
                                        Header="高级选项"
                                        Description="不常改的运行时机、学科课件文件夹、显示内容与交互选项收在这里；默认值已够日常使用。">
-                <StackPanel Spacing="4">
+                <!-- x:Name 给 code-behind 用：里面的卡片是嵌套 SettingsExpander，
+                     要在模板应用时关掉 FluentAvalonia 的展开动画（见 ExpanderAnimationFix）。 -->
+                <StackPanel x:Name="AdvancedPanel" Spacing="4">
             <Separator Margin="0 12 0 4" />
             <ciControls:IconText Glyph="&#xE51E;" Text="运行时机" Margin="0 0 0 4" />
 

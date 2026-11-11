@@ -96,6 +96,9 @@ namespace ClassSlideSync.Plugin.Ui
             Appearance = new SlideSyncAppearanceViewModel(this.settings, service!);
 
             InitializeComponent();
+            // “高级选项”里是嵌套 SettingsExpander，必须关掉 FluentV2 动画，
+            // 否则外层展开时内层模板在动画的 Measure 里应用，ExpanderExt 会空引用（见 ExpanderAnimationFix）。
+            ExpanderAnimationFix.DisableForChildren(AdvancedPanel);
             DataContext = this;
 
             GroupList.ItemsSource = groups;
