@@ -215,7 +215,10 @@ namespace ClassSlideSync.Plugin.Core
             set { Set(ref showCardOutsideClass, value); }
         }
 
-        /// <summary>历史记录保留多少天（默认 21 天 = 3 周），更久没用的课件记录会被清掉。</summary>
+        /// <summary>
+        /// 课前推荐回看多少天（默认 21 天 = 3 周）：只影响「这一科上次那份没讲完」往回找多久。
+        /// 功能7（2026-11-11）后**不再用于自动删除**：缓存区不自动清空，记录一直留着（见 Ledger.Prune）。
+        /// </summary>
         public int HistoryRetentionDays
         {
             get { return historyRetentionDays; }

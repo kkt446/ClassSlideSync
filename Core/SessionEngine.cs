@@ -27,6 +27,11 @@ namespace ClassSlideSync.Plugin.Core
         public int Current;              // current slide (0 when unknown)
         public int SlideCount;           // total slides (0 when unknown)
         public int Previous;             // where the last lesson stopped (0 when unknown)
+        /// <summary>
+        /// 上次已讲到最后一页（2026-11-11 用户第 6 条）：这份课件讲完了，再打开不该续旧页，
+        /// 而是「从头开始」。此时 <see cref="Previous"/> 被置成 1（跳转目标），卡片按钮文案换成「从头开始」。
+        /// </summary>
+        public bool Finished;
         public double PreviousAgeDays = -1;
         public bool PreviousTrusted = true;   // false => the deck was edited since the record
         public string FileName = "";
@@ -77,6 +82,13 @@ namespace ClassSlideSync.Plugin.Core
         public string SuiteName = "";
 
         /// <summary>
+        /// 权限不一致（ClassIsland 管理员 / Office 普通）导致 COM 读不到课件时的一句话说明
+        /// （issue #1 残留 + 用户第 4 条）。空串表示没有这回事。卡片据此把灰死的跳转按钮换成
+        /// 「切换到课件窗口」，并把原因显示出来，而不是让老师对着「正在识别课件…」干点。
+        /// </summary>
+        public string BlockedNotice = "";
+
+        /// <summary>
         /// 功能7（2026-10-24）：课前预备态。true 表示现在没有任何课件，但这一科上次那份没讲完，
         /// 卡片要换成「文件名 + 上次停在第 N 页 + 还有 M 页没讲 + 打开并接着讲」。
         /// 卡片只读这个标志和下面三个快照字段，**不要**去读台账 —— 台账只在引擎/服务线程上碰。
@@ -102,6 +114,10 @@ namespace ClassSlideSync.Plugin.Core
             // 「还剩几页 · 约几分钟」也是卡片上的字：换一页、或者一节课结束让每页耗时变了，
             // 这两个数都会变，哈希不带上它们卡片就会停在上一秒的估计上。
             h = h * 31 + RemainingPages * 7 + RemainingMinutes;
+            // 「从头开始」是另一种按钮文案：讲完与否变了，卡片必须重画（Previous 同为 1 时哈希也要不同）。
+            if (Finished) h = h * 31 + 900000;
+            // 权限说明出现/消失是另一种卡片形态（按钮从灰死变可点），哈希必须带上它。
+            if (!string.IsNullOrEmpty(BlockedNotice)) h = h * 31 + 800000 + BlockedNotice.GetHashCode();
             if (History != null && History.Count > 0) h = h * 31 + History[0].Slide;
             // 预备态是三种卡片形态之一（2026-10-24 功能7），它和正常态/课表面板的排版完全不同：
             // 只换 Hint 不改这几项的话，卡片收到新状态却不重画，会继续画上一个形态。
@@ -249,6 +265,10 @@ namespace ClassSlideSync.Plugin.Core
         // 跳页必须落在老师点的那一刻看到的那一页上，而不能在执行时重新查一遍
         // （2026-10-18 日志：卡片上是希沃第 8 页，点下去跳了 WPS 第 6 页）。
         SessionRecord displayed;
+        // displayed 那条记录是否「已讲完」：DoJump 据此把跳转目标改成第 1 页（从头开始）。
+        bool displayedFinished;
+        // 权限不一致说明（issue #1 残留 + 用户第 4 条）：COM 接不上且检测到管理员/普通权限分裂时非空。
+        string blockedNotice = "";
         // 刚结束的那节课：多套件并存时用它压过另一台引擎留下的旧会话。
         SessionRecord recentEnded;
         DateTime recentEndedAt = DateTime.MinValue;
@@ -451,6 +471,7 @@ namespace ClassSlideSync.Plugin.Core
                     if (b != null)
                     {
                         bridge = b;
+                        blockedNotice = "";
                         ledger.Log("attached to " + b.Label + " via " + b.ProgId + " [mode=" + b.AttachMode + "]");
                     }
                     else if (Diag)
@@ -466,6 +487,9 @@ namespace ClassSlideSync.Plugin.Core
                     if (showing) EndSession(0);
                     // 2026-10-17：没有 COM 也先把卡片点亮（窗口标题里的文档名足够翻出"上次讲到第几页"）。
                     ApplyTitleFallback();
+                    // issue #1 残留 + 用户第 4 条：接不上又开着演示窗口时，看看是不是权限分裂，
+                    // 是的话给老师一句原因 + 一个仍可点的按钮，而不是灰死在「正在识别课件…」。
+                    blockedNotice = PptBridge.IntegrityNotice();
                     Push(false, 0, 0);
                     return;
                 }
@@ -1267,13 +1291,28 @@ namespace ClassSlideSync.Plugin.Core
             if (!showing
                 && recentEnded != null
                 && (DateTime.Now - recentEndedAt).TotalSeconds <= RecentSessionSeconds
-                && !SameBucket(histKey, recentEnded.FilePath))
+                && !SameBucket(histKey, recentEnded.FilePath)
+                && !DeckWindowOnScreen())
             {
                 recent = true;
                 histKey = recentEnded.FilePath;
                 return recentEnded;
             }
             return r;
+        }
+
+        /// <summary>
+        /// 桌面上是否还有打开着的课件窗口（只读窗口标题，不碰 COM）。
+        ///
+        /// bug 5（2026-11-11 用户第 5 条）：眼前这份课件没进过缓存时，不能拿「刚讲完的另一份」
+        /// 的页码冒充它 —— 否则未缓存课件也会显示一个页码且可跳转（张冠李戴）。只有桌面上确实
+        /// 没有课件窗口时，才允许用最近结束的那节课兜底（希沃退出授课、屏幕已空的那种情形）。
+        /// 只在 PickRecord 真要启用 recent 兜底时才调用（短路在前），不会每拍都枚举窗口。
+        /// </summary>
+        static bool DeckWindowOnScreen()
+        {
+            try { return PptBridge.SuiteFrameDocuments().Length > 0; }
+            catch { return false; }
         }
 
         /// <summary>
@@ -1331,6 +1370,8 @@ namespace ClassSlideSync.Plugin.Core
                 return;
             }
             int target = explicitSlide > 0 ? explicitSlide : (r != null ? r.EndSlide : 0);
+            // 已讲完的课件：卡片按钮是「从头开始」，跳转目标就是第 1 页，而不是旧的最后一次页码。
+            if (explicitSlide <= 0 && displayedFinished) target = 1;
             if (target <= 0)
             {
                 SetStatus("这条记录没有页码");
@@ -1533,6 +1574,7 @@ namespace ClassSlideSync.Plugin.Core
             var r = PickRecord(out histKey, out recent);
             // 这一条就是卡片正在展示的记录，DoJump 直接用它 —— 显示什么就跳什么。
             displayed = r;
+            displayedFinished = false;
 
             // 「还剩 N 页 · 约 M 分钟」（2026-10-24 功能1）。没在放映时一律不给值：那时候
             // Current / SlideCount 可能是上一节课的残留，或者窗口标题兜底猜出来的，
@@ -1575,7 +1617,15 @@ namespace ClassSlideSync.Plugin.Core
                 st.Hint = st.PreviousTrusted
                     ? "记录于 " + ShortAge(st.PreviousAgeDays)
                     : (string.IsNullOrEmpty(st.RemapNote) ? "文件在那之后被改过，页码可能已偏移" : st.RemapNote);
-                if (finished) st.Hint = "上次已讲到最后一页";
+                if (finished)
+                {
+                    // 讲完了：续讲页改成第 1 页，按钮文案「从头开始」（用户 2026-11-11 第 6 条）。
+                    // 放在 remap 之后：finished 期间 Previous 先是 0，remap 不会去对齐一个已讲完的课件。
+                    st.Previous = 1;
+                    st.Finished = true;
+                    displayedFinished = true;
+                    st.Hint = "上次已讲到最后一页";
+                }
                 // 刚讲完的这份：明说一句，免得老师把它当成“别的套件里那份课件”。
                 if (recent) st.Hint = "刚讲完 · " + (st.PreviousTrusted ? "点这里接着讲" : "文件改过，页码可能偏移");
             }
@@ -1647,6 +1697,8 @@ namespace ClassSlideSync.Plugin.Core
                 st.History.Clear();
                 st.HistoryTotal = 0;
             }
+            st.BlockedNotice = blockedNotice;
+            if (blockedNotice.Length > 0) st.Hint = blockedNotice;
             return st;
         }
 

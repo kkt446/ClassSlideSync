@@ -378,6 +378,133 @@ namespace ClassSlideSync.Plugin.Core
             return "";
         }
 
+        // ---- 权限（integrity level）诊断：issue #1 残留 + 用户第 4 条 -------------------------
+        // ClassIsland 被「以管理员身份启动」抬到 High IL 后，Windows 不让它读普通权限（Medium IL）
+        // Office 的 COM ROT：GetActiveObject / ROT 遍历全空，卡片永远停在「正在识别课件…」、
+        // 跳转按钮灰死（点了没反应）。跨权限 COM 是系统级禁止，插件绕不过；能做的是把"为什么读不到"
+        // 算出来告诉老师，并让按钮仍然有一个有用的动作（切到已开着的课件窗口）。
+        const int TOKEN_QUERY = 0x0008;
+        const int PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+        const int TokenIntegrityLevel = 25;
+        const int SW_RESTORE = 9;
+
+        [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+        [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr h, int access, out IntPtr token);
+        [DllImport("advapi32.dll", SetLastError = true)] static extern bool GetTokenInformation(IntPtr token, int cls, IntPtr info, int len, out int retLen);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(int access, bool inherit, uint pid);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr h);
+        [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
+        [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+
+        static int IntegrityOfToken(IntPtr token)
+        {
+            // TOKEN_MANDATORY_LABEL = SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes; }，
+            // 且 GetTokenInformation 会把 SID 本体紧跟在结构体后面一起写回这块缓冲区，
+            // 所以缓冲区要留够"结构体 + SID"（实测 x64 需要 28 字节），只给结构体大小会 122 不足。
+            int size = 128;
+            IntPtr buf = Marshal.AllocHGlobal(size);
+            try
+            {
+                int ret;
+                if (!GetTokenInformation(token, TokenIntegrityLevel, buf, size, out ret)) return -1;
+                IntPtr sid = Marshal.ReadIntPtr(buf);
+                if (sid == IntPtr.Zero) return -1;
+                // SID 最后一个 subauthority 就是 IL：0x1000 Low / 0x2000 Medium / 0x3000 High。
+                byte count = Marshal.ReadByte(sid, 1);
+                if (count == 0) return -1;
+                return Marshal.ReadInt32(sid, 8 + 4 * (count - 1));
+            }
+            catch { return -1; }
+            finally { Marshal.FreeHGlobal(buf); }
+        }
+
+        public static int OurIntegrity()
+        {
+            if (!PlatformGuard.IsWindows) return -1;
+            IntPtr token;
+            if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, out token)) return -1;
+            try { return IntegrityOfToken(token); }
+            finally { CloseHandle(token); }
+        }
+
+        static int WindowIntegrity(IntPtr h)
+        {
+            uint pid;
+            GetWindowThreadProcessId(h, out pid);
+            if (pid == 0) return -1;
+            IntPtr proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+            if (proc == IntPtr.Zero) return -1;
+            try
+            {
+                IntPtr token;
+                if (!OpenProcessToken(proc, TOKEN_QUERY, out token)) return -1;
+                try { return IntegrityOfToken(token); }
+                finally { CloseHandle(token); }
+            }
+            finally { CloseHandle(proc); }
+        }
+
+        /// <summary>第一个可见的演示主窗口（不需要 COM，跨权限也能拿到标题）。</summary>
+        public static bool TryGetSuiteWindow(out IntPtr hwnd, out string title)
+        {
+            IntPtr found = IntPtr.Zero; string foundTitle = "";
+            EnumWindowsProc cb = delegate (IntPtr h, IntPtr l)
+            {
+                try
+                {
+                    if (found != IntPtr.Zero) return true;
+                    if (!IsWindowVisible(h) || !IsSuiteFrame(h)) return true;
+                    var sb = new StringBuilder(512);
+                    GetWindowTextW(h, sb, sb.Capacity);
+                    found = h; foundTitle = sb.ToString();
+                }
+                catch { }
+                return true;
+            };
+            try { EnumWindows(cb, IntPtr.Zero); } catch { }
+            GC.KeepAlive(cb);
+            hwnd = found; title = foundTitle;
+            return found != IntPtr.Zero;
+        }
+
+        static string cachedNotice = ""; static DateTime cachedNoticeAt = DateTime.MinValue;
+        /// <summary>
+        /// 权限不一致导致读不到课件时给老师看的一句话；其余情况返回空串。
+        /// 5 秒缓存：引擎每 250ms 问一次，不能每次都去开进程查 token。
+        /// </summary>
+        public static string IntegrityNotice()
+        {
+            if (!PlatformGuard.IsWindows) return "";
+            if ((DateTime.UtcNow - cachedNoticeAt).TotalSeconds < 5) return cachedNotice;
+            cachedNoticeAt = DateTime.UtcNow;
+            cachedNotice = "";
+            try
+            {
+                IntPtr h; string title;
+                if (!TryGetSuiteWindow(out h, out title)) return cachedNotice;
+                int ours = OurIntegrity(), theirs = WindowIntegrity(h);
+                if (ours > 0 && theirs > 0 && ours > theirs)
+                    cachedNotice = "ClassIsland 以管理员运行、Office 是普通权限，Windows 禁止跨权限读课件。关掉「以管理员身份启动」后重启 ClassIsland 即可恢复读页。";
+            }
+            catch { }
+            return cachedNotice;
+        }
+
+        /// <summary>把已经开着的演示窗口切到前台：读不到 COM 时，卡片按钮仍然有用的兜底动作。</summary>
+        public static bool ForegroundSuiteWindow()
+        {
+            if (!PlatformGuard.IsWindows) return false;
+            try
+            {
+                IntPtr h; string title;
+                if (!TryGetSuiteWindow(out h, out title)) return false;
+                if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
+                SetForegroundWindow(h);
+                return true;
+            }
+            catch { return false; }
+        }
+
         /// <summary>只看进程名（大小写不敏感），给上面几个判断用。</summary>
         static bool ProcessNamed(string name)
         {

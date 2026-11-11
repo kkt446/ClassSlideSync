@@ -915,10 +915,17 @@ namespace ClassSlideSync.Plugin.Services
             c.PositionChanged += OnPositionChanged;   // 用户第 3 条：拖完记住位置
             c.PanelRequested += OnPanelRequested;     // 右上角齿轮 → 独立 Avalonia 控制面板
             c.OpenDeckRequested += OnOpenDeckRequested;   // 功能8：预备态点「打开并接着讲」
+            c.SwitchToSuiteRequested += OnSwitchToSuiteRequested;   // 权限分裂时「切换到课件窗口」
             // 卡片的显示/隐藏变化写进 app.log：老师报"卡片该出来却没出来"时，日志要能直接看出来。
             c.Log = m => { try { ledger.Log("card: " + m); } catch { } };
             c.Start();
             return c;
+        }
+
+        /// <summary>权限不一致读不到 COM 时，卡片按钮的兜底动作：把已开着的演示窗口切到前台。</summary>
+        void OnSwitchToSuiteRequested()
+        {
+            try { PptBridge.ForegroundSuiteWindow(); } catch { }
         }
 
         // ---- Linux 待命 ----------------------------------------------------------
@@ -1279,7 +1286,11 @@ namespace ClassSlideSync.Plugin.Services
             }
         }
 
-        /// <summary>清掉太久没用的课件历史（默认 3 周），启动时一次，之后每天一次。</summary>
+        /// <summary>
+        /// 历史清理入口（启动时一次、之后每天一次、设置变更后一次）。
+        /// 功能7（2026-11-11 用户第 7 条）后 <see cref="Ledger.Prune"/> 恒为 no-op：缓存区不自动清空。
+        /// 保留入口与节奏，手动清空走 RemoveMany / 自动化「清空课件历史」，不受影响。
+        /// </summary>
         void PruneHistory()
         {
             try
@@ -1612,7 +1623,8 @@ namespace ClassSlideSync.Plugin.Services
                 if (c != null) c.Configure(Appearance, settings.AutoShowOverlay, settings.AutoHide, settings.AutoHideSeconds, settings.EnableControlPanel);
                 var e = engine;
                 if (e != null) e.Diag = settings.DiagnosticLog;
-                // 保留期可能刚被改短：立刻按新值清一次，老师能看到历史真的被清掉了。
+                // 功能7（2026-11-11）：缓存不自动清空，Ledger.Prune 恒为 no-op；
+                // 保留这个调用点只是维持"设置变更后刷新一次"的节奏，不会删任何记录。
                 PruneHistory();
             }
             catch { }
@@ -1802,7 +1814,8 @@ namespace ClassSlideSync.Plugin.Services
                     current,
                     count,
                     LessonKeyOf(lessonTag),
-                    DateTime.Now.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture));
+                    DateTime.Now.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+                    st.RemainingMinutes);
                 progress = p;
 
                 var handler = SlideProgressChanged;
@@ -1952,7 +1965,8 @@ namespace ClassSlideSync.Plugin.Services
             int current,
             int slideCount,
             string lessonKey,
-            string dayKey)
+            string dayKey,
+            int remainingMinutes = 0)
         {
             DeckOpen = deckOpen;
             Showing = showing;
@@ -1962,6 +1976,7 @@ namespace ClassSlideSync.Plugin.Services
             SlideCount = slideCount;
             LessonKey = lessonKey ?? "";
             DayKey = dayKey ?? "";
+            RemainingMinutes = remainingMinutes;
         }
 
         /// <summary>true = 演示软件此刻真的打开着某份课件（沿用 <see cref="CardState.DeckOpen"/> 的原义）。</summary>
@@ -1982,6 +1997,9 @@ namespace ClassSlideSync.Plugin.Services
         /// <summary>总页数，0 = 未知。</summary>
         public int SlideCount { get; }
 
+        /// <summary>按实测速度估算的剩余分钟数，0 = 未知/不在放映。小组件与「剩余约x分钟」触发器共用。</summary>
+        public int RemainingMinutes { get; }
+
         /// <summary>课次（"科目|节名|节号"），没有课表读数是空串。触发器用它认「同一节课」。</summary>
         public string LessonKey { get; }
 
@@ -1992,7 +2010,7 @@ namespace ClassSlideSync.Plugin.Services
         public string Signature()
         {
             return (DeckOpen ? "1" : "0") + (Showing ? "1" : "0") + "|" + DeckPath + "|"
-                + Current + "|" + SlideCount + "|" + LessonKey;
+                + Current + "|" + SlideCount + "|" + LessonKey + "|" + RemainingMinutes;
         }
 
         /// <summary>日志里的一句话小结，例如「数学 · 第 3 节 / 课件.pptx 第 5 页（放映中）」。</summary>

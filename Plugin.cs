@@ -210,6 +210,17 @@ public class Plugin : PluginBase
             HostCompat.Skip("trigger:slide-page-reached", "TriggerBase + AddTrigger<T>");
         }
 
+        // —— 触发器：2026-11-11 用户第 3 条需求「剩余约 x 分钟 / 打开课件时 / 关闭课件时」 ——
+        // 剩余分钟带设置抽屉（分钟数可填），与页码触发器同构；打开/关闭是纯事件，没有设置项，
+        // 用非泛型 TriggerBase + AddTrigger<T>()（取证见 stability-report-trigger.txt 第三节）。
+        RegisterTriggerWithSettings(services, caps, "trigger:slide-remaining",
+            () => services.AddTrigger<SlideRemainingTrigger, SlideRemainingSettingsControl>(),
+            () => services.AddTrigger<SlideRemainingTrigger>());
+        HostCompat.TryRun("trigger:deck-opened", "TriggerBase + AddTrigger<T>", caps.Triggers,
+            () => services.AddTrigger<DeckOpenedTrigger>());
+        HostCompat.TryRun("trigger:deck-closed", "TriggerBase + AddTrigger<T>", caps.Triggers,
+            () => services.AddTrigger<DeckClosedTrigger>());
+
         // —— 主界面组件「课件进度」：设置 → 主界面 → 编辑组件 里能把它拖进任何一行 ——
         // 组件自己订阅 SlideSyncService.SlideProgressChanged；没课件放映时把自身 IsVisible 关掉，
         // 不留占位（宿主对组件 IsVisible 的 setter 是 internal，插件不能代设）。
@@ -248,6 +259,29 @@ public class Plugin : PluginBase
         }
 
         HostCompat.Skip(feature, "ActionBase + AddAction<T>");
+    }
+
+    /// <summary>
+    /// 带设置抽屉的触发器。旧宿主没有 AddTrigger&lt;T, TSettingsControl&gt; 时退回 AddTrigger&lt;T&gt;：
+    /// 触发器本身仍能触发，只是没有设置界面（分钟数用默认值）——有意义的降级，不是静默丢弃。
+    /// </summary>
+    static void RegisterTriggerWithSettings(IServiceCollection services, HostCapabilities caps, string feature,
+        Action withSettings, Action plain)
+    {
+        if (caps.TriggersWithSettings)
+        {
+            HostCompat.TryRun(feature, "AddTrigger<T,TSettingsControl>", true, withSettings);
+            return;
+        }
+
+        if (caps.Triggers)
+        {
+            HostCompat.Skip(feature + ".settings-control", "AddTrigger<T,TSettingsControl>");
+            HostCompat.TryRun(feature, "AddTrigger<T> (degraded, no settings drawer)", true, plain);
+            return;
+        }
+
+        HostCompat.Skip(feature, "TriggerBase + AddTrigger<T>");
     }
 
     /// <summary>

@@ -595,46 +595,15 @@ namespace ClassSlideSync.Plugin.Core
         }
 
         /// <summary>
-        /// 清掉太久没用的课件记录（默认 3 周，见 SyncSettings.HistoryRetentionDays）。
-        /// 判据是"最后一次使用"而不是"记录创建时间"：同一份课件只要还在用就一直留着。
-        /// 返回清掉的记录条数（路径也跟着一起清）。
+        /// 历史保留期清理。**2026-11-11 用户第 7 条：缓存区不自动清空** —— 本方法现在恒为 no-op。
+        /// 课件记录（含「已讲到最后一页」这种状态，见功能 6）要一直留着，老师下次打开才认得回来；
+        /// 按时间自动删会让这些记忆过几周就消失。想清的人走手动清空（<see cref="RemoveMany"/> /
+        /// 自动化「清空课件历史」），那条路不受影响。
+        /// 保留签名与返回值（清掉条数，恒 0）是为了让既有调用点（启动/每日/设置变更）不用改。
         /// </summary>
         public int Prune(int retentionDays)
         {
-            if (retentionDays <= 0) return 0;
-            var cutoff = DateTime.Now.AddDays(-retentionDays);
-            int removed = 0;
-            try
-            {
-                lock (Sync)
-                {
-                    Dictionary<string, List<SessionRecord>> next = null;
-                    foreach (var kv in byFile)
-                    {
-                        var list = kv.Value;
-                        if (list == null)
-                        {
-                            next = next ?? new Dictionary<string, List<SessionRecord>>(byFile);
-                            next.Remove(kv.Key);
-                            continue;
-                        }
-                        int before = list.Count;
-                        list.RemoveAll(r => LastUsed(r) < cutoff);
-                        removed += before - list.Count;
-                        if (list.Count == 0)
-                        {
-                            next = next ?? new Dictionary<string, List<SessionRecord>>(byFile);
-                            next.Remove(kv.Key);
-                        }
-                    }
-                    if (next != null) byFile = next;
-                }
-                // Save 必须在 Sync 之外：Save 内部按 saveLock → Sync 的顺序拿锁，
-                // 如果在这里持着 Sync 去等 saveLock，就会和另一条正在 Save 的线程互相等死。
-                if (removed > 0) Save();
-            }
-            catch { }
-            return removed;
+            return 0;
         }
 
         /// <summary>

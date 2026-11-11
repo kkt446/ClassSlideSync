@@ -59,6 +59,9 @@ namespace ClassSlideSync.Plugin.Components
         /// <summary>组件库里的说明文字。</summary>
         public const string Description = "显示当前课件讲到第几页（如 12 / 24）。没有课件在放映时自动隐藏。";
 
+        /// <summary>第一行小标题。有课件在放映且算得出剩余时间时换成「剩余约 x 分钟」，否则是「课件续页」。</summary>
+        readonly TextBlock titleText;
+
         readonly TextBlock valueText;
 
         /// <summary>组件内容。隐藏时整块摘掉，避免宿主把子元素挪进自己的面板后 IsVisible 管不住。</summary>
@@ -97,7 +100,7 @@ namespace ClassSlideSync.Plugin.Components
         public DeckProgressComponent()
         {
             // 两行：小标题 + 页码。字号取宿主资源键，用户改主界面字体时跟着变；取不到时退回继承值。
-            var titleText = new TextBlock { Text = IdleTitle, Opacity = 0.85 };
+            titleText = new TextBlock { Text = IdleTitle, Opacity = 0.85 };
             titleText.Bind(TextBlock.FontSizeProperty, new DynamicResourceExtension("MainWindowSecondaryFontSize"));
 
             valueText = new TextBlock { Text = IdleHint };
@@ -203,12 +206,25 @@ namespace ClassSlideSync.Plugin.Components
         }
 
         /// <summary>
+        /// 第一行小标题：有课件在放映且算得出剩余时间时显示「剩余约 x 分钟」，否则是「课件续页」。
+        /// 剩余时间只在放映中才有（引擎按实测翻页速度估算），编辑视图 / 没课件 / 还没估出速度时回到默认文案。
+        /// 抽成纯函数是为了自测能直接断言。
+        /// </summary>
+        public static string FormatTitle(SlideProgress? progress)
+        {
+            if (progress != null && progress.DeckOpen && progress.RemainingMinutes > 0)
+                return "剩余约" + progress.RemainingMinutes + "分钟";
+            return IdleTitle;
+        }
+
+        /// <summary>
         /// 把一份快照刷到界面上。public 是为了自测直接喂快照（不需要真开 PowerPoint，也不需要跑事件循环）。
         /// 只碰控件、不碰服务，所以可以在没有服务的状态下单独测。
         /// </summary>
         public void Apply(SlideProgress? progress)
         {
             LastProgress = progress;
+            titleText.Text = FormatTitle(progress);
             bool live = ShouldShow(progress);
             if (live && progress != null)
             {

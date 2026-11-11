@@ -288,6 +288,12 @@ namespace ClassSlideSync.Plugin.Ui
         public event Action? JumpRequested;
 
         /// <summary>
+        /// 权限不一致读不到 COM 时，卡片按钮换成「切换到课件窗口」，点下去触发这个（浮层线程）。
+        /// 服务把它转成 PptBridge.ForegroundSuiteWindow()：把已开着的演示窗口切到前台。
+        /// </summary>
+        public event Action? SwitchToSuiteRequested;
+
+        /// <summary>
         /// 历史面板里点了一条记录（浮层线程）。参数是「哪份文件 + 要跳到的页码」；真正的
         /// COM / MCP 调用由服务转给引擎的工作线程，浮层线程不碰。
         /// 文件夹面板可以跨文件翻历史，所以文件必须跟着页码一起走。
@@ -386,6 +392,7 @@ namespace ClassSlideSync.Plugin.Ui
 
         // 最近一次绘制出来的可点区域（客户区坐标）与当时是不是在放映 —— 点击要按这个判定。
         Rect32 jumpHit;
+        Rect32 switchHit;        // 权限不一致时「切换到课件窗口」按钮的命中区（与 jumpHit 互斥）
         Rect32 collapseHit;      // 小窗右上角那个"收回"箭头，点它就把卡片贴回屏幕边
         bool showingCard;
         // 状态推送比窗口早到时记一笔（见 Wake / Run）：窗口一建好就补一次 ApplyPending。
@@ -2051,6 +2058,14 @@ namespace ClassSlideSync.Plugin.Ui
             // 任何不在跳转行上的点击都拦掉，历史入口就永远点不开了。
             if (historyHit.R > historyHit.L && Inside(historyHit, x, y)) { OpenHistoryPanel(); return; }
 
+            // 权限不一致时的「切换到课件窗口」：它不是跳页，不受 ClickToJump / 放映中只点跳转行的限制。
+            if (switchHit.R > switchHit.L && Inside(switchHit, x, y))
+            {
+                var sw = SwitchToSuiteRequested;
+                if (sw != null) sw();
+                return;
+            }
+
             if (!look.ClickToJump) return;
             // 正在放映时只有“上次停在第 N 页”那一行可点：老师随手点在卡片别处就把放映跳走，
             // 是比不响应更糟的事故。
@@ -2161,6 +2176,7 @@ namespace ClassSlideSync.Plugin.Ui
         {
             showingCard = false;          // 预备态还没在放映，不给"整卡跳页"的老逻辑留口子
             jumpHit = new Rect32(0, 0, 0, 0);
+            switchHit = new Rect32(0, 0, 0, 0);
             int step = Scaled(22);
 
             // 「上次停在第 N 页」用正文色：这是老师扫一眼就要读到的数字。
@@ -2246,6 +2262,7 @@ namespace ClassSlideSync.Plugin.Ui
                         // 面板分支里万一以后加了提前 return，就会留着上一次的跳页区 —— 点到面板
                         // 空白处会把放映跳走。统一在这里先清，各分支再按需覆盖。
                         jumpHit = new Rect32(0, 0, 0, 0);
+                        switchHit = new Rect32(0, 0, 0, 0);
                         collapseHit = new Rect32(0, 0, 0, 0);
                         for (int i = 0; i < CardFileList.MaxSameName; i++)
                         {
@@ -2595,11 +2612,13 @@ namespace ClassSlideSync.Plugin.Ui
                                            new Rect32(rightX, y + Scaled(2), w - padR, y + Scaled(22)), Align.Right, false);
 
                                     string remainText;
-                                    if (!st.Showing && st.Previous > 0) remainText = "上次停在这一页";
+                                    if (st.Finished) remainText = "上次已讲完";
+                                    else if (!st.Showing && st.Previous > 0) remainText = "上次停在这一页";
                                     else if (st.RemainingPages > 0)
                                         remainText = "还剩 " + st.RemainingPages.ToString(CultureInfo.InvariantCulture) + " 页 · 约 "
                                                    + st.RemainingMinutes.ToString(CultureInfo.InvariantCulture) + " 分钟";
                                     else if (st.Showing && totalPages > 0) remainText = "已经讲到最后一页";
+                                    else if (st.BlockedNotice.Length > 0) remainText = "权限不一致·读不到页码";
                                     else remainText = st.SuiteOnly ? "正在识别课件…" : "等待放映";
                                     g.Text(g.Ellipsis(FitRemain(g, remainText, rightW), g.FontSub2, rightW), g.FontSub2, text,
                                            new Rect32(rightX, y + Scaled(24), w - padR, y + linePage), Align.Right, false);
@@ -2611,12 +2630,22 @@ namespace ClassSlideSync.Plugin.Ui
                                 // 或者老师关掉这一行时画一个灰掉的同形按钮：位置留着，卡片高度不抖。
                                 showingCard = st.Showing || st.SuiteOnly;   // 等课件时整张卡片都不可点（只有把手能点）
                                 jumpHit = new Rect32(0, 0, 0, 0);
+                                switchHit = new Rect32(0, 0, 0, 0);
                                 y += Scaled(BtnGapTop96);
                                 var btn = new Rect32(pad, y, w - padR, y + btnH);
-                                if (look.ShowJumpLine && st.Previous > 0)
+                                if (st.BlockedNotice.Length > 0)
+                                {
+                                    // 权限分裂读不到 COM：按钮不灰死，换成一个仍然有用的动作（切到课件窗口）。
+                                    g.FillRounded(accent, btn, Scaled(8), true, true);
+                                    g.Text("切换到课件窗口", g.FontTitle, Color32.White, btn, Align.Center, true);
+                                    switchHit = btn;
+                                }
+                                else if (look.ShowJumpLine && st.Previous > 0)
                                 {
                                     g.FillRounded(accent, btn, Scaled(8), true, true);
-                                    string jump = "从第 " + st.Previous.ToString(CultureInfo.InvariantCulture) + " 页接着讲";
+                                    string jump = st.Finished
+                                        ? "从头开始"
+                                        : "从第 " + st.Previous.ToString(CultureInfo.InvariantCulture) + " 页接着讲";
                                     g.Text(g.Ellipsis(jump, g.FontTitle, inner - Scaled(12)), g.FontTitle, Color32.White,
                                            btn, Align.Center, true);
                                     jumpHit = btn;

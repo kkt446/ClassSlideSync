@@ -159,4 +159,116 @@ namespace ClassSlideSync.Plugin.Automation
             };
         }
     }
+
+    /// <summary>
+    /// 触发器「课件剩余约 N 分钟」的设置界面：一个分钟数输入框。
+    /// 写法与时序坑和 <see cref="SlidePageReachedSettingsControl"/> 完全一致（纯 C#、附树后回填、loading 守卫）。
+    /// </summary>
+    public sealed class SlideRemainingSettingsControl : TriggerSettingsControlBase<SlideRemainingSettings>
+    {
+        readonly TextBox minutesBox = new TextBox
+        {
+            Width = 120,
+            Watermark = "1 - 999",
+            HorizontalAlignment = HorizontalAlignment.Left,
+        };
+
+        bool loading;
+
+        public SlideRemainingSettingsControl()
+        {
+            var panel = new StackPanel
+            {
+                Spacing = 8,
+                Margin = new Thickness(0, 8, 0, 8),
+            };
+
+            panel.Children.Add(Label("剩余约几分钟时触发"));
+            panel.Children.Add(minutesBox);
+            panel.Children.Add(Hint(
+                "1 - 999，默认 5。剩余时间按实测翻页速度估算，只在放映中才算得出。"
+                + "同一节课的同一份课件只触发一次：剩余时间第一次降到这个值以内时触发，换课件或换下一节课后重新算。"));
+
+            Content = panel;
+
+            minutesBox.TextChanged += (_, _) =>
+            {
+                if (loading) return;
+                var settings = TrySettings();
+                if (settings == null) return;
+                if (int.TryParse((minutesBox.Text ?? "").Trim(), out int minutes))
+                {
+                    settings.Minutes = Math.Clamp(minutes, SlideRemainingTrigger.MinMinutes, SlideRemainingTrigger.MaxMinutes);
+                }
+            };
+
+            minutesBox.LostFocus += (_, _) => NormalizeMinutes();
+
+            AttachedToVisualTree += (_, _) => LoadFromSettings();
+        }
+
+        SlideRemainingSettings? TrySettings()
+        {
+            try { return Settings; }
+            catch { return null; }
+        }
+
+        void LoadFromSettings()
+        {
+            var settings = TrySettings();
+            if (settings == null) return;
+
+            loading = true;
+            try
+            {
+                minutesBox.Text = Math.Clamp(settings.Minutes, SlideRemainingTrigger.MinMinutes, SlideRemainingTrigger.MaxMinutes)
+                    .ToString();
+            }
+            finally
+            {
+                loading = false;
+            }
+        }
+
+        void NormalizeMinutes()
+        {
+            var settings = TrySettings();
+            if (settings == null) return;
+
+            int minutes = Math.Clamp(settings.Minutes, SlideRemainingTrigger.MinMinutes, SlideRemainingTrigger.MaxMinutes);
+            settings.Minutes = minutes;
+
+            loading = true;
+            try
+            {
+                minutesBox.Text = minutes.ToString();
+            }
+            finally
+            {
+                loading = false;
+            }
+        }
+
+        static TextBlock Label(string text)
+        {
+            return new TextBlock
+            {
+                Text = text,
+                FontWeight = FontWeight.SemiBold,
+                Margin = new Thickness(0, 4, 0, 0),
+            };
+        }
+
+        static TextBlock Hint(string text)
+        {
+            return new TextBlock
+            {
+                Text = text,
+                Opacity = 0.7,
+                FontSize = 12,
+                TextWrapping = TextWrapping.Wrap,
+                MaxWidth = 420,
+            };
+        }
+    }
 }

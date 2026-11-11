@@ -110,209 +110,7 @@
                 </controls:SettingsExpander.Footer>
             </controls:SettingsExpander>
 
-            <Separator Margin="0 12 0 4" />
-            <ciControls:IconText Glyph="&#xE51E;" Text="运行时机" Margin="0 0 0 4" />
 
-            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE51E;}"
-                                       Header="上课前自动待命"
-                                       Description="{Binding RuntimeSummary}">
-                <controls:SettingsExpander.Footer>
-                    <ToggleSwitch VerticalAlignment="Center"
-                                  IsChecked="{Binding Settings.AutoStartBeforeClass, Mode=TwoWay}"/>
-                </controls:SettingsExpander.Footer>
-            </controls:SettingsExpander>
-
-            <!-- 功能7：课前预览上次没讲完的课件。直接绑同一个 SyncSettings 实例，
-                 拨动开关立刻写回 Settings.ReadyCardEnabled，不需要额外的保存/刷新代码。 -->
-            <controls:SettingsExpander x:Name="ReadyCardRow"
-                                       IconSource="{ciControls:FluentIconSource &#xE81C;}"
-                                       Header="课前预览上次没讲完的课件"
-                                       Description="上课前两分钟，如果这一科上次没讲完，卡片先亮出来，写着上次停在第几页。关掉就只在真正放映时出现。"
-                                       IsVisible="{Binding Settings.AutoStartBeforeClass}">
-                <controls:SettingsExpander.Footer>
-                    <ToggleSwitch x:Name="ReadyCardToggle"
-                                  VerticalAlignment="Center"
-                                  IsChecked="{Binding Settings.ReadyCardEnabled, Mode=TwoWay}"/>
-                </controls:SettingsExpander.Footer>
-            </controls:SettingsExpander>
-
-            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xF031;}"
-                                       Header="提前多少秒待命"
-                                       Description="默认 120 秒，也就是上课前 2 分钟。"
-                                       IsVisible="{Binding Settings.AutoStartBeforeClass}">
-                <controls:SettingsExpander.Footer>
-                    <NumericUpDown Width="140" Minimum="0" Maximum="600" Increment="10"
-                                   VerticalAlignment="Center"
-                                   Value="{Binding Settings.PreClassLeadSeconds, Mode=TwoWay}"/>
-                </controls:SettingsExpander.Footer>
-            </controls:SettingsExpander>
-
-            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xF031;}"
-                                       Header="下课后保留多久"
-                                       Description="默认 120 秒。下课之后插件还会盯一会儿课件，把「最后停在第几页」记完，然后彻底退出（秒）。"
-                                       IsVisible="{Binding Settings.AutoStartBeforeClass}">
-                <controls:SettingsExpander.Footer>
-                    <NumericUpDown Width="140" Minimum="0" Maximum="1800" Increment="30"
-                                   VerticalAlignment="Center"
-                                   Value="{Binding Settings.PostClassGraceSeconds, Mode=TwoWay}"/>
-                </controls:SettingsExpander.Footer>
-            </controls:SettingsExpander>
-
-            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xEA2F;}"
-                                       Header="课表外打开课件也加载"
-                                       Description="自习课、临时加课、学校没排课表时的兜底：只要打开 PowerPoint/WPS 就待命，关掉就退出。">
-                <controls:SettingsExpander.Footer>
-                    <ToggleSwitch VerticalAlignment="Center"
-                                  IsChecked="{Binding Settings.ArmOnDeckOpenOutsideClass, Mode=TwoWay}"/>
-                </controls:SettingsExpander.Footer>
-            </controls:SettingsExpander>
-
-            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE7B3;}"
-                                       Header="检测到 PPT 就显示卡片"
-                                       Description="默认开：只要 PowerPoint/WPS 在跑、课件打开着，就显示卡片，不管是不是上课时间。关掉 = 课表时段外一律不显示、下课铃一响就隐藏（插件仍在后台记页码）。">
-                <controls:SettingsExpander.Footer>
-                    <ToggleSwitch VerticalAlignment="Center"
-                                  IsChecked="{Binding Settings.ShowCardOutsideClass, Mode=TwoWay}"/>
-                </controls:SettingsExpander.Footer>
-            </controls:SettingsExpander>
-
-            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE6EF;}"
-                                       Header="历史保留天数"
-                                       Description="默认 21 天（3 周）。更久没用过的课件记录会被自动清理，正在用的课件不受影响。">
-                <controls:SettingsExpander.Footer>
-                    <NumericUpDown Width="140" Minimum="1" Maximum="365" Increment="1"
-                                   VerticalAlignment="Center"
-                                   Value="{Binding Settings.HistoryRetentionDays, Mode=TwoWay}"/>
-                </controls:SettingsExpander.Footer>
-            </controls:SettingsExpander>
-
-            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE9B0;}"
-                                       Header="诊断日志"
-                                       Description="把每次 COM 轮询的结果写进 app.log。排查「没反应」时才需要打开，平时关着。">
-                <controls:SettingsExpander.Footer>
-                    <ToggleSwitch VerticalAlignment="Center"
-                                  IsChecked="{Binding Settings.DiagnosticLog, Mode=TwoWay}"/>
-                </controls:SettingsExpander.Footer>
-            </controls:SettingsExpander>
-
-            <Separator Margin="0 12 0 4" />
-            <ciControls:IconText Glyph="&#xE8B7;" Text="学科课件文件夹" Margin="0 0 0 4" />
-
-            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE8B7;}"
-                                       Header="上课时自动打开本科目的课件文件夹"
-                                       Description="正课一开始，就把当前科目对应的文件夹打开（同一节课只开一次）。科目名取 ClassIsland 课表里的「科目」，所以先让课表认得出这一科。">
-                <controls:SettingsExpander.Footer>
-                    <ToggleSwitch VerticalAlignment="Center"
-                                  IsChecked="{Binding Settings.AutoOpenSubjectFolder, Mode=TwoWay}"/>
-                </controls:SettingsExpander.Footer>
-            </controls:SettingsExpander>
-
-            <!-- 2026-10-31 任务A：打开时机可配置。三档：上课开始时（默认）/上课前 N 分钟/下课后 N 分钟。
-                 下拉的选项来自 Settings.SubjectFolderMomentOptions（顺序 = 枚举值，所以 SelectedIndex 能直接双向绑）；
-                 默认那一项文字后面补一个强调色「（推荐）」，数据本身不改，见下面的 ItemTemplate。
-                 「上课前/下课后」两行只在对应档位出现，由 Settings.ShowBeforeClassOpenMinutes / ShowAfterClassOpenMinutes 控制。 -->
-            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE823;}"
-                                       Header="什么时候打开"
-                                       Description="「上课开始时」是出厂默认（推荐）——正课一打铃就打开。另外两档按当前时间与课表判定，同一节课只打开一次。"
-                                       IsVisible="{Binding Settings.AutoOpenSubjectFolder}">
-                <controls:SettingsExpander.Footer>
-                    <ComboBox x:Name="SubjectFolderMomentCombo"
-                              MinWidth="190"
-                              VerticalAlignment="Center"
-                              HorizontalContentAlignment="Left"
-                              ItemsSource="{Binding Settings.SubjectFolderMomentOptions}"
-                              SelectedIndex="{Binding Settings.SubjectFolderMomentIndex, Mode=TwoWay}">
-                        <ComboBox.ItemTemplate>
-                            <DataTemplate x:DataType="core:ChoiceOption">
-                                <StackPanel Orientation="Horizontal" Spacing="2">
-                                    <TextBlock Text="{Binding Label}" VerticalAlignment="Center"/>
-                                    <!-- 「（推荐）」用主题强调色（浅色主题下是蓝），只在默认项上出现。 -->
-                                    <TextBlock Text="（推荐）"
-                                               VerticalAlignment="Center"
-                                               IsVisible="{Binding IsDefault}"
-                                               Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}"/>
-                                </StackPanel>
-                            </DataTemplate>
-                        </ComboBox.ItemTemplate>
-                    </ComboBox>
-                </controls:SettingsExpander.Footer>
-            </controls:SettingsExpander>
-
-            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE823;}"
-                                       Header="上课前多少分钟"
-                                       Description="打铃前 N 分钟打开这一科的文件夹（0–30 分钟，默认 2）。到点只开一次。"
-                                       IsVisible="{Binding Settings.ShowBeforeClassOpenMinutes}">
-                <controls:SettingsExpander.Footer>
-                    <NumericUpDown Width="140"
-                                   VerticalAlignment="Center"
-                                   Minimum="0"
-                                   Maximum="30"
-                                   Increment="1"
-                                   FormatString="F0"
-                                   Value="{Binding Settings.BeforeClassOpenMinutes, Mode=TwoWay}"/>
-                </controls:SettingsExpander.Footer>
-            </controls:SettingsExpander>
-
-            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE823;}"
-                                       Header="下课后多少分钟"
-                                       Description="下课铃后 N 分钟打开这一节的文件夹（0–30 分钟，默认 2）。到点只开一次。"
-                                       IsVisible="{Binding Settings.ShowAfterClassOpenMinutes}">
-                <controls:SettingsExpander.Footer>
-                    <NumericUpDown Width="140"
-                                   VerticalAlignment="Center"
-                                   Minimum="0"
-                                   Maximum="30"
-                                   Increment="1"
-                                   FormatString="F0"
-                                   Value="{Binding Settings.AfterClassOpenMinutes, Mode=TwoWay}"/>
-                </controls:SettingsExpander.Footer>
-            </controls:SettingsExpander>
-
-            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE8B7;}"
-                                       Header="各科目的文件夹"
-                                       Description="科目名照 ClassIsland 课表里的写法（语文、数学、英语……）。遇到「劳动/英语」这种合写科目，斜杠两边任一匹配都算。"
-                                       IsVisible="{Binding Settings.AutoOpenSubjectFolder}">
-                <StackPanel Spacing="8" Margin="0 4 0 0">
-                    <ItemsControl ItemsSource="{Binding Settings.SubjectFolders}">
-                        <ItemsControl.ItemTemplate>
-                            <DataTemplate x:DataType="core:SubjectFolder">
-                                <Grid ColumnDefinitions="160,*,Auto,Auto" Margin="0 0 0 6">
-                                    <!-- 科目优先给下拉（选项 = 课表里的科目 + 这条记录原来的值）；
-                                         课表没加载/读不出来时，SubjectFolder.UseDropdown 为 false，
-                                         这里就退回原来的可编辑文本框，绝不把旧值弄丢。
-                                         注意：绑定只能落在 x:DataType 指明的 SubjectFolder 成员上。
-                                         以前这里写 $parent[local:SlideSyncSettingsPage].…，Avalonia 会在运行时
-                                         按程序集名 Assembly.Load 解析类型，而插件是动态加载的，直接抛
-                                         FileNotFoundException 把整个设置页打崩（2026-10-24 真机崩溃）。 -->
-                                    <ComboBox Grid.Column="0" Margin="0 0 8 0"
-                                              IsVisible="{Binding UseDropdown}"
-                                              ItemsSource="{Binding Options}"
-                                              SelectedItem="{Binding Subject, Mode=TwoWay}"
-                                              PlaceholderText="语文"
-                                              HorizontalAlignment="Stretch"/>
-                                    <TextBox Grid.Column="0" Margin="0 0 8 0"
-                                             IsVisible="{Binding UseTextBox}"
-                                             Watermark="语文"
-                                             Text="{Binding Subject, Mode=TwoWay}"/>
-                                    <TextBox Grid.Column="1" Watermark="D:\课件\语文"
-                                             Text="{Binding Folder, Mode=TwoWay}"/>
-                                    <Button Grid.Column="2" Margin="8 0 0 0" Content="选择…"
-                                            Tag="{Binding}" Click="OnPickSubjectFolder"/>
-                                    <Button Grid.Column="3" Margin="6 0 0 0" Content="删除"
-                                            Tag="{Binding}" Click="OnRemoveSubjectFolder"/>
-                                </Grid>
-                            </DataTemplate>
-                        </ItemsControl.ItemTemplate>
-                    </ItemsControl>
-                    <StackPanel Orientation="Horizontal" Spacing="10">
-                        <Button Content="添加一行" Click="OnAddSubjectFolder"/>
-                        <TextBlock VerticalAlignment="Center"
-                                   Text="没配的科目不会打开任何文件夹。"
-                                   FontSize="{DynamicResource MainWindowSecondaryFontSize}"
-                                   Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
-                    </StackPanel>
-                </StackPanel>
-            </controls:SettingsExpander>
 
             <Separator Margin="0 12 0 4" />
             <ciControls:IconText Glyph="&#xE523;" Text="卡片外观" Margin="0 0 0 4" />
@@ -572,6 +370,237 @@
                 </controls:SettingsExpander.Footer>
             </controls:SettingsExpander>
 
+
+
+            <TextBlock Text="{Binding Appearance.CardSummary}" TextWrapping="Wrap"
+                       FontSize="{DynamicResource MainWindowSecondaryFontSize}"
+                       Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                       Margin="0 10 0 0"/>
+
+            <Separator Margin="0 16 0 4" />
+            <ciControls:IconText Glyph="&#xE897;" Text="新手引导" Margin="0 0 0 4" />
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE897;}"
+                                       Header="新手引导"
+                                       Description="分 10 步介绍这个插件怎么用：小窗上有什么、翻页怎么记、历史怎么翻、设置怎么调。">
+                <controls:SettingsExpander.Footer>
+                    <Button Content="开始引导" Click="OnStartTutorialClick"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <TextBlock x:Name="GuideHint" IsVisible="False" TextWrapping="Wrap"
+                       FontSize="{DynamicResource MainWindowSecondaryFontSize}"
+                       Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                       Margin="0 6 0 0"/>
+
+
+            <Separator Margin="0 16 0 4" />
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE713;}"
+                                       Header="高级选项"
+                                       Description="不常改的运行时机、学科课件文件夹、显示内容与交互选项收在这里；默认值已够日常使用。">
+                <StackPanel Spacing="4">
+            <Separator Margin="0 12 0 4" />
+            <ciControls:IconText Glyph="&#xE51E;" Text="运行时机" Margin="0 0 0 4" />
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE51E;}"
+                                       Header="上课前自动待命"
+                                       Description="{Binding RuntimeSummary}">
+                <controls:SettingsExpander.Footer>
+                    <ToggleSwitch VerticalAlignment="Center"
+                                  IsChecked="{Binding Settings.AutoStartBeforeClass, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <!-- 功能7：课前预览上次没讲完的课件。直接绑同一个 SyncSettings 实例，
+                 拨动开关立刻写回 Settings.ReadyCardEnabled，不需要额外的保存/刷新代码。 -->
+            <controls:SettingsExpander x:Name="ReadyCardRow"
+                                       IconSource="{ciControls:FluentIconSource &#xE81C;}"
+                                       Header="课前预览上次没讲完的课件"
+                                       Description="上课前两分钟，如果这一科上次没讲完，卡片先亮出来，写着上次停在第几页。关掉就只在真正放映时出现。"
+                                       IsVisible="{Binding Settings.AutoStartBeforeClass}">
+                <controls:SettingsExpander.Footer>
+                    <ToggleSwitch x:Name="ReadyCardToggle"
+                                  VerticalAlignment="Center"
+                                  IsChecked="{Binding Settings.ReadyCardEnabled, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xF031;}"
+                                       Header="提前多少秒待命"
+                                       Description="默认 120 秒，也就是上课前 2 分钟。"
+                                       IsVisible="{Binding Settings.AutoStartBeforeClass}">
+                <controls:SettingsExpander.Footer>
+                    <NumericUpDown Width="140" Minimum="0" Maximum="600" Increment="10"
+                                   VerticalAlignment="Center"
+                                   Value="{Binding Settings.PreClassLeadSeconds, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xF031;}"
+                                       Header="下课后保留多久"
+                                       Description="默认 120 秒。下课之后插件还会盯一会儿课件，把「最后停在第几页」记完，然后彻底退出（秒）。"
+                                       IsVisible="{Binding Settings.AutoStartBeforeClass}">
+                <controls:SettingsExpander.Footer>
+                    <NumericUpDown Width="140" Minimum="0" Maximum="1800" Increment="30"
+                                   VerticalAlignment="Center"
+                                   Value="{Binding Settings.PostClassGraceSeconds, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xEA2F;}"
+                                       Header="课表外打开课件也加载"
+                                       Description="自习课、临时加课、学校没排课表时的兜底：只要打开 PowerPoint/WPS 就待命，关掉就退出。">
+                <controls:SettingsExpander.Footer>
+                    <ToggleSwitch VerticalAlignment="Center"
+                                  IsChecked="{Binding Settings.ArmOnDeckOpenOutsideClass, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE7B3;}"
+                                       Header="检测到 PPT 就显示卡片"
+                                       Description="默认开：只要 PowerPoint/WPS 在跑、课件打开着，就显示卡片，不管是不是上课时间。关掉 = 课表时段外一律不显示、下课铃一响就隐藏（插件仍在后台记页码）。">
+                <controls:SettingsExpander.Footer>
+                    <ToggleSwitch VerticalAlignment="Center"
+                                  IsChecked="{Binding Settings.ShowCardOutsideClass, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE6EF;}"
+                                       Header="课前回看天数"
+                                       Description="默认 21 天（3 周）。只决定课前「打开并接着讲」往回找多久没讲完的课件；缓存区不会自动清空，记录一直留着。">
+                <controls:SettingsExpander.Footer>
+                    <NumericUpDown Width="140" Minimum="1" Maximum="365" Increment="1"
+                                   VerticalAlignment="Center"
+                                   Value="{Binding Settings.HistoryRetentionDays, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE9B0;}"
+                                       Header="诊断日志"
+                                       Description="把每次 COM 轮询的结果写进 app.log。排查「没反应」时才需要打开，平时关着。">
+                <controls:SettingsExpander.Footer>
+                    <ToggleSwitch VerticalAlignment="Center"
+                                  IsChecked="{Binding Settings.DiagnosticLog, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+            <Separator Margin="0 12 0 4" />
+            <ciControls:IconText Glyph="&#xE8B7;" Text="学科课件文件夹" Margin="0 0 0 4" />
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE8B7;}"
+                                       Header="上课时自动打开本科目的课件文件夹"
+                                       Description="正课一开始，就把当前科目对应的文件夹打开（同一节课只开一次）。科目名取 ClassIsland 课表里的「科目」，所以先让课表认得出这一科。">
+                <controls:SettingsExpander.Footer>
+                    <ToggleSwitch VerticalAlignment="Center"
+                                  IsChecked="{Binding Settings.AutoOpenSubjectFolder, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <!-- 2026-10-31 任务A：打开时机可配置。三档：上课开始时（默认）/上课前 N 分钟/下课后 N 分钟。
+                 下拉的选项来自 Settings.SubjectFolderMomentOptions（顺序 = 枚举值，所以 SelectedIndex 能直接双向绑）；
+                 默认那一项文字后面补一个强调色「（推荐）」，数据本身不改，见下面的 ItemTemplate。
+                 「上课前/下课后」两行只在对应档位出现，由 Settings.ShowBeforeClassOpenMinutes / ShowAfterClassOpenMinutes 控制。 -->
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE823;}"
+                                       Header="什么时候打开"
+                                       Description="「上课开始时」是出厂默认（推荐）——正课一打铃就打开。另外两档按当前时间与课表判定，同一节课只打开一次。"
+                                       IsVisible="{Binding Settings.AutoOpenSubjectFolder}">
+                <controls:SettingsExpander.Footer>
+                    <ComboBox x:Name="SubjectFolderMomentCombo"
+                              MinWidth="190"
+                              VerticalAlignment="Center"
+                              HorizontalContentAlignment="Left"
+                              ItemsSource="{Binding Settings.SubjectFolderMomentOptions}"
+                              SelectedIndex="{Binding Settings.SubjectFolderMomentIndex, Mode=TwoWay}">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="core:ChoiceOption">
+                                <StackPanel Orientation="Horizontal" Spacing="2">
+                                    <TextBlock Text="{Binding Label}" VerticalAlignment="Center"/>
+                                    <!-- 「（推荐）」用主题强调色（浅色主题下是蓝），只在默认项上出现。 -->
+                                    <TextBlock Text="（推荐）"
+                                               VerticalAlignment="Center"
+                                               IsVisible="{Binding IsDefault}"
+                                               Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}"/>
+                                </StackPanel>
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE823;}"
+                                       Header="上课前多少分钟"
+                                       Description="打铃前 N 分钟打开这一科的文件夹（0–30 分钟，默认 2）。到点只开一次。"
+                                       IsVisible="{Binding Settings.ShowBeforeClassOpenMinutes}">
+                <controls:SettingsExpander.Footer>
+                    <NumericUpDown Width="140"
+                                   VerticalAlignment="Center"
+                                   Minimum="0"
+                                   Maximum="30"
+                                   Increment="1"
+                                   FormatString="F0"
+                                   Value="{Binding Settings.BeforeClassOpenMinutes, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE823;}"
+                                       Header="下课后多少分钟"
+                                       Description="下课铃后 N 分钟打开这一节的文件夹（0–30 分钟，默认 2）。到点只开一次。"
+                                       IsVisible="{Binding Settings.ShowAfterClassOpenMinutes}">
+                <controls:SettingsExpander.Footer>
+                    <NumericUpDown Width="140"
+                                   VerticalAlignment="Center"
+                                   Minimum="0"
+                                   Maximum="30"
+                                   Increment="1"
+                                   FormatString="F0"
+                                   Value="{Binding Settings.AfterClassOpenMinutes, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE8B7;}"
+                                       Header="各科目的文件夹"
+                                       Description="科目名照 ClassIsland 课表里的写法（语文、数学、英语……）。遇到「劳动/英语」这种合写科目，斜杠两边任一匹配都算。"
+                                       IsVisible="{Binding Settings.AutoOpenSubjectFolder}">
+                <StackPanel Spacing="8" Margin="0 4 0 0">
+                    <ItemsControl ItemsSource="{Binding Settings.SubjectFolders}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="core:SubjectFolder">
+                                <Grid ColumnDefinitions="160,*,Auto,Auto" Margin="0 0 0 6">
+                                    <!-- 科目优先给下拉（选项 = 课表里的科目 + 这条记录原来的值）；
+                                         课表没加载/读不出来时，SubjectFolder.UseDropdown 为 false，
+                                         这里就退回原来的可编辑文本框，绝不把旧值弄丢。
+                                         注意：绑定只能落在 x:DataType 指明的 SubjectFolder 成员上。
+                                         以前这里写 $parent[local:SlideSyncSettingsPage].…，Avalonia 会在运行时
+                                         按程序集名 Assembly.Load 解析类型，而插件是动态加载的，直接抛
+                                         FileNotFoundException 把整个设置页打崩（2026-10-24 真机崩溃）。 -->
+                                    <ComboBox Grid.Column="0" Margin="0 0 8 0"
+                                              IsVisible="{Binding UseDropdown}"
+                                              ItemsSource="{Binding Options}"
+                                              SelectedItem="{Binding Subject, Mode=TwoWay}"
+                                              PlaceholderText="语文"
+                                              HorizontalAlignment="Stretch"/>
+                                    <TextBox Grid.Column="0" Margin="0 0 8 0"
+                                             IsVisible="{Binding UseTextBox}"
+                                             Watermark="语文"
+                                             Text="{Binding Subject, Mode=TwoWay}"/>
+                                    <TextBox Grid.Column="1" Watermark="D:\课件\语文"
+                                             Text="{Binding Folder, Mode=TwoWay}"/>
+                                    <Button Grid.Column="2" Margin="8 0 0 0" Content="选择…"
+                                            Tag="{Binding}" Click="OnPickSubjectFolder"/>
+                                    <Button Grid.Column="3" Margin="6 0 0 0" Content="删除"
+                                            Tag="{Binding}" Click="OnRemoveSubjectFolder"/>
+                                </Grid>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                    <StackPanel Orientation="Horizontal" Spacing="10">
+                        <Button Content="添加一行" Click="OnAddSubjectFolder"/>
+                        <TextBlock VerticalAlignment="Center"
+                                   Text="没配的科目不会打开任何文件夹。"
+                                   FontSize="{DynamicResource MainWindowSecondaryFontSize}"
+                                   Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+                    </StackPanel>
+                </StackPanel>
+            </controls:SettingsExpander>
             <Separator Margin="0 12 0 4" />
             <ciControls:IconText Glyph="&#xE6EF;" Text="显示内容" Margin="0 0 0 4" />
 
@@ -607,7 +636,6 @@
                     </controls:SettingsExpanderItem.Footer>
                 </controls:SettingsExpanderItem>
             </controls:SettingsExpander>
-
             <Separator Margin="0 12 0 4" />
             <ciControls:IconText Glyph="&#xF031;" Text="交互" Margin="0 0 0 4" />
 
@@ -636,28 +664,8 @@
                     <Button Content="显示卡片" Click="OnPreviewClick"/>
                 </controls:SettingsExpander.Footer>
             </controls:SettingsExpander>
-
-            <TextBlock Text="{Binding Appearance.CardSummary}" TextWrapping="Wrap"
-                       FontSize="{DynamicResource MainWindowSecondaryFontSize}"
-                       Foreground="{DynamicResource TextFillColorSecondaryBrush}"
-                       Margin="0 10 0 0"/>
-
-            <Separator Margin="0 16 0 4" />
-            <ciControls:IconText Glyph="&#xE897;" Text="新手引导" Margin="0 0 0 4" />
-
-            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE897;}"
-                                       Header="新手引导"
-                                       Description="分 10 步介绍这个插件怎么用：小窗上有什么、翻页怎么记、历史怎么翻、设置怎么调。">
-                <controls:SettingsExpander.Footer>
-                    <Button Content="开始引导" Click="OnStartTutorialClick"/>
-                </controls:SettingsExpander.Footer>
+                </StackPanel>
             </controls:SettingsExpander>
-
-            <TextBlock x:Name="GuideHint" IsVisible="False" TextWrapping="Wrap"
-                       FontSize="{DynamicResource MainWindowSecondaryFontSize}"
-                       Foreground="{DynamicResource TextFillColorSecondaryBrush}"
-                       Margin="0 6 0 0"/>
-
         </StackPanel>
     </ScrollViewer>
 </ci:SettingsPageBase>
