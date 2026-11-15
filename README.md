@@ -6,7 +6,7 @@
 
 ▶ 点开上图看演示（B 站，28 秒）
 
-支持 PowerPoint、WPS 演示、希沃白板 ｜ 需要 ClassIsland 2.1.0.1 及以上 ｜ Windows 10 及以上 / Linux x64 ｜ 只在本地记，不联网
+支持 PowerPoint、WPS 演示、希沃白板 ｜ 需要 ClassIsland 2.1.0.1 及以上（含 2.2 预览） ｜ Windows 10 及以上 / Linux x64 ｜ 只在本地记，不联网
 
 ## 下载插件
 
@@ -18,6 +18,8 @@
 | Linux 通用版（ClassIsland 2.x） | [ClassSlideSync.Plugin.cipx · 最新版](https://github.com/KKT446/ClassSlideSync/releases/latest/download/ClassSlideSync.Plugin.cipx)（同一个包；Linux 上还要按 `tools/linux-adapters/` 装一个页码适配器） |
 
 > 还没装 ClassIsland 的话：去 [ClassIsland Releases · latest](https://github.com/ClassIsland/ClassIsland/releases/latest) 下 Windows 的 `ClassIsland_app_windows_x64_full_folder.zip`，或 Linux 的 `ClassIsland_app_linux_x64_selfContained_folder.zip`（也可以直接装 `ClassIsland_app_linux_x64_selfContained_deb.deb`）。
+
+> 兼容性：当前包已在 ClassIsland **2.2（2.1.2.0 开发者预览）** 上实测可加载、可正常记录页码，无需换包；2.1.0.1 及以上直接安装即可。
 
 ## 安装
 

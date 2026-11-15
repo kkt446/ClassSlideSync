@@ -15,8 +15,8 @@
     </PropertyGroup>
 
     <PropertyGroup>
-        <!-- Must match the installed ClassIsland build (2.1.0.1 here): compiling against a newer
-             SDK than the host is the one combination that can reference APIs the host lacks. -->
+        <!-- 2.1.2 的 SDK 只发 net10.0 资产，而 2.1.0.1 宿主是 net8.0：插件继续按 net8.0 + 2.1.0.1 编译，
+             net10.0 宿主可以加载 net8.0 程序集；实测见 docs/reports/cisland-2.1.2.md。 -->
         <ClassIslandPluginSdkVersion>2.1.0.1</ClassIslandPluginSdkVersion>
     </PropertyGroup>
 
