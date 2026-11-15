@@ -514,6 +514,18 @@ namespace ClassSlideSync.Plugin.Core
                     int mine = bridge.DeckScore;   // 3=有真课件 2=只有没存过的空白稿 1=什么都没有 0=死的
                     swVerify.Stop();
                     NoteComCost("DeckScore", swVerify.ElapsedMilliseconds);
+                    if (mine == 0)
+                    {
+                        // 2026-11-15：WPS 结束放映后自动化服务退出登记，指针变成死壳。留在手里
+                        // 只会让下一次点「接着讲」走进 OpenDeck 的“拿不到 Presentations 集合”。
+                        // 直接丢掉：Step 的空桥分支每 1.2 秒重连；实在没有自动化时卡片走标题兜底，
+                        // 老师点跳页则由 DoJump 里的 Launch 兜底。
+                        ledger.Log("bridge is dead (score=0) -- dropped, will reattach");
+                        DropBridge();
+                        ApplyTitleFallback();
+                        Push(false, 0, 0);
+                        return;
+                    }
                     if (mine < 3)
                     {
                         var swFresh = System.Diagnostics.Stopwatch.StartNew();
@@ -1392,26 +1404,61 @@ namespace ClassSlideSync.Plugin.Core
             }
 
             var b = bridge;
+            // 2026-11-15 用户实测「点接着讲不跳转」：WPS 结束放映后自动化服务会退出登记
+            // （wpp.exe 没了、ROT 清空），手里这个 COM 指针就成了"死壳"——Snapshot 安静地
+            // 报 0/0、DeckScore=0，但旧代码照样拿它去 JumpToSlide，OpenDeck 只能报
+            // “拿不到 Presentations 集合”。判据与空闲校验同一把尺子：0 = 连 Name /
+            // Presentations 都问不出来。丢掉死壳，让下面的兜底按"老师正在用的套件"重来。
+            if (b != null && b.DeckScore == 0)
+            {
+                ledger.Log("jump: bridge is dead (score=0) -- dropping it");
+                DropBridge();
+                b = null;
+            }
             if (b == null)
             {
-                // 老师点了“从第 N 页开始放映”，这时候连 PowerPoint 一起拉起来才是他要的。
-                SetStatus("正在打开 PowerPoint…");
-                b = PptBridge.Launch(jumpPath);
-                if (b == null) { SetStatus("打不开 PowerPoint"); return; }
+                // 刚打开/刚重开的 WPS 要几秒才登记自动化（2026-11-15 实测：8 秒内就点会落空）。
+                // 先给它 2 秒，避免"先拉起第二个实例"这种更吵的兜底。
+                SetStatus("正在连接演示软件…");
+                for (int i = 0; i < 4 && b == null; i++)
+                {
+                    if (i > 0) System.Threading.Thread.Sleep(500);
+                    b = PptBridge.Connect();
+                }
+                if (b == null)
+                {
+                    // 老师点了“从第 N 页开始放映”，这时候连 PowerPoint 一起拉起来才是他要的。
+                    SetStatus("正在打开演示软件…");
+                    b = PptBridge.Launch(jumpPath);
+                }
+                if (b == null) { SetStatus("打不开演示软件"); return; }
                 bridge = b;   // 让后面的轮询也用上这个实例
-                ledger.Log("jump: launched " + b.ProgId + " for " + jumpPath);
+                ledger.Log("jump: attached " + b.Label + " via " + b.ProgId
+                           + " [mode=" + b.AttachMode + "] for " + jumpPath);
             }
 
             bool wasShowing = last != null && last.Showing;
             var sw = System.Diagnostics.Stopwatch.StartNew();
             var err = b.JumpToSlide(target, settings.JumpResetsAnimation, jumpPath);
+            // 指针在跳页途中烂掉（WPS 结束放映时偶发）：不再让老师点第二下，换一次重跳。
+            if (err.Length > 0 && b.DeckScore == 0)
+            {
+                DropBridge();
+                SetStatus("正在重新连接演示软件…");
+                b = PptBridge.Launch(jumpPath);
+                if (b != null)
+                {
+                    bridge = b;
+                    err = b.JumpToSlide(target, settings.JumpResetsAnimation, jumpPath);
+                }
+            }
             sw.Stop();
             SetStatus(err.Length == 0
                 ? (wasShowing ? "已跳到第 " + target + " 页" : "已从第 " + target + " 页开始放映")
                 : err);
             ledger.Log("jump -> " + target + " : " + (err.Length == 0 ? "ok" : err)
                 + " (" + sw.ElapsedMilliseconds + " ms"
-                + (string.IsNullOrEmpty(b.LastViewRoute) ? "" : ", view=" + b.LastViewRoute) + ")");
+                + (b == null || string.IsNullOrEmpty(b.LastViewRoute) ? "" : ", view=" + b.LastViewRoute) + ")");
         }
 
         /// <summary>Clear the one-off status line shown on the card.</summary>

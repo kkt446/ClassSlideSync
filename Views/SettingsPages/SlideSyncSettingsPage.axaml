@@ -477,6 +477,15 @@
                 </controls:SettingsExpander.Footer>
             </controls:SettingsExpander>
 
+            <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE72E;}"
+                                       Header="以管理员身份运行时自动降权重启"
+                                       Description="ClassIsland 被「以管理员身份运行」时，Windows 禁止它读普通权限的 PowerPoint / WPS，卡片永远认不出课件。打开后：启动时发现是高权限，就自动关闭并用普通权限重新打开（只需几秒）。关掉则保持现状，只在卡片上提示权限不一致。">
+                <controls:SettingsExpander.Footer>
+                    <ToggleSwitch VerticalAlignment="Center"
+                                  IsChecked="{Binding Settings.AutoDeElevate, Mode=TwoWay}"/>
+                </controls:SettingsExpander.Footer>
+            </controls:SettingsExpander>
+
             <controls:SettingsExpander IconSource="{ciControls:FluentIconSource &#xE9B0;}"
                                        Header="诊断日志"
                                        Description="把每次 COM 轮询的结果写进 app.log。排查「没反应」时才需要打开，平时关着。">

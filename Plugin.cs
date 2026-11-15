@@ -141,6 +141,11 @@ public class Plugin : PluginBase
             LogAutomationRegistrations(Service);
             try { Service.Start(); }
             catch (Exception ex) { Service?.Ledger?.Log("启动失败: " + ex); }
+
+            // 2026-11-15：宿主被「以管理员身份运行」时，Windows 禁止它读普通权限 Office 的 COM，
+            // 插件读不到课件也跳不了页。默认自动降权重启一次（设置里可关），放在 Service.Start()
+            // 之后：先让服务自己试，重启走宿主正常退出流程（台账、设置都已落盘）。
+            DeElevation.MaybeRestart(Settings, PluginConfigFolder, Service?.Ledger);
         };
 
         AppBase.Current.AppStopping += (_, _) =>

@@ -31,6 +31,9 @@ namespace ClassSlideSync.Plugin.Core
         bool showCardOutsideClass = true;
         int historyRetentionDays = 21;
         bool diagnosticLog = false;
+        // 2026-11-15：ClassIsland 被「以管理员身份运行」时，Windows 会禁止它读普通权限 Office 的
+        // COM（卡片永远识别不到课件、跳不了页）。默认开：启动后发现是高权限就自动降权重启一次。
+        bool autoDeElevate = true;
 
         // ---- 外观（UI 自定义；解析与优先级见 Core/Appearance.cs）----
         bool followClassIslandTheme = true;
@@ -233,6 +236,17 @@ namespace ClassSlideSync.Plugin.Core
         {
             get { return diagnosticLog; }
             set { Set(ref diagnosticLog, value); }
+        }
+
+        /// <summary>
+        /// 自动降权重启：ClassIsland 被以管理员身份启动时，关闭并立刻用普通权限重新打开。
+        /// 管理员权限下 Windows 不允许跨权限读 Office 的 COM，插件会完全读不到课件；
+        /// 关掉这个开关就保持现状（继续显示"权限不一致"的提示）。
+        /// </summary>
+        public bool AutoDeElevate
+        {
+            get { return autoDeElevate; }
+            set { Set(ref autoDeElevate, value); }
         }
 
         // ---- 外观属性 ----------------------------------------------------------

@@ -167,6 +167,52 @@ namespace ClassSlideSync.Plugin.Core
         static readonly string[] SuiteQtFrameClasses = { "Qt5QWindowIcon" };
 
         /// <summary>
+        /// 老师此刻正在用的是哪个套件（"WPS" / "PowerPoint" / 空）。两个套件都装着时，
+        /// 跳页兜底要用同一个：2026-11-15 实测，WPS 的老师点「接着讲」，Launch 先试
+        /// PowerPoint.Application，结果真的拉起了微软 PowerPoint 去放这份课件。
+        /// 判据只用窗口（类名 + 进程名 + 标题里的课件扩展名），不碰 COM，几十微秒。
+        /// </summary>
+        public static string OnScreenSuite()
+        {
+            if (!PlatformGuard.IsWindows) { PlatformGuard.Announce("ppt-bridge:on-screen-suite"); return ""; }
+            string kind = "";
+            EnumWindowsProc cb = delegate (IntPtr h, IntPtr lparam)
+            {
+                try
+                {
+                    if (!IsWindowVisible(h)) return true;
+                    var cls = new StringBuilder(64);
+                    GetClassNameW(h, cls, cls.Capacity);
+                    string c = cls.ToString();
+                    var txt = new StringBuilder(512);
+                    GetWindowTextW(h, txt, txt.Capacity);
+                    uint pid;
+                    GetWindowThreadProcessId(h, out pid);
+                    string proc = "";
+                    try
+                    {
+                        using (var p = System.Diagnostics.Process.GetProcessById((int)pid))
+                            proc = p.ProcessName;
+                    }
+                    catch { }
+
+                    bool wps = c == "PP12FrameClass"
+                               || proc.Equals("wpp", StringComparison.OrdinalIgnoreCase)
+                               || (proc.Equals("wps", StringComparison.OrdinalIgnoreCase)
+                                   && DocumentFromTitle(txt.ToString()).Length > 0);
+                    bool ppt = c == "PPTFrameClass" || proc.Equals("POWERPNT", StringComparison.OrdinalIgnoreCase);
+                    if (wps && !ppt) { kind = "WPS"; return false; }
+                    if (ppt && !wps) { kind = "PowerPoint"; return false; }
+                }
+                catch { }
+                return true;
+            };
+            try { EnumWindows(cb, IntPtr.Zero); } catch { }
+            GC.KeepAlive(cb);
+            return kind;
+        }
+
+        /// <summary>
         /// 这些进程的窗口才可能是演示窗口。wps.exe 只出现在这里、**不**进 SuiteProcessNames：
         /// 它是开机常驻的（WPS 文字/表格也用），进了进程判据卡片就永远关不掉。
         /// </summary>
@@ -520,6 +566,20 @@ namespace ClassSlideSync.Plugin.Core
         }
 
         /// <summary>
+        /// Launch 兜底时按"老师正在用的套件"排先后：WPS 的老师不会被塞给 PowerPoint，
+        /// 反之亦然。没有可见套件窗口时保持原顺序（PowerPoint 在前，兼容老机器）。
+        /// </summary>
+        static string[] LaunchProgIds()
+        {
+            string suite = OnScreenSuite();
+            if (suite == "WPS")
+                return new[] { "Kwpp.Application", "WPP.Application", "wpp.Application", "PowerPoint.Application" };
+            if (suite == "PowerPoint")
+                return new[] { "PowerPoint.Application", "Kwpp.Application", "WPP.Application", "wpp.Application" };
+            return LiveProgIds;
+        }
+
+        /// <summary>
         /// 老师主动点了卡片上的“从第 N 页开始放映”：这时候可以真的把 PowerPoint 拉起来。
         /// 与 <see cref="Connect"/> 的克制是两回事——Connect 是后台轮询，不能凭空启动一个老师
         /// 根本没要的程序；这里是用户自己按下去的按钮，拉不起来才是 bug。
@@ -537,7 +597,7 @@ namespace ClassSlideSync.Plugin.Core
             var existing = Connect();
             if (existing != null) return existing;
 
-            foreach (var pid in LiveProgIds)
+            foreach (var pid in LaunchProgIds())
             {
                 try
                 {
