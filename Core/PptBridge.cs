@@ -107,21 +107,25 @@ namespace ClassSlideSync.Plugin.Core
             void Load(object pStm);
             void Save(object pStm, bool fClearDirty);
             void GetSizeMax(out long pcbSize);
-            void BindToObject(object pbc, object pmkToLeft, ref Guid riidResult, [MarshalAs(UnmanagedType.Interface)] out object ppvResult);
-            void BindToStorage(object pbc, object pmkToLeft, ref Guid riid, [MarshalAs(UnmanagedType.Interface)] out object ppvObj);
-            void Reduce(object pmkToLeft, object pmkToRight, object pbc, int dwReduceHowFar, ref object ppmkToLeft, out IMoniker ppmkReduced);
+            // 参数类型一律写具体的 COM 接口，不要用 object：
+            // .NET 10 把 object 形参按 VARIANT 封送，而 IMoniker 的原生签名要的是接口指针，
+            // 系统 moniker 会把 VARIANT* 当 IBindCtx* 用，写坏调用方栈后直接 fastfail
+            // （0xc0000409，2026-11-18 ClassIsland 2.2 / net10 x86 闪退）。
+            void BindToObject(IBindCtx pbc, IMoniker pmkToLeft, ref Guid riidResult, [MarshalAs(UnmanagedType.Interface)] out object ppvResult);
+            void BindToStorage(IBindCtx pbc, IMoniker pmkToLeft, ref Guid riid, [MarshalAs(UnmanagedType.Interface)] out object ppvObj);
+            void Reduce(IBindCtx pbc, int dwReduceHowFar, ref IMoniker ppmkToLeft, out IMoniker ppmkReduced);
             void ComposeWith(IMoniker pmkRight, bool fOnlyIfNotGeneric, out IMoniker ppmkComposite);
             void Enum(bool fForward, out IEnumMoniker ppenumMoniker);
             void IsEqual(IMoniker pmkOtherMoniker);
             void Hash(out int pdwHash);
-            void IsRunning(object pbc, object pmkToLeft, object pmkNewlyRunning);
-            void GetTimeOfLastChange(object pbc, object pmkToLeft, out System.Runtime.InteropServices.ComTypes.FILETIME pFileTime);
+            void IsRunning(IBindCtx pbc, IMoniker pmkToLeft, IMoniker pmkNewlyRunning);
+            void GetTimeOfLastChange(IBindCtx pbc, IMoniker pmkToLeft, out System.Runtime.InteropServices.ComTypes.FILETIME pFileTime);
             void Inverse(out IMoniker ppmk);
             void CommonPrefixWith(IMoniker pmkOther, out IMoniker ppmkPrefix);
             void RelativePathTo(IMoniker pmkOther, out IMoniker ppmkRelPath);
-            [PreserveSig] int GetDisplayName(object pbc, object pmkToLeft, out IntPtr ppszDisplayName);
+            [PreserveSig] int GetDisplayName(IBindCtx pbc, IMoniker pmkToLeft, out IntPtr ppszDisplayName);
             // HRESULT 失败时 out 里是垃圾指针，交给 marshaler 翻译就是 0xc0000005，所以自己看。
-            void ParseDisplayName(object pbc, object pmkToLeft, [MarshalAs(UnmanagedType.LPWStr)] string pszDisplayName, out int pchEaten, out IMoniker ppmkOut);
+            void ParseDisplayName(IBindCtx pbc, IMoniker pmkToLeft, [MarshalAs(UnmanagedType.LPWStr)] string pszDisplayName, out int pchEaten, out IMoniker ppmkOut);
             void IsSystemMoniker(out int pdwMksys);
         }
 

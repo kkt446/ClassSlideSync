@@ -125,6 +125,10 @@ docs/reports/                   本地审计与测试报告（不入库）
 
 ## 更新日志
 
+### 1.2.7.3（2026-11-18）
+
+- 修掉 2.2（net10）下打开课件时整个 ClassIsland 卡死闪退（`0xc0000409`）：ROT 里枚举演示软件时，`IMoniker.GetDisplayName` 的 `object` 形参在 .NET 10 按 VARIANT 封送，系统 moniker 却按接口指针使用，写坏调用方栈触发 fastfail。参数改为 `IBindCtx`/`IMoniker` 强类型，2.1 与 2.2 都好用
+
 ### 1.2.7.2（2026-11-18）
 
 - 兼容 ClassIsland 2.2（2.1.2.0 开发者预览）：宿主升级到 Avalonia 12 + FluentAvalonia 3.0，设置页原先会报「未知错误」打不开。设置页与控制面板不再依赖 FluentAvalonia 的展开卡片，改为插件自绘的同款卡片，两代宿主通用
