@@ -50,8 +50,34 @@ if (-not $shell) { throw "找不到 pwsh / PowerShell" }
 Write-Host "dotnet : $dotnet"
 Write-Host "shell  : $shell"
 
+# 两代宿主二进制不通用（Avalonia 11 vs 12），各出一个包：
+#   ClassSlideSync.Plugin.cipx        net8  —— ClassIsland 2.1.x
+#   ClassSlideSync.Plugin.net10.cipx  net10 —— ClassIsland 2.2（2.1.2.0，Avalonia 12）
 & $dotnet build $proj -c $Configuration -p:CreateCipx=true -p:PowershellBinaryName="$shell"
-if ($LASTEXITCODE -ne 0) { throw "打包失败" }
+if ($LASTEXITCODE -ne 0) { throw "net8 打包失败" }
 
-Get-ChildItem (Join-Path $PSScriptRoot "cipx") | Select-Object Name, Length | Format-Table -AutoSize
-Write-Host "好了，把 cipx\ClassSlideSync.Plugin.cipx 丢给 ClassIsland 的「导入插件包」即可。"
+$cipxDir = Join-Path $PSScriptRoot "cipx"
+# 后一次 CreateCipx 会清空 cipx 目录，先把 net8 的产物挪出去
+$stash = Join-Path ([IO.Path]::GetTempPath()) ("css8-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $stash | Out-Null
+Copy-Item (Join-Path $cipxDir "ClassSlideSync.Plugin.cipx") $stash
+
+$proj10 = Join-Path $PSScriptRoot "ClassSlideSync.Plugin.Net10.csproj"
+if (-not (Test-Path $proj10)) { throw "找不到 $proj10" }
+& $dotnet build $proj10 -c $Configuration -p:CreateCipx=true -p:PowershellBinaryName="$shell"
+if ($LASTEXITCODE -ne 0) { throw "net10 打包失败" }
+
+$raw10 = Join-Path $cipxDir "ClassSlideSync.Plugin.Net10.cipx"
+if (Test-Path $raw10) { Move-Item -Force $raw10 (Join-Path $cipxDir "ClassSlideSync.Plugin.net10.cipx") }
+Copy-Item (Join-Path $stash "ClassSlideSync.Plugin.cipx") $cipxDir
+Remove-Item -Recurse -Force $stash
+
+$md5 = @{}
+foreach ($f in Get-ChildItem $cipxDir -Filter *.cipx) {
+    $md5[$f.Name] = (Get-FileHash $f.FullName -Algorithm MD5).Hash
+}
+$json = ($md5 | ConvertTo-Json -Compress) -replace ' ','' 
+Set-Content -Path (Join-Path $cipxDir "checksums.md") -Encoding UTF8 -Value "<!-- CLASSISLAND_PKG_MD5 $json -->"
+
+Get-ChildItem $cipxDir | Select-Object Name, Length | Format-Table -AutoSize
+Write-Host "好了：ClassIsland 2.1.x 用 cipx\ClassSlideSync.Plugin.cipx；2.2（2.1.2.0 预览）用 cipx\ClassSlideSync.Plugin.net10.cipx。"

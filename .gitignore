@@ -1,6 +1,8 @@
 # 编译产物
 bin/
 obj/
+bin10/
+obj10/
 cipx/
 *.user
 *.pdb

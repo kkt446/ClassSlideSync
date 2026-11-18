@@ -10,20 +10,22 @@
 
 ## 下载插件
 
-直接下我们插件的安装包。Windows 和 Linux 用的是**同一个** `.cipx`，装好后导入 ClassIsland 即可：
+ClassIsland 2.1.x 和 2.2 预览用的是两代 Avalonia（11 / 12），程序二进制不通用，所以按宿主任选一个包导入即可：
 
-| 平台 | 下载 |
+| 你的 ClassIsland | 下载 |
 | --- | --- |
-| Windows（ClassIsland 2.x） | [ClassSlideSync.Plugin.cipx · 最新版](https://github.com/KKT446/ClassSlideSync/releases/latest/download/ClassSlideSync.Plugin.cipx) |
-| Linux 通用版（ClassIsland 2.x） | [ClassSlideSync.Plugin.cipx · 最新版](https://github.com/KKT446/ClassSlideSync/releases/latest/download/ClassSlideSync.Plugin.cipx)（同一个包；Linux 上还要按 `tools/linux-adapters/` 装一个页码适配器） |
+| 2.2 预览（2.1.2.0） | [ClassSlideSync.Plugin.net10.cipx · 最新版](https://github.com/KKT446/ClassSlideSync/releases/latest/download/ClassSlideSync.Plugin.net10.cipx) |
+| 2.1.x（2.1.0.1 及以上，Windows / Linux 同一个包） | [ClassSlideSync.Plugin.cipx · 最新版](https://github.com/KKT446/ClassSlideSync/releases/latest/download/ClassSlideSync.Plugin.cipx) |
+
+> Linux 上还要按 `tools/linux-adapters/` 装一个页码适配器。
 
 > 还没装 ClassIsland 的话：去 [ClassIsland Releases · latest](https://github.com/ClassIsland/ClassIsland/releases/latest) 下 Windows 的 `ClassIsland_app_windows_x64_full_folder.zip`，或 Linux 的 `ClassIsland_app_linux_x64_selfContained_folder.zip`（也可以直接装 `ClassIsland_app_linux_x64_selfContained_deb.deb`）。
 
-> 兼容性：当前包已在 ClassIsland **2.2（2.1.2.0 开发者预览）** 上实测可加载、可正常记录页码，无需换包；2.1.0.1 及以上直接安装即可。
+> 兼容性：2.2（2.1.2.0 开发者预览）用 `ClassSlideSync.Plugin.net10.cipx`，2.1.0.1 – 2.1.x 用 `ClassSlideSync.Plugin.cipx`。装错包的表现是设置页打不开或插件加载失败，换另一个包即可。
 
 ## 安装
 
-1. ClassIsland 2.1 → **应用设置 → 插件 → 导入插件包**，选下载好的 ClassSlideSync.Plugin.cipx（也可以在插件市场里直接搜「课件续页」）。
+1. ClassIsland → **应用设置 → 插件 → 导入插件包**，按上表选对应版本的 `.cipx`（2.1.x 也可以在插件市场里直接搜「课件续页」）。
 2. 打开任意一份课件：屏幕边上会弹出小窗，写着「上次停在第 N 页」。
 3. 进 **应用设置 → 插件 → 课件续页** 可以调卡片样式、配学科文件夹、跑一遍新手引导。
 
@@ -122,6 +124,12 @@ docs/reports/                   本地审计与测试报告（不入库）
 - Linux 上页码要靠随包适配器（`tools/linux-adapters/`）：LibreOffice Impress 已实测可用，WPS Linux 只在 12.1.2 上验证到「加载项被登记但不执行」，属实验性。
 
 ## 更新日志
+
+### 1.2.7.2（2026-11-18）
+
+- 兼容 ClassIsland 2.2（2.1.2.0 开发者预览）：宿主升级到 Avalonia 12 + FluentAvalonia 3.0，设置页原先会报「未知错误」打不开。设置页与控制面板不再依赖 FluentAvalonia 的展开卡片，改为插件自绘的同款卡片，两代宿主通用
+- 新增 2.2 专用安装包 `ClassSlideSync.Plugin.net10.cipx`；2.1.x 继续用 `ClassSlideSync.Plugin.cipx`，两个包功能一致
+- 卡片左侧图标改用 ClassIsland 自带的 FluentIcon，不再出现方框
 
 ### 1.2.7.1（2026-11-15）
 

@@ -12,6 +12,9 @@
              .runtimeconfig.json that the ClassIsland loader (and every plugin already installed
              under data\Plugins) ships, and makes the SDK resolve dependencies from the host. -->
         <EnableDynamicLoading>true</EnableDynamicLoading>
+        <!-- net10 变体（ClassIsland 2.2 / Avalonia 12）用同一份源码、单独的中间输出目录，
+             这里把它的产物排除在主工程的通配之外，否则两边会重复生成 AssemblyInfo 特性。 -->
+        <DefaultItemExcludes>$(DefaultItemExcludes);obj10\**;bin10\**</DefaultItemExcludes>
     </PropertyGroup>
 
     <PropertyGroup>

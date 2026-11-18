@@ -1,0 +1,79 @@
+<ResourceDictionary xmlns="https://github.com/avaloniaui"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:ui="clr-namespace:ClassSlideSync.Plugin.Ui"
+                    xmlns:ciControls="clr-namespace:ClassIsland.Core.Controls;assembly=ClassIsland.Core">
+
+    <!--
+      设置卡片的主题。配色一律取宿主主题资源（FluentAvalonia 2.x / 3.0 都提供这些键），
+      不写死颜色，换主题/夜间模式时跟着变。
+
+      控件本体见 Ui/SettingsCard.cs：为什么不直接用 FluentAvalonia 的 SettingsExpander，
+      那里有完整说明（2.2 宿主把它改名成 FASettingsExpander 了）。
+    -->
+    <ControlTheme x:Key="{x:Type ui:SettingsCard}" TargetType="ui:SettingsCard">
+        <Setter Property="Margin" Value="0 0 0 4" />
+        <Setter Property="HorizontalAlignment" Value="Stretch" />
+        <Setter Property="Template">
+            <ControlTemplate>
+                <Border Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
+                        BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                        BorderThickness="1"
+                        CornerRadius="4"
+                        Padding="16,11">
+                    <StackPanel>
+                        <Grid ColumnDefinitions="Auto,*,Auto,Auto">
+                            <Viewbox x:Name="PART_Icon"
+                                     Width="20" Height="20"
+                                     Margin="0,0,16,0"
+                                     VerticalAlignment="Center">
+                                <ciControls:FluentIcon FontSize="16" Glyph="{TemplateBinding Glyph}" />
+                            </Viewbox>
+
+                            <StackPanel Grid.Column="1"
+                                        VerticalAlignment="Center"
+                                        Spacing="2">
+                                <TextBlock Text="{TemplateBinding Header}"
+                                           FontSize="14"
+                                           FontWeight="SemiBold"
+                                           TextWrapping="Wrap" />
+                                <TextBlock x:Name="PART_Description"
+                                           Text="{TemplateBinding Description}"
+                                           FontSize="12"
+                                           TextWrapping="Wrap"
+                                           Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                            </StackPanel>
+
+                            <ContentPresenter Grid.Column="2"
+                                              Content="{TemplateBinding Footer}"
+                                              Margin="16,0,0,0"
+                                              VerticalAlignment="Center" />
+
+                            <Button x:Name="PART_Chevron"
+                                    Grid.Column="3"
+                                    Margin="8,0,0,0"
+                                    Padding="6"
+                                    MinWidth="0"
+                                    MinHeight="0"
+                                    VerticalAlignment="Center"
+                                    Background="Transparent"
+                                    BorderThickness="0"
+                                    Focusable="False"
+                                    IsVisible="False">
+                                <Button.RenderTransform>
+                                    <RotateTransform Angle="0" />
+                                </Button.RenderTransform>
+                                <ciControls:FluentIcon FontSize="12" Glyph="&#xE70D;" />
+                            </Button>
+                        </Grid>
+
+                        <ContentPresenter x:Name="PART_Body"
+                                          Content="{TemplateBinding Content}"
+                                          Margin="0,10,0,0"
+                                          IsVisible="False" />
+                    </StackPanel>
+                </Border>
+            </ControlTemplate>
+        </Setter>
+    </ControlTheme>
+
+</ResourceDictionary>

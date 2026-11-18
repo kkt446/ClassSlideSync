@@ -1,0 +1,71 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <EnableDynamicLoading>true</EnableDynamicLoading>
+        <ClassIslandPluginSdkVersion>2.1.2</ClassIslandPluginSdkVersion>
+        <!-- Avalonia 12 默认把 {Binding} 编成编译绑定；本插件大量绑定没有 x:DataType，
+             运行时 DataContext 由宿主注入，继续用反射绑定。 -->
+        <AvaloniaUseCompiledBindingsByDefault>false</AvaloniaUseCompiledBindingsByDefault>
+        <DebugType>none</DebugType>
+        <DebugSymbols>false</DebugSymbols>
+        <AssemblyName>ClassSlideSync.Plugin</AssemblyName>
+        <RootNamespace>ClassSlideSync.Plugin</RootNamespace>
+        <BaseOutputPath>bin10\</BaseOutputPath>
+        <BaseIntermediateOutputPath>obj10\</BaseIntermediateOutputPath>
+        <DefaultItemExcludes>$(DefaultItemExcludes);bin\**;obj\**;bin10\**;obj10\**;cipx\**</DefaultItemExcludes>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="ClassIsland.PluginSdk" Version="$(ClassIslandPluginSdkVersion)">
+            <ExcludeAssets>runtime; native</ExcludeAssets>
+        </PackageReference>
+    </ItemGroup>
+
+    <ItemGroup>
+        <None Update="manifest.yml">
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </None>
+        <None Update="README.md">
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </None>
+        <None Update="icon.png">
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </None>
+        <None Include="test\纯页码课件.pptx">
+            <Link>test\纯页码课件.pptx</Link>
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </None>
+    </ItemGroup>
+
+    <ItemGroup>
+        <EmbeddedResource Include="Assets\Tutorials\getStarted.json" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <Compile Remove="tools\**\*.cs" />
+        <AvaloniaXaml Remove="tools\**\*" />
+        <AvaloniaResource Remove="tools\**\*" />
+        <EmbeddedResource Remove="tools\**\*" />
+        <None Remove="tools\**\obj\**" />
+        <None Remove="tools\**\bin\**" />
+        <Compile Remove="obj10\**" />
+        <AvaloniaXaml Remove="obj10\**" />
+        <None Remove="bin10\**;obj10\**;bin\**;obj\**;cipx\**" />
+        <Compile Remove="bin10\**" />
+    </ItemGroup>
+
+    <!-- net10 版不需要内嵌的辅助程序：ToastHelper 单独构建，打包时拷入。 -->
+    <Target Name="CopyToastHelperNet10" AfterTargets="Build"
+            Condition="'$(OS)' == 'Windows_NT' And Exists('$(MSBuildProjectDirectory)\Tools\ToastHelper\bin\$(Configuration)\net8.0-windows10.0.19041.0\ToastHelper.exe')">
+        <ItemGroup>
+            <_TH Include="$(MSBuildProjectDirectory)\Tools\ToastHelper\bin\$(Configuration)\net8.0-windows10.0.19041.0\**\*" />
+        </ItemGroup>
+        <Copy SourceFiles="@(_TH)"
+              DestinationFiles="@(_TH->'$(OutDir)ToastHelper\%(RecursiveDir)%(Filename)%(Extension)')"
+              SkipUnchangedFiles="true" />
+    </Target>
+
+</Project>

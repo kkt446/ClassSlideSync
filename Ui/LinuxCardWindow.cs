@@ -298,7 +298,12 @@ namespace ClassSlideSync.Plugin.Ui
             if (win != null) return;
             var w = new Window
             {
+#if NET10_0
+                // Avalonia 12 把 SystemDecorations 枚举改名为 WindowDecorations。
+                WindowDecorations = WindowDecorations.None,
+#else
                 SystemDecorations = SystemDecorations.None,
+#endif
                 WindowStartupLocation = WindowStartupLocation.Manual,
                 Topmost = true,
                 ShowInTaskbar = false,
