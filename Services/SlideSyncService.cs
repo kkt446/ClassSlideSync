@@ -109,6 +109,8 @@ namespace ClassSlideSync.Plugin.Services
         {
             this.settings = settings;
             this.pluginConfigFolder = pluginConfigFolder;
+            // 打开课件的软件偏好是静态状态（引擎的 Launch 兜底也要看它），构造时同步一次。
+            DeckLauncher.Preferred = settings.DeckOpenApp;
             // 2026-10-24 修 bug：以前这里是 null，引擎里 beginSession 的科目写入永远不执行。
             // 现在固定指向内存快照（只有调度器会替换 lessonTag），引擎怎么调都不会读到半截状态，
             // 也不会被拖进 ClassIsland 的 UI 线程。
@@ -1355,7 +1357,8 @@ namespace ClassSlideSync.Plugin.Services
                 lastOpenDeckAt = now;
 
                 ledger?.Log("open deck: " + path + "（接着讲第 " + slide + " 页）");
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(path) { UseShellExecute = true });
+                // 设置里选了 PowerPoint / WPS 就用它，Auto 仍然交给系统默认程序（见 DeckLauncher）。
+                DeckLauncher.Open(path, m => ledger?.Log(m));
                 var e = engine;
                 if (e != null) e.RequestJumpOnOpen(path, slide);
                 var c = card;
@@ -1619,6 +1622,7 @@ namespace ClassSlideSync.Plugin.Services
                 // live; the card needs both its timers re-armed and its appearance recomputed --
                 // 老师在设置页里动一下滑块，屏幕上的卡片就该当场变。
                 RecomputeAppearance();
+                DeckLauncher.Preferred = settings.DeckOpenApp;
                 var c = card;
                 if (c != null) c.Configure(Appearance, settings.AutoShowOverlay, settings.AutoHide, settings.AutoHideSeconds, settings.EnableControlPanel);
                 var e = engine;

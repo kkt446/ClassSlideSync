@@ -1,5 +1,4 @@
 using System;
-using System.Diagnostics;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
@@ -72,9 +71,9 @@ namespace ClassSlideSync.Plugin.Automation
 
                 try
                 {
-                    // UseShellExecute=true：按系统默认程序打开 .pptx（PowerPoint 或 WPS 都行）。
-                    // 插件不去猜老师装的是哪套，也不自己指定 exe——那会把默认程序设置绕过去。
-                    Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+                    // 打开方式由设置决定：Auto = 系统默认程序；选了 PowerPoint / WPS 就只认它。
+                    // 找不到那套软件时 DeckLauncher 自己退回默认程序，不会让自动化哑火。
+                    DeckLauncher.Open(path, m => ledger.Log(m));
                 }
                 catch (Exception ex)
                 {

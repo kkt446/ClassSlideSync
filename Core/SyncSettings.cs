@@ -75,6 +75,53 @@ namespace ClassSlideSync.Plugin.Core
         /// <summary>功能7（2026-10-25）：课前 2 分钟亮预备态。老师不需要就直接关掉。</summary>
         bool readyCardEnabled = true;
 
+        // ---- 打开课件用哪个软件（2026-11-18 用户要求）----
+        // Auto = 老行为：交给系统默认程序 / 按屏幕上正在用的套件。
+        DeckOpenApp deckOpenApp = DeckOpenApp.Auto;
+
+        /// <summary>
+        /// 老师点「打开并接着讲」/ 自动化打开课件时，用哪个软件打开这份课件。
+        /// 默认 <see cref="DeckOpenApp.Auto"/>：交给 Windows 的默认程序（跳页兜底时仍按屏幕上
+        /// 正在用的套件排序）。选了 PowerPoint / WPS 就只认它，找不到安装位置再退回默认程序。
+        /// </summary>
+        public DeckOpenApp DeckOpenApp
+        {
+            get { return deckOpenApp; }
+            set
+            {
+                // 旧配置里的未知值不要漏进来，否则下拉框会一项都不选中。
+                if (!Enum.IsDefined(typeof(DeckOpenApp), value)) value = DeckOpenApp.Auto;
+                Set(ref deckOpenApp, value);
+                Raise(nameof(DeckOpenAppIndex));
+            }
+        }
+
+        /// <summary>给 ComboBox 的 SelectedIndex 用，顺序与枚举一致。</summary>
+        [JsonIgnore]
+        public int DeckOpenAppIndex
+        {
+            get { return (int)deckOpenApp; }
+            set
+            {
+                // 同 SubjectFolderMomentIndex：ItemsSource 未就位时的 -1 不算用户选择。
+                if (value < 0) return;
+                DeckOpenApp = (DeckOpenApp)value;
+            }
+        }
+
+        [JsonIgnore]
+        public IReadOnlyList<ChoiceOption> DeckOpenAppOptions
+        {
+            get { return DeckOpenAppChoices; }
+        }
+
+        static readonly ChoiceOption[] DeckOpenAppChoices =
+        {
+            new ChoiceOption("自动（跟随系统默认）", true),
+            new ChoiceOption("PowerPoint", false),
+            new ChoiceOption("WPS 演示", false),
+        };
+
         // ---- 学科课件文件夹（2026-10-16 用户第 1 条）----
         bool autoOpenSubjectFolder = true;
         ObservableCollection<SubjectFolder> subjectFolders = new ObservableCollection<SubjectFolder>();
@@ -1026,6 +1073,20 @@ namespace ClassSlideSync.Plugin.Core
         BeforeClass = 1,
         /// <summary>下课后 N 分钟：下课铃之后 N 分钟打开，同一节课只开一次。</summary>
         AfterClass = 2,
+    }
+
+    /// <summary>
+    /// 打开课件时用哪个软件（2026-11-18 用户要求可配置）。值就是下拉框的顺序，
+    /// <see cref="SyncSettings.DeckOpenAppIndex"/> 直接拿它当 SelectedIndex。
+    /// </summary>
+    public enum DeckOpenApp
+    {
+        /// <summary>自动：交给系统默认程序；跳页兜底时按屏幕上正在用的套件。</summary>
+        Auto = 0,
+        /// <summary>始终优先用微软 PowerPoint 打开。</summary>
+        PowerPoint = 1,
+        /// <summary>始终优先用 WPS 演示打开。</summary>
+        Wps = 2,
     }
 
     /// <summary>

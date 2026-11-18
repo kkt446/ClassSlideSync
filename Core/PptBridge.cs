@@ -569,17 +569,21 @@ namespace ClassSlideSync.Plugin.Core
             catch { return false; }
         }
 
+        static readonly string[] PowerPointFirst = { "PowerPoint.Application", "Kwpp.Application", "WPP.Application", "wpp.Application" };
+        static readonly string[] WpsFirst = { "Kwpp.Application", "WPP.Application", "wpp.Application", "PowerPoint.Application" };
+
         /// <summary>
         /// Launch 兜底时按"老师正在用的套件"排先后：WPS 的老师不会被塞给 PowerPoint，
         /// 反之亦然。没有可见套件窗口时保持原顺序（PowerPoint 在前，兼容老机器）。
+        /// 2026-11-18 起，设置里明确选了 PowerPoint / WPS 时以设置为准（设置 > 屏幕猜测）。
         /// </summary>
         static string[] LaunchProgIds()
         {
+            if (DeckLauncher.Preferred == DeckOpenApp.PowerPoint) return PowerPointFirst;
+            if (DeckLauncher.Preferred == DeckOpenApp.Wps) return WpsFirst;
             string suite = OnScreenSuite();
-            if (suite == "WPS")
-                return new[] { "Kwpp.Application", "WPP.Application", "wpp.Application", "PowerPoint.Application" };
-            if (suite == "PowerPoint")
-                return new[] { "PowerPoint.Application", "Kwpp.Application", "WPP.Application", "wpp.Application" };
+            if (suite == "WPS") return WpsFirst;
+            if (suite == "PowerPoint") return PowerPointFirst;
             return LiveProgIds;
         }
 

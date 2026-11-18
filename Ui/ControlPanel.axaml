@@ -835,6 +835,35 @@
                     </ui:SettingsCard>
 
                     <Separator Margin="0,12,0,4" />
+                    <TextBlock Classes="settings-group" Text="打开课件" />
+
+                    <!-- 2026-11-18：和设置页同一张卡、同一个 SyncSettings 实例。
+                         Auto = 系统默认程序；PowerPoint / WPS 固定优先，缺装时 DeckLauncher 退回默认程序。 -->
+                    <ui:SettingsCard Header="打开课件时默认用哪个软件"
+                                               Description="「自动」交给 Windows 的默认程序；也可以固定用 PowerPoint 或 WPS 演示。选定的软件没装时仍会退回默认程序。">
+                        <ui:SettingsCard.Footer>
+                            <ComboBox x:Name="DeckOpenAppCombo"
+                                      MinWidth="190"
+                                      VerticalAlignment="Center"
+                                      HorizontalContentAlignment="Left"
+                                      ItemsSource="{Binding Settings.DeckOpenAppOptions}"
+                                      SelectedIndex="{Binding Settings.DeckOpenAppIndex, Mode=TwoWay}">
+                                <ComboBox.ItemTemplate>
+                                    <DataTemplate x:DataType="core:ChoiceOption" x:CompileBindings="True">
+                                        <StackPanel Orientation="Horizontal" Spacing="2">
+                                            <TextBlock Text="{Binding Label}" VerticalAlignment="Center" />
+                                            <TextBlock Text="（推荐）"
+                                                       VerticalAlignment="Center"
+                                                       IsVisible="{Binding IsDefault}"
+                                                       Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}" />
+                                        </StackPanel>
+                                    </DataTemplate>
+                                </ComboBox.ItemTemplate>
+                            </ComboBox>
+                        </ui:SettingsCard.Footer>
+                    </ui:SettingsCard>
+
+                    <Separator Margin="0,12,0,4" />
                     <TextBlock Classes="settings-group" Text="学科课件文件夹" />
 
                     <ui:SettingsCard Header="上课时自动打开本科目的课件文件夹"
